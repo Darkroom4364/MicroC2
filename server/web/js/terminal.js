@@ -22,6 +22,12 @@ class TerminalManager {
                 console.error('Invalid JSON from terminal websocket:', e);
                 return;
             }
+            
+            if (response.type === 'tab_completion') {
+                this.handleTabCompletionResponse(response.completions);
+                return;
+            }
+            
             if (response.cwd) {
                 this.currentWorkingDirectory = response.cwd;
                 this.updatePrompt();
@@ -38,10 +44,10 @@ class TerminalManager {
     }
 
     setupEventListeners() {
-        this.terminalInput.addEventListener('keydown', (e) => this.handleKeyDown(e));
+        this.terminalInput.addEventListener('keydown', (event) => this.handleKeyDown(event));
 
         // Focus input when clicking anywhere in terminal
-        document.querySelector('.terminal-container').addEventListener('click', (e) => {
+        document.querySelector('.terminal-container').addEventListener('click', () => {
             if (window.getSelection().toString() === '') {
                 this.terminalInput.focus();
             }
@@ -106,8 +112,102 @@ class TerminalManager {
         }));
     }
 
+    handleTabCompletionResponse(completions) {
+        if (!completions || completions.length === 0) {
+            return;
+        }
+
+        const currentInput = this.terminalInput.value;
+        const cursorPos = this.terminalInput.selectionStart;
+        
+        if (completions.length === 1) {
+            // Single completion - auto-complete
+            this.applySingleCompletion(completions[0], currentInput, cursorPos);
+        } else {
+            // Multiple completions - show options and apply common prefix
+            this.handleMultipleCompletions(completions, currentInput, cursorPos);
+        }
+    }
+
+    applySingleCompletion(completion, currentInput, cursorPos) {
+        // Find the word boundary to replace
+        const beforeCursor = currentInput.substring(0, cursorPos);
+        const afterCursor = currentInput.substring(cursorPos);
+        
+        // Find the start of the current word
+        const wordStart = Math.max(
+            beforeCursor.lastIndexOf(' ') + 1,
+            beforeCursor.lastIndexOf('\t') + 1,
+            0
+        );
+        
+        // Replace the current word with the completion
+        const newInput = beforeCursor.substring(0, wordStart) + completion + afterCursor;
+        this.terminalInput.value = newInput;
+        
+        // Position cursor at the end of the completion
+        const newCursorPos = wordStart + completion.length;
+        this.terminalInput.setSelectionRange(newCursorPos, newCursorPos);
+    }
+
+    handleMultipleCompletions(completions, currentInput, cursorPos) {
+        // Show available completions
+        this.showCompletionOptions(completions);
+        
+        // Find common prefix and apply it
+        const commonPrefix = this.findCommonPrefix(completions);
+        if (commonPrefix) {
+            const beforeCursor = currentInput.substring(0, cursorPos);
+            const afterCursor = currentInput.substring(cursorPos);
+            
+            // Find the start of the current word
+            const wordStart = Math.max(
+                beforeCursor.lastIndexOf(' ') + 1,
+                beforeCursor.lastIndexOf('\t') + 1,
+                0
+            );
+            
+            const currentWord = beforeCursor.substring(wordStart);
+            
+            // Only apply if the common prefix is longer than current word
+            if (commonPrefix.length > currentWord.length) {
+                const newInput = beforeCursor.substring(0, wordStart) + commonPrefix + afterCursor;
+                this.terminalInput.value = newInput;
+                
+                const newCursorPos = wordStart + commonPrefix.length;
+                this.terminalInput.setSelectionRange(newCursorPos, newCursorPos);
+            }
+        }
+    }
+
+    findCommonPrefix(completions) {
+        if (completions.length === 0) return '';
+        if (completions.length === 1) return completions[0];
+        
+        let prefix = completions[0];
+        for (let i = 1; i < completions.length; i++) {
+            while (!completions[i].startsWith(prefix) && prefix.length > 0) {
+                prefix = prefix.substring(0, prefix.length - 1);
+            }
+        }
+        return prefix;
+    }
+
+    showCompletionOptions(completions) {
+        // Display completions in the terminal output with special styling
+        const outputDiv = document.createElement('div');
+        outputDiv.className = 'completion-output';
+        outputDiv.textContent = completions.join('  ');
+        this.terminalOutput.appendChild(outputDiv);
+        this.scrollToBottom();
+        
+        // Also show the current command line again
+        this.appendCommand(this.terminalInput.value);
+    }
+
     updatePrompt() {
-        const pathElement = document.querySelector('.prompt .path');
+        // Update the prompt in the input container
+        const pathElement = document.querySelector('.terminal-input-container .prompt .path');
         if (pathElement) {
             pathElement.textContent = this.currentWorkingDirectory;
         }

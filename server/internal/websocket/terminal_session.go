@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/gorilla/websocket"
@@ -17,12 +18,20 @@ type TerminalSession struct {
 	WorkingDir string
 }
 
+// TerminalRequest defines the structure of requests from the client
+type TerminalRequest struct {
+	Type    string `json:"type,omitempty"`
+	Partial string `json:"partial,omitempty"`
+}
+
 // TerminalResponse defines the structure of responses sent back to the client
 // It provides command output, current working directory, and error status.
 type TerminalResponse struct {
-	Output string `json:"output,omitempty"`
-	CWD    string `json:"cwd,omitempty"`
-	Error  bool   `json:"error,omitempty"`
+	Output      string   `json:"output,omitempty"`
+	CWD         string   `json:"cwd,omitempty"`
+	Error       bool     `json:"error,omitempty"`
+	Type        string   `json:"type,omitempty"`
+	Completions []string `json:"completions,omitempty"`
 }
 
 // TerminalHandler manages terminal websocket sessions
@@ -83,6 +92,17 @@ func (h *TerminalHandler) HandleConnection(w http.ResponseWriter, r *http.Reques
 			break
 		}
 
+		// Try to parse as JSON first (for tab completion and other structured requests)
+		var request TerminalRequest
+		if err := json.Unmarshal(message, &request); err == nil {
+			// Handle structured requests
+			if request.Type == "tab_completion" {
+				h.handleTabCompletion(conn, session, request.Partial)
+				continue
+			}
+		}
+
+		// Handle as plain text command
 		command := string(message)
 
 		// Handle built-in commands
@@ -141,6 +161,182 @@ func (h *TerminalHandler) HandleConnection(w http.ResponseWriter, r *http.Reques
 		msg, _ := json.Marshal(response)
 		conn.WriteMessage(websocket.TextMessage, msg)
 	}
+}
+
+// handleTabCompletion processes tab completion requests
+//
+// Pre-conditions:
+//   - conn is a valid websocket connection
+//   - session contains current working directory state
+//   - partial contains the partial command/path to complete
+//
+// Post-conditions:
+//   - Sends back completion suggestions to the client
+//   - Handles file/directory completion and basic command completion
+func (h *TerminalHandler) handleTabCompletion(conn *websocket.Conn, session *TerminalSession, partial string) {
+	completions := h.getCompletions(session, partial)
+	
+	response := TerminalResponse{
+		Type:        "tab_completion",
+		Completions: completions,
+	}
+	
+	msg, _ := json.Marshal(response)
+	conn.WriteMessage(websocket.TextMessage, msg)
+}
+
+// getCompletions generates completion suggestions based on the partial input
+//
+// Pre-conditions:
+//   - session contains valid working directory
+//   - partial contains the text to complete
+//
+// Post-conditions:
+//   - Returns a slice of completion suggestions
+//   - Handles both command and file/directory completion
+func (h *TerminalHandler) getCompletions(session *TerminalSession, partial string) []string {
+	// Split command into words
+	words := strings.Fields(partial)
+	
+	// If no words or first word, suggest commands
+	if len(words) == 0 || (len(words) == 1 && !strings.HasSuffix(partial, " ")) {
+		return h.getCommandCompletions(partial)
+	}
+	
+	// Otherwise, complete file paths for the last word
+	lastWord := words[len(words)-1]
+	if strings.HasSuffix(partial, " ") {
+		lastWord = ""
+	}
+	
+	return h.getPathCompletions(session, lastWord)
+}
+
+// getCommandCompletions returns basic shell command completions
+//
+// Pre-conditions:
+//   - partial contains the partial command to complete
+//
+// Post-conditions:
+//   - Returns a slice of matching command suggestions
+func (h *TerminalHandler) getCommandCompletions(partial string) []string {
+	commands := []string{
+		"ls", "cd", "pwd", "cat", "grep", "find", "mkdir", "rmdir", "rm", "cp", "mv",
+		"chmod", "chown", "du", "df", "ps", "top", "kill", "which", "whereis",
+		"echo", "less", "more", "head", "tail", "wc", "sort", "uniq", "awk", "sed",
+		"tar", "gzip", "gunzip", "zip", "unzip", "curl", "wget", "ssh", "scp",
+		"git", "nano", "vim", "emacs", "python", "python3", "node", "go", "make",
+	}
+	
+	var matches []string
+	for _, cmd := range commands {
+		if strings.HasPrefix(cmd, partial) {
+			matches = append(matches, cmd)
+		}
+	}
+	
+	sort.Strings(matches)
+	return matches
+}
+
+// getPathCompletions returns file and directory completion suggestions
+//
+// Pre-conditions:
+//   - session contains valid working directory
+//   - partial contains the partial path to complete
+//
+// Post-conditions:
+//   - Returns a slice of matching file/directory suggestions
+//   - Handles relative and absolute paths, and ~ expansion
+func (h *TerminalHandler) getPathCompletions(session *TerminalSession, partial string) []string {
+	var searchDir, prefix string
+	
+	// Handle different path types
+	if partial == "" {
+		searchDir = session.WorkingDir
+		prefix = ""
+	} else if strings.HasPrefix(partial, "/") {
+		// Absolute path
+		searchDir = filepath.Dir(partial)
+		prefix = filepath.Base(partial)
+		if partial == "/" {
+			searchDir = "/"
+			prefix = ""
+		}
+	} else if strings.HasPrefix(partial, "~/") {
+		// Home directory path
+		home := os.Getenv("HOME")
+		if partial == "~/" {
+			searchDir = home
+			prefix = ""
+		} else {
+			relativePath := partial[2:]
+			searchDir = filepath.Join(home, filepath.Dir(relativePath))
+			prefix = filepath.Base(relativePath)
+		}
+	} else if partial == "~" {
+		// Just tilde
+		return []string{"~/"}
+	} else {
+		// Relative path
+		if strings.Contains(partial, "/") {
+			searchDir = filepath.Join(session.WorkingDir, filepath.Dir(partial))
+			prefix = filepath.Base(partial)
+		} else {
+			searchDir = session.WorkingDir
+			prefix = partial
+		}
+	}
+	
+	// Read directory contents
+	entries, err := os.ReadDir(searchDir)
+	if err != nil {
+		return []string{}
+	}
+	
+	var matches []string
+	for _, entry := range entries {
+		name := entry.Name()
+		
+		// Skip hidden files unless prefix starts with .
+		if strings.HasPrefix(name, ".") && !strings.HasPrefix(prefix, ".") {
+			continue
+		}
+		
+		// Check if name matches prefix
+		if strings.HasPrefix(name, prefix) {
+			completionName := name
+			
+			// Add trailing slash for directories
+			if entry.IsDir() {
+				completionName += "/"
+			}
+			
+			// Build the full completion based on the original partial path
+			var fullCompletion string
+			if strings.HasPrefix(partial, "/") {
+				fullCompletion = filepath.Join(searchDir, completionName)
+			} else if strings.HasPrefix(partial, "~/") {
+				home := os.Getenv("HOME")
+				relativePath := strings.TrimPrefix(searchDir, home)
+				if relativePath == "" {
+					fullCompletion = "~/" + completionName
+				} else {
+					fullCompletion = "~" + filepath.Join(relativePath, completionName)
+				}
+			} else if strings.Contains(partial, "/") {
+				dirPart := filepath.Dir(partial)
+				fullCompletion = filepath.Join(dirPart, completionName)
+			} else {
+				fullCompletion = completionName
+			}
+			
+			matches = append(matches, fullCompletion)
+		}
+	}
+	
+	sort.Strings(matches)
+	return matches
 }
 
 // formatPath formats the path for display in the terminal prompt
