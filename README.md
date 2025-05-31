@@ -1,6 +1,19 @@
 # MicroC2 Framework - Academic Research Project
 
-**This framework was designed in conjunction with a bachelors thesis done at the Cyber Defence Campus (https://www.cydcampus.admin.ch/en) and ETH Zurich. It ultimately is designed to be a research testbed for exploring the limitations of state of the art AV and EDR solutions**
+## 📚 Project Background and Development Context
+
+**This framework was developed as part of a bachelor's thesis conducted at the [Cyber Defence Campus](https://www.cydcampus.admin.ch/en) in collaboration with [ETH Zurich](https://ethz.ch/en.html). The project serves as a research testbed for exploring the limitations and detection capabilities of state-of-the-art AV and EDR solutions.**
+
+(I do however plan on continuing developement on this as it has become a passion project. Goal is to build this into a fully fleshed out research testbed)
+
+### ⚠️ Development Acknowledgments
+
+**Ths project was developed under a rather compressed timeline, prioritizing research validation over production readiness.** Please expect:
+
+- **Prototype-Grade Code**: Some design decisions may require refinement
+- **Implementation Gaps**: Certain features contain placeholder implementations
+- **Limited Testing**: Comprehensive testing was constrained by timeline
+- **Potential Bugs**: Rapid development may have introduced edge cases
 
 
 ## 🚨 ETHICAL DISCLAIMER AND LEGAL NOTICE
@@ -98,6 +111,22 @@ This framework can be used to:
 - **SOCKS5 Proxy Pivoting**: Multi-hop network traversal with reverse tunneling capabilities
 - **Minimal Footprint**: Optimized Rust agent with aggressive size reduction and anti-analysis features
 - **Modular Architecture**: Extensible framework supporting multiple communication protocols
+
+---
+
+### 🐛 **Bug Reports Welcome (Seriously, Please Help!)**
+
+**Found something broken? Congratulations, you're probably right!** 
+
+This framework was built by someone running on way too much caffeine. If you encounter:
+- Mysterious crashes that make no sense
+- Features that work "sometimes" 
+- Error messages that are less helpful than a chocolate teapot
+- Code that makes you go "wait, how does this even compile?"
+
+**Please report them!**
+
+**Bonus points if you can explain why something is broken in simpler terms than I used to break it!**
 
 ---
 
