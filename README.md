@@ -1,6 +1,6 @@
 # MicroC2 Framework - Academic Research Project
 
-**This thesis proposes the design of a lightweight C2 framework for penetration testing and red team operations, emphasizing stealth and a low system footprint. The framework utilizes covert communication, encryption and obfuscation to evade detection by security tools like EDR and IDS. Its effectiveness is evaluated in simulated environments, offering insights into evasion techniques and improving defensive strategies.**
+**This framework was designed in conjunction with a bachelors thesis done at the Cyber Defence Campus (https://www.cydcampus.admin.ch/en) and ETH Zurich. It ultimately is designed to be a research testbed for exploring the limitations of state of the art AV and EDR solutions**
 
 
 ## 🚨 ETHICAL DISCLAIMER AND LEGAL NOTICE
