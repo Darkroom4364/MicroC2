@@ -181,7 +181,7 @@ This framework was built by someone running on way too much caffeine. If you enc
 ### TLS certificates for using HTTPS
 - Run the following in MicroC2/server/ to generate TLS certificates
     ```
-    openssl req -x509 -newkey rsa:4096 -keyout certs/server.key -out certs/server.crt -days 365 -nodes -subj "/CN=localhost"
+    mkdir certs && openssl req -x509 -newkey rsa:4096 -keyout certs/server.key -out certs/server.crt -days 365 -nodes -subj "/CN=localhost"
     ```
 
 ### Creating Listeners
