@@ -5,7 +5,7 @@ use chrono::Timelike;
 use once_cell::sync::Lazy;
 use serde::{Serialize, Deserialize};
 use crate::state::MEMORY_PROTECTOR;
-use crate::high_threat_tools::{HIGH_THREAT_ANALYSIS_TOOLS, COMMON_AV_EDR_PROCESSES, SUSPICIOUS_WINDOW_TITLES};
+use crate::high_threat_tools::{HIGH_THREAT_ANALYSIS_TOOLS};
 use zeroize::Zeroize;
 
 // --- OPSEC Scoring Constants ---

@@ -103,22 +103,26 @@ impl MemoryProtector {
     }
 
     //  Mutable access with immediate cleanup
-    pub fn with_opsec_state_mut<F, R>(&mut self, f: F) -> Result<R>
+    pub fn with_opsec_state_mut<F, R>(&mut self, f: F) -> Result<R, Box<dyn std::error::Error>>
+    where F: FnOnce(&mut crate::opsec::OpsecState) -> R,
     {
         let (nonce, ciphertext) = self.encrypted_opsec_state.as_ref().ok_or("No encrypted OPSEC state found")?;
         let mut decrypted_bytes = self.protector.decrypt(nonce, ciphertext)?;
         let mut state: crate::opsec::OpsecState = bincode::deserialize(&decrypted_bytes)?;
         
-        //  FIX: Immediately zeroize decryption buffer
+        // FIX: Immediately zeroize decryption buffer
         decrypted_bytes.zeroize();
         
         let result = f(&mut state);
         
         let mut serialized_bytes = bincode::serialize(&state)?;
-        let (nonce, ciphertext) = self.protector.encrypt(&serialized_bytes)?;
+        let (new_nonce, new_ciphertext) = self.protector.encrypt(&serialized_bytes)?;
         
-        //  FIX: Immediately zeroize serialization buffer
+        // FIX: Immediately zeroize serialization buffer
         serialized_bytes.zeroize();
+        
+        // Update the stored encrypted state
+        self.encrypted_opsec_state = Some((new_nonce, new_ciphertext));
         
         state.zeroize();
         Ok(result)
@@ -132,11 +136,11 @@ impl MemoryProtector {
     }
 
     pub fn with_config<F, R>(&self, f: F) -> Result<R, Box<dyn std::error::Error>>
-    where F: FnOnce(&[u8]) -> R,
+    where F: FnOnce(&[u8]) -> R,  // Fix: Change to work with bytes, not OpsecState
     {
         if let Some((nonce, ciphertext)) = &self.encrypted_config {
             let mut decrypted = self.protector.decrypt(nonce, ciphertext)?;
-            let result = f(&decrypted);
+            let result = f(&decrypted);  // Pass bytes, not OpsecState
             decrypted.zeroize();
             Ok(result)
         } else {

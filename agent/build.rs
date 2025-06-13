@@ -152,9 +152,10 @@ fn main() {
         // For this example, let's use a fixed non-empty key to prevent XORing with an empty slice.
         let fixed_fallback_key = "DefaultFallbackKey123";
         let mut obfuscated_config_bytes = config_content.as_bytes().to_vec();
-        for (i, byte) in obfuscated_config_bytes.iter_mut().enumerate() {
-            *byte ^= fixed_fallback_key.as_bytes()[i % fixed_fallback_key.as_bytes().len()];
-        }
+        
+        // Use improved_xor for fallback too
+        improved_xor(&mut obfuscated_config_bytes, fixed_fallback_key.as_bytes());
+        
         let hex_obfuscated_config = obfuscated_config_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>();
         let config_code = format!(
             r###"pub const EMBEDDED_CONFIG_HEX: &str = r#"{}"#;
@@ -171,16 +172,17 @@ fn main() {
         }
     } else {
         let mut obfuscated_config_bytes = config_content.as_bytes().to_vec();
-        for (i, byte) in obfuscated_config_bytes.iter_mut().enumerate() {
-            *byte ^= xor_key_bytes[i % xor_key_bytes.len()];
-        }
+        
+        // Use the improved_xor function instead of simple XOR
+        improved_xor(&mut obfuscated_config_bytes, xor_key_bytes);
+        
         let hex_obfuscated_config = obfuscated_config_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>();
         let config_code = format!(
             r###"pub const EMBEDDED_CONFIG_HEX: &str = r#"{}"#;
             pub const EMBEDDED_CONFIG_XOR_KEY: &str = r#"{}"#; // Embed the payload_id as the key
             "###,
             hex_obfuscated_config,
-            payload_id // Embed the payload_id string itself as the key
+            payload_id
         );
         if let Err(e) = fs::write(&dest_path, config_code) {
             log_build(&format!("Failed to write config.rs: {}", e));
@@ -188,5 +190,17 @@ fn main() {
         } else {
             log_build("Embedded config written successfully with payload_id as XOR key.");
         }
+    }
+}
+
+// SIMPLE IMPROVEMENT: Add entropy through a Pseudo-Random Number Generator (PRNG) seed
+fn improved_xor(data: &mut [u8], key: &[u8]) {
+    let mut state = 0x5A5A5A5Au32; // Simple PRNG seed
+    for (i, byte) in data.iter_mut().enumerate() {
+        // Simple linear congruential generator
+        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        let key_byte = key[i % key.len()];
+        let entropy_byte = (state >> 24) as u8;
+        *byte ^= key_byte ^ entropy_byte;
     }
 }
