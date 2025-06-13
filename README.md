@@ -132,6 +132,13 @@ This framework was built by someone running on way too much caffeine. If you enc
 
 ## Getting Started
 
+### Automatic installation using the install script
+    ```sh
+    chmod +x ./MicroC2/install.sh
+    ./install.sh
+    ```
+
+### Manual Installation
 ### Prerequisites
 - **Go** (v1.23+ recommended)
 - **Rust** (for agent builds)
