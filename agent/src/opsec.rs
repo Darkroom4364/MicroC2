@@ -80,6 +80,8 @@ impl Zeroize for OpsecState {
         self.dyn_enter_reduced = 0.0;
         self.dyn_exit_reduced = 0.0;
         self.threshold_adjustment_history = 0;
+        // Ensure mode enum is also cleared
+        self.mode = AgentMode::FullOpsec; // Set to safe default
     }
 }
 
