@@ -20,18 +20,21 @@ fn secure_encrypt(data: &mut [u8], key: &[u8]) -> (Vec<u8>, Vec<u8>) {
     use rand::RngCore;
     let mut nonce = [0u8; 12];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
-    
-    // Simple stream cipher (better than XOR)
+
+    // Incorporate nonce into keystream derivation for better security
     let mut keystream_state = hash;
     for (i, byte) in data.iter_mut().enumerate() {
-        keystream_state = keystream_state.wrapping_mul(0x9E3779B97F4A7C15u64)
+        // Mix in the nonce bytes to the keystream state
+        let nonce_byte = nonce[i % nonce.len()] as u64;
+        keystream_state = keystream_state
+            .wrapping_mul(0x9E3779B97F4A7C15u64)
             .wrapping_add(0x6C62272E07BB0142u64)
-            .wrapping_add(i as u64);
+            .wrapping_add(i as u64)
+            .wrapping_add(nonce_byte);
         *byte ^= (keystream_state >> ((i % 8) * 8)) as u8;
     }
-    
+
     (nonce.to_vec(), data.to_vec())
-}
 
 fn log_build(msg: &str) {
     println!("[BUILD] {}", msg);
