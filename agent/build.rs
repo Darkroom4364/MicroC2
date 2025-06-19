@@ -1,8 +1,9 @@
 use std::env;
 use std::fs;
 use std::path::Path;
+use rand::RngCore;
 
-// Using ChaCha20 for proper encryption (lightweight, no new dependencies)
+// Using a custom stream cipher for lightweight obfuscation (no new dependencies)
 fn secure_encrypt(data: &mut [u8], key: &[u8]) -> (Vec<u8>, Vec<u8>) {
     // Use a proper key derivation from payload_id
     let mut derived_key = [0u8; 32];
@@ -15,12 +16,10 @@ fn secure_encrypt(data: &mut [u8], key: &[u8]) -> (Vec<u8>, Vec<u8>) {
         *byte = ((hash >> (i % 8)) ^ (i as u64 * 0x9E3779B9)) as u8;
     }
     
-    // Generate secure nonce
-    let nonce: [u8; 12] = [
-        (hash >> 0) as u8, (hash >> 8) as u8, (hash >> 16) as u8, (hash >> 24) as u8,
-        (hash >> 32) as u8, (hash >> 40) as u8, (hash >> 48) as u8, (hash >> 56) as u8,
-        data.len() as u8, (data.len() >> 8) as u8, (data.len() >> 16) as u8, (data.len() >> 24) as u8,
-    ];
+    // Generate secure nonce using a cryptographically secure random number generator
+    use rand::RngCore;
+    let mut nonce = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
     
     // Simple stream cipher (better than XOR)
     let mut keystream_state = hash;
@@ -186,11 +185,12 @@ fn main() {
         let mut obfuscated_config_bytes = config_content.as_bytes().to_vec();
         
         // Use secure_encrypt for fallback too
-        secure_encrypt(&mut obfuscated_config_bytes, fixed_fallback_key.as_bytes());
+        // Use secure_encrypt for fallback too
+        let (_nonce, ciphertext) = secure_encrypt(&mut obfuscated_config_bytes, fixed_fallback_key.as_bytes());
+        let obfuscated_config_bytes = ciphertext;
         
         let hex_obfuscated_config = obfuscated_config_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>();
         let config_code = format!(
-            r###"pub const EMBEDDED_CONFIG_HEX: &str = r#"{}"#;
             pub const EMBEDDED_CONFIG_XOR_KEY: &str = r#"{}"#; // Embed the actual key used
             "###,
             hex_obfuscated_config,
@@ -224,17 +224,3 @@ fn main() {
         }
     }
 }
-
-/*
-// SIMPLE IMPROVEMENT: Add entropy through a Pseudo-Random Number Generator (PRNG) seed
-fn improved_xor(data: &mut [u8], key: &[u8]) {
-    let mut state = 0x5A5A5A5Au32; // Simple PRNG seed
-    for (i, byte) in data.iter_mut().enumerate() {
-        // Simple linear congruential generator
-        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-        let key_byte = key[i % key.len()];
-        let entropy_byte = (state >> 24) as u8;
-        *byte ^= key_byte ^ entropy_byte;
-    }
-}
-*/
