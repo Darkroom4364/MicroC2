@@ -7,6 +7,54 @@ use log::{info, warn, error};
 use reqwest::{Client, Proxy};
 use obfstr::obfstr;
 
+// --- AES Decryption Logic ---
+#[cfg(feature = "encryption-aes")]
+fn decrypt_config(encrypted_data: &[u8], key_str: &str) -> Result<String, String> {
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Key, Nonce};
+
+    if encrypted_data.len() < 12 {
+        return Err("Encrypted data too short".to_string());
+    }
+    let (nonce_bytes, ciphertext) = encrypted_data.split_at(12);
+    let nonce = Nonce::from_slice(nonce_bytes);
+
+    let mut key_material = [0u8; 32];
+    let key_bytes = key_str.as_bytes();
+    let len = key_bytes.len().min(32);
+    key_material[..len].copy_from_slice(&key_bytes[..len]);
+    let key = Key::<Aes256Gcm>::from_slice(&key_material);
+
+    let cipher = Aes256Gcm::new(key);
+    let decrypted_bytes = cipher.decrypt(nonce, ciphertext)
+        .map_err(|e| format!("AES decrypt failed: {}", e))?;
+    String::from_utf8(decrypted_bytes).map_err(|e| e.to_string())
+}
+
+// --- ChaCha20 Decryption Logic ---
+#[cfg(feature = "encryption-chacha")]
+fn decrypt_config(encrypted_data: &[u8], key_str: &str) -> Result<String, String> {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+
+    if encrypted_data.len() < 12 {
+        return Err("Encrypted data too short".to_string());
+    }
+    let (nonce_bytes, ciphertext) = encrypted_data.split_at(12);
+    let nonce = Nonce::from_slice(nonce_bytes);
+
+    let mut key_material = [0u8; 32];
+    let key_bytes = key_str.as_bytes();
+    let len = key_bytes.len().min(32);
+    key_material[..len].copy_from_slice(&key_bytes[..len]);
+    let key = Key::from_slice(&key_material);
+
+    let cipher = ChaCha20Poly1305::new(key);
+    let decrypted_bytes = cipher.decrypt(nonce, ciphertext)
+        .map_err(|e| format!("ChaCha20 decrypt failed: {}", e))?;
+    String::from_utf8(decrypted_bytes).map_err(|e| e.to_string())
+}
+
 // Include the generated config file
 include!(concat!(env!("OUT_DIR"), "/config.rs"));
 
@@ -157,40 +205,31 @@ impl Default for AgentConfig {
 // The AgentConfig struct is used to load and manage the agent's configuration.
 impl AgentConfig {
     pub fn load() -> io::Result<Self> {
-        // First try using the embedded config
-        match deobfuscate_config(EMBEDDED_CONFIG_HEX, EMBEDDED_CONFIG_XOR_KEY) {
-            Ok(deobfuscated_json) => {
-                if let Ok(config) = serde_json::from_str::<AgentConfig>(&deobfuscated_json) {
-                    if !config.server_url.is_empty() && !config.payload_id.is_empty() {
-                        return Ok(config);
-                    }
-                    warn!("[WARNING] Embedded config invalid after deobfuscation (missing server_url or payload_id)");
-                } else {
-                    warn!("[WARNING] Failed to parse deobfuscated embedded config");
+        // Primary method: Load from embedded, encrypted config
+        match decrypt_config(ENCRYPTED_CONFIG, CONFIG_KEY) {
+            Ok(json_config) => {
+                info!("[CONFIG] Successfully decrypted and loaded embedded configuration.");
+                if let Ok(config) = serde_json::from_str::<AgentConfig>(&json_config) {
+                     return Ok(config);
                 }
-            },
+            }
             Err(e) => {
-                warn!("[WARNING] Failed to deobfuscate embedded config: {}", e);
+                error!("[CONFIG] FAILED to decrypt embedded config: {}. Falling back.", e);
             }
         }
-        
-        // Try filesystem config as fallback
-        if let Ok(exe_path) = env::current_exe() {
-            let exe_dir = exe_path.parent().unwrap_or(Path::new("."));
-            let config_path = exe_dir.join(".config").join("config.json");
-            
-            if config_path.exists() {
-                if let Ok(contents) = fs::read_to_string(&config_path) {
-                    if let Ok(config) = serde_json::from_str::<AgentConfig>(&contents) {
-                        if !config.server_url.is_empty() && !config.payload_id.is_empty() {
-                            return Ok(config);
-                        }
-                    }
+
+        // Fallback: Load from config.json in the same directory as the executable
+        if let Ok(mut exe_path) = env::current_exe() {
+            exe_path.pop();
+            let config_path = exe_path.join(".config/config.json");
+            if let Ok(contents) = fs::read_to_string(config_path) {
+                if let Ok(config) = serde_json::from_str(&contents) {
+                    warn!("[CONFIG] Loaded configuration from filesystem as a fallback.");
+                    return Ok(config);
                 }
             }
         }
 
-        // No valid config found
         Err(io::Error::new(io::ErrorKind::NotFound, "No valid configuration found"))
     }
 
