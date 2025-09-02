@@ -1,6 +1,7 @@
 use zeroize::Zeroize;
 
 // Conditionally compile the encryption backend
+// AES-GCM encryption backend
 #[cfg(feature = "encryption-aes")]
 mod aes_backend {
     use aes_gcm::{Aes256Gcm, Key, Nonce};
@@ -11,11 +12,13 @@ mod aes_backend {
         key: Key<Aes256Gcm>,
     }
 
+    // Implementation of the Protector
+    // This is essentially responsible for managing the encryption and decryption keys
     impl Protector {
         pub fn new() -> Self {
             Self { key: Aes256Gcm::generate_key(OsRng) }
         }
-
+        
         pub fn encrypt(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
             let cipher = Aes256Gcm::new(&self.key);
             let nonce_bytes = Aes256Gcm::generate_nonce(&mut OsRng);
@@ -37,6 +40,7 @@ mod aes_backend {
     }
 }
 
+// ChaCha20Poly1305 encryption backend
 #[cfg(feature = "encryption-chacha")]
 mod chacha_backend {
     use chacha20poly1305::{

@@ -47,6 +47,7 @@ fn dormant_startup() {
     }
 }
 
+// Main async function using Tokio runtime
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "windows")]
