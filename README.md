@@ -2,9 +2,9 @@
 
 ## 📚 Project Background and Development Context
 
-**This framework was developed as part of a bachelor's thesis conducted at the [Cyber Defence Campus](https://www.cydcampus.admin.ch/en) in collaboration with [ETH Zurich](https://ethz.ch/en.html). The project serves as a research testbed for exploring the limitations and detection capabilities of state-of-the-art AV and EDR solutions.**
+**This framework was developed as part of a bachelor's thesis conducted at the [Cyber Defence Campus](https://www.cydcampus.admin.ch/en) in collaboration with [ETH Zurich](https://ethz.ch/en.html) as of 30th of May 2025. The project serves as a research testbed for exploring the limitations and detection capabilities of state-of-the-art AV and EDR solutions.**
 
-(I do however plan on continuing developement on this as it has become a passion project. Goal is to build this into a fully fleshed out research testbed)
+(I am however continuing developement on this as it has become a passion project. The goal is to build this into a fully fleshed out research testbed.)
 
 ### ⚠️ Development Acknowledgments
 
