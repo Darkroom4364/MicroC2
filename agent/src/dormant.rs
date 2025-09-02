@@ -1,33 +1,143 @@
 use zeroize::Zeroize;
 
-// Conditionally compile and include the chosen encryption module.
+// Conditionally compile the encryption backend
 #[cfg(feature = "encryption-aes")]
-mod dormant_aes;
-#[cfg(feature = "encryption-aes")]
-use dormant_aes as protector_impl;
+mod aes_backend {
+    use aes_gcm::{Aes256Gcm, Key, Nonce};
+    use aes_gcm::aead::{AeadCore, Aead, OsRng, KeyInit};
+    use zeroize::Zeroize;
+
+    pub struct Protector {
+        key: Key<Aes256Gcm>,
+    }
+
+    impl Protector {
+        pub fn new() -> Self {
+            Self { key: Aes256Gcm::generate_key(OsRng) }
+        }
+
+        pub fn encrypt(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+            let cipher = Aes256Gcm::new(&self.key);
+            let nonce_bytes = Aes256Gcm::generate_nonce(&mut OsRng);
+            let ciphertext_and_tag = cipher.encrypt(&nonce_bytes, plaintext)
+                .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("AES encryption failed: {:?}", e))) as Box<dyn std::error::Error>)?;
+            Ok((nonce_bytes.to_vec(), ciphertext_and_tag))
+        }
+
+        pub fn decrypt(&self, nonce_bytes: &[u8], ciphertext_and_tag: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+            let cipher = Aes256Gcm::new(&self.key);
+            let nonce = Nonce::from_slice(nonce_bytes);
+            Ok(cipher.decrypt(nonce, ciphertext_and_tag)
+                .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("AES decryption failed: {:?}", e))) as Box<dyn std::error::Error>)?)
+        }
+
+        pub fn zeroize(&mut self) {
+            self.key.as_mut_slice().zeroize();
+        }
+    }
+}
 
 #[cfg(feature = "encryption-chacha")]
-mod dormant_chacha;
-#[cfg(feature = "encryption-chacha")]
-use dormant_chacha as protector_impl;
+mod chacha_backend {
+    use chacha20poly1305::{
+        aead::{Aead, AeadCore, KeyInit, OsRng},
+        ChaCha20Poly1305, Key, Nonce,
+    };
+    use zeroize::Zeroize;
+
+    pub struct Protector {
+        key: Key,
+    }
+
+    impl Protector {
+        pub fn new() -> Self {
+            Self {
+                key: ChaCha20Poly1305::generate_key(&mut OsRng),
+            }
+        }
+
+        pub fn encrypt(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+            let cipher = ChaCha20Poly1305::new(&self.key);
+            let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+            let ciphertext = cipher.encrypt(&nonce, plaintext)
+                .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("ChaCha20 encryption failed: {:?}", e))) as Box<dyn std::error::Error>)?;
+            Ok((nonce.to_vec(), ciphertext))
+        }
+
+        pub fn decrypt(&self, nonce_bytes: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+            let cipher = ChaCha20Poly1305::new(&self.key);
+            let nonce = Nonce::from_slice(nonce_bytes);
+            let plaintext = cipher.decrypt(nonce, ciphertext)
+                .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("ChaCha20 decryption failed: {:?}", e))) as Box<dyn std::error::Error>)?;
+            Ok(plaintext)
+        }
+
+        pub fn zeroize(&mut self) {
+            self.key.zeroize();
+        }
+    }
+}
+
+// Default fallback - use AES if no feature is enabled
+#[cfg(not(any(feature = "encryption-aes", feature = "encryption-chacha")))]
+mod aes_backend {
+    use aes_gcm::{Aes256Gcm, Key, Nonce};
+    use aes_gcm::aead::{AeadCore, Aead, OsRng, KeyInit};
+    use zeroize::Zeroize;
+
+    pub struct Protector {
+        key: Key<Aes256Gcm>,
+    }
+
+    impl Protector {
+        pub fn new() -> Self {
+            Self { key: Aes256Gcm::generate_key(OsRng) }
+        }
+
+        pub fn encrypt(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+            let cipher = Aes256Gcm::new(&self.key);
+            let nonce_bytes = Aes256Gcm::generate_nonce(&mut OsRng);
+            let ciphertext_and_tag = cipher.encrypt(&nonce_bytes, plaintext)
+                .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("AES encryption failed: {:?}", e))) as Box<dyn std::error::Error>)?;
+            Ok((nonce_bytes.to_vec(), ciphertext_and_tag))
+        }
+
+        pub fn decrypt(&self, nonce_bytes: &[u8], ciphertext_and_tag: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+            let cipher = Aes256Gcm::new(&self.key);
+            let nonce = Nonce::from_slice(nonce_bytes);
+            Ok(cipher.decrypt(nonce, ciphertext_and_tag)
+                .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("AES decryption failed: {:?}", e))) as Box<dyn std::error::Error>)?)
+        }
+
+        pub fn zeroize(&mut self) {
+            self.key.as_mut_slice().zeroize();
+        }
+    }
+}
+
+// Choose the backend based on features
+#[cfg(feature = "encryption-aes")]
+use aes_backend as backend;
+
+#[cfg(all(feature = "encryption-chacha", not(feature = "encryption-aes")))]
+use chacha_backend as backend;
+
+#[cfg(not(any(feature = "encryption-aes", feature = "encryption-chacha")))]
+use aes_backend as backend;
 
 // True in-memory protection - only encrypted storage
 pub struct MemoryProtector {
-    protector: protector_impl::Protector,
-    //  ONLY encrypted storage - no plaintext fields
+    protector: backend::Protector,
     encrypted_opsec_state: Option<(Vec<u8>, Vec<u8>)>,
     encrypted_config: Option<(Vec<u8>, Vec<u8>)>,
     encrypted_command_queue: Vec<(Vec<u8>, Vec<u8>)>,
     encrypted_file_buffer: Option<(Vec<u8>, Vec<u8>)>,
 }
 
-// The rest of this file remains the same, as it just calls methods on `self.protector`.
-// No changes are needed below this line.
-
 impl MemoryProtector {
     pub fn new() -> Self {
         Self {
-            protector: protector_impl::Protector::new(),
+            protector: backend::Protector::new(),
             encrypted_opsec_state: None,
             encrypted_config: None,
             encrypted_command_queue: Vec::new(),
@@ -37,7 +147,7 @@ impl MemoryProtector {
 
     //  Store encrypted OPSEC state
     pub fn encrypt_opsec_state(&mut self, opsec_state: &crate::opsec::OpsecState) -> Result<(), Box<dyn std::error::Error>> {
-        let serialized = bincode::serialize(opsec_state)?;
+        let serialized = bincode::encode_to_vec(opsec_state, bincode::config::standard())?;
         let (nonce, ciphertext) = self.protector.encrypt(&serialized)?;
         self.encrypted_opsec_state = Some((nonce, ciphertext));
         Ok(())
@@ -47,7 +157,7 @@ impl MemoryProtector {
     pub fn decrypt_opsec_state(&self) -> Result<crate::opsec::OpsecState, Box<dyn std::error::Error>> {
         if let Some((nonce, ciphertext)) = &self.encrypted_opsec_state {
             let decrypted = self.protector.decrypt(nonce, ciphertext)?;
-            let opsec_state: crate::opsec::OpsecState = bincode::deserialize(&decrypted)?;
+            let (opsec_state, _): (crate::opsec::OpsecState, usize) = bincode::decode_from_slice(&decrypted, bincode::config::standard())?;
             Ok(opsec_state)
         } else {
             Err("No encrypted OPSEC state found".into())
@@ -60,7 +170,7 @@ impl MemoryProtector {
     {
         if let Some((nonce, ciphertext)) = &self.encrypted_opsec_state {
             let decrypted = self.protector.decrypt(nonce, ciphertext)?;
-            let mut opsec_state: crate::opsec::OpsecState = bincode::deserialize(&decrypted)?;
+            let (mut opsec_state, _): (crate::opsec::OpsecState, usize) = bincode::decode_from_slice(&decrypted, bincode::config::standard())?;
             let result = f(&opsec_state);
             
             //  Immediately zeroize decrypted data
@@ -79,13 +189,13 @@ impl MemoryProtector {
     {
         let (nonce, ciphertext) = self.encrypted_opsec_state.as_ref().ok_or("No encrypted OPSEC state found")?;
         let mut decrypted_bytes = self.protector.decrypt(nonce, ciphertext)?;
-        let mut state: crate::opsec::OpsecState = bincode::deserialize(&decrypted_bytes)?;
+        let (mut state, _): (crate::opsec::OpsecState, usize) = bincode::decode_from_slice(&decrypted_bytes, bincode::config::standard())?;
         
         decrypted_bytes.zeroize();
         
         let result = f(&mut state);
         
-        let mut serialized_bytes = bincode::serialize(&state)?;
+        let mut serialized_bytes = bincode::encode_to_vec(&state, bincode::config::standard())?;
         let (new_nonce, new_ciphertext) = self.protector.encrypt(&serialized_bytes)?;
         
         serialized_bytes.zeroize();
@@ -96,7 +206,6 @@ impl MemoryProtector {
         Ok(result)
     }
 
-    // ... other methods like encrypt_config, add_command, etc. remain unchanged ...
     //  Config methods
     pub fn encrypt_config(&mut self, config: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
         let (nonce, ciphertext) = self.protector.encrypt(config)?;

