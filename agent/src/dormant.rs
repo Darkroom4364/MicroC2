@@ -15,10 +15,12 @@ mod aes_backend {
     // Implementation of the Protector
     // This is essentially responsible for managing the encryption and decryption keys
     impl Protector {
+        // Generate a new random key
         pub fn new() -> Self {
             Self { key: Aes256Gcm::generate_key(OsRng) }
         }
         
+        // Encrypt data, returning the nonce and ciphertext
         pub fn encrypt(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
             let cipher = Aes256Gcm::new(&self.key);
             let nonce_bytes = Aes256Gcm::generate_nonce(&mut OsRng);
@@ -27,6 +29,7 @@ mod aes_backend {
             Ok((nonce_bytes.to_vec(), ciphertext_and_tag))
         }
 
+        // Decrypt data given the nonce and ciphertext
         pub fn decrypt(&self, nonce_bytes: &[u8], ciphertext_and_tag: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
             let cipher = Aes256Gcm::new(&self.key);
             let nonce = Nonce::from_slice(nonce_bytes);
@@ -34,6 +37,7 @@ mod aes_backend {
                 .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("AES decryption failed: {:?}", e))) as Box<dyn std::error::Error>)?)
         }
 
+        // Zeroize the key when done
         pub fn zeroize(&mut self) {
             self.key.as_mut_slice().zeroize();
         }
