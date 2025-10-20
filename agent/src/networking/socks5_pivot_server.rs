@@ -22,8 +22,19 @@ impl Socks5PivotServer {
 
     pub async fn run(self, pivot_handler: Arc<tokio::sync::Mutex<Socks5PivotHandler>>) {
         let addr = format!("{}:{}", self.listen_addr, self.listen_port);
-        let listener = TcpListener::bind(&addr).await.expect("Failed to bind SOCKS5 pivot server");
-        info!("[SOCKS5-PIVOT] Listening on {}", addr);
+        
+        let listener = match TcpListener::bind(&addr).await {
+            Ok(listener) => {
+                info!("[SOCKS5-PIVOT] Listening on {}", addr);
+                listener
+            }
+            Err(e) => {
+                error!("[SOCKS5-PIVOT] Failed to bind to {}: {}. SOCKS5 pivot disabled.", addr, e);
+                error!("[SOCKS5-PIVOT] This is not fatal - agent continues without pivot capability.");
+                // Return gracefully instead of panicking
+                return;
+            }
+        };
 
         loop {
             match listener.accept().await {

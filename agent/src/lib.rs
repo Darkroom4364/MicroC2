@@ -7,5 +7,6 @@ pub mod dormant;
 pub mod state;
 pub mod file_handling;
 pub mod high_threat_tools;
+pub mod safe_mutex;
 #[cfg(target_os = "windows")]
 pub mod win_api_hiding;

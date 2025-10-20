@@ -1,13 +1,19 @@
 use std::error::Error;
 use std::path::Path;
+use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use reqwest::Client; // Use reqwest::Client
 use log::{info, warn, error, debug};
 
 /// Download a file using reqwest by streaming chunks directly to disk
+/// Includes timeout protection to prevent hanging on stalled connections
 pub async fn download_file(url: &str, dest_path: &Path) -> Result<(), Box<dyn Error>> {
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(Duration::from_secs(300)) // 5 minute total timeout
+        .connect_timeout(Duration::from_secs(30)) // 30 second connect timeout
+        .build()?;
+        
     let mut resp = client.get(url).send().await?; // Use reqwest::Client::get and send
 
     if !resp.status().is_success() {
@@ -17,8 +23,9 @@ pub async fn download_file(url: &str, dest_path: &Path) -> Result<(), Box<dyn Er
     // Create file asynchronously
     let mut file = File::create(dest_path).await?;
 
-    // Stream body chunks to file using reqwest::Response::chunk
-    while let Some(chunk) = resp.chunk().await? {
+    // Stream body chunks to file using reqwest::Response::chunk with timeout per chunk
+    let chunk_timeout = Duration::from_secs(60); // 1 minute per chunk
+    while let Ok(Some(chunk)) = tokio::time::timeout(chunk_timeout, resp.chunk()).await? {
         file.write_all(&chunk).await?;
     }
 
