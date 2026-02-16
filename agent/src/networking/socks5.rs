@@ -155,6 +155,7 @@ impl Socks5Client {
         }
     }
 
+    #[allow(dead_code)] // Part of connection pooling - to be completed
     async fn store_connection(&self, target: String, conn: TcpStream) {
         debug!("[SOCKS5] Storing connection to pool for {}", target);
         let mut pool = self.connection_pool.lock().await;
@@ -254,7 +255,7 @@ impl Socks5Client {
                     last_error = Some(e);
                     attempts += 1;
                     if attempts < retries {
-                        let delay = 1 << attempts;
+                        let delay = 1u64 << attempts.min(6); // Cap at 64s max
                         info!("[SOCKS5] Retrying in {} seconds...", delay);
                         tokio::time::sleep(Duration::from_secs(delay)).await;
                     }

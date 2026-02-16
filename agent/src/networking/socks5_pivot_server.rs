@@ -101,10 +101,20 @@ async fn handle_socks5_client(
             let port = u16::from_be_bytes(port);
             format!("{}:{}", domain, port)
         }
+        0x04 => { // IPv6
+            let mut ip = [0u8; 16];
+            stream.read_exact(&mut ip).await?;
+            let mut port = [0u8; 2];
+            stream.read_exact(&mut port).await?;
+            let ip = std::net::Ipv6Addr::from(ip);
+            let port = u16::from_be_bytes(port);
+            format!("[{}]:{}", ip, port)
+        }
         _ => return Err("Unsupported address type".into()),
     };
 
     // 3. Assign unique stream ID
+    // Note: fetch_add wraps on overflow. With ~4 billion IDs, collision is negligible.
     let stream_id = STREAM_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     info!("[SOCKS5-PIVOT] CONNECT to {} (stream_id={})", addr, stream_id);
 

@@ -1,8 +1,11 @@
 use zeroize::Zeroize;
 
 // Conditionally compile the encryption backend
-// AES-GCM encryption backend
-#[cfg(feature = "encryption-aes")]
+// AES-GCM encryption backend (used for encryption-aes feature AND as default fallback)
+#[cfg(any(
+    feature = "encryption-aes",
+    not(any(feature = "encryption-aes", feature = "encryption-chacha"))
+))]
 mod aes_backend {
     use aes_gcm::{Aes256Gcm, Key, Nonce};
     use aes_gcm::aead::{AeadCore, Aead, OsRng, KeyInit};
@@ -12,15 +15,11 @@ mod aes_backend {
         key: Key<Aes256Gcm>,
     }
 
-    // Implementation of the Protector
-    // This is essentially responsible for managing the encryption and decryption keys
     impl Protector {
-        // Generate a new random key
         pub fn new() -> Self {
             Self { key: Aes256Gcm::generate_key(OsRng) }
         }
-        
-        // Encrypt data, returning the nonce and ciphertext
+
         pub fn encrypt(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
             let cipher = Aes256Gcm::new(&self.key);
             let nonce_bytes = Aes256Gcm::generate_nonce(&mut OsRng);
@@ -29,7 +28,6 @@ mod aes_backend {
             Ok((nonce_bytes.to_vec(), ciphertext_and_tag))
         }
 
-        // Decrypt data given the nonce and ciphertext
         pub fn decrypt(&self, nonce_bytes: &[u8], ciphertext_and_tag: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
             let cipher = Aes256Gcm::new(&self.key);
             let nonce = Nonce::from_slice(nonce_bytes);
@@ -37,7 +35,6 @@ mod aes_backend {
                 .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("AES decryption failed: {:?}", e))) as Box<dyn std::error::Error>)?)
         }
 
-        // Zeroize the key when done
         pub fn zeroize(&mut self) {
             self.key.as_mut_slice().zeroize();
         }
@@ -82,43 +79,6 @@ mod chacha_backend {
 
         pub fn zeroize(&mut self) {
             self.key.zeroize();
-        }
-    }
-}
-
-// Default fallback - use AES if no feature is enabled
-#[cfg(not(any(feature = "encryption-aes", feature = "encryption-chacha")))]
-mod aes_backend {
-    use aes_gcm::{Aes256Gcm, Key, Nonce};
-    use aes_gcm::aead::{AeadCore, Aead, OsRng, KeyInit};
-    use zeroize::Zeroize;
-
-    pub struct Protector {
-        key: Key<Aes256Gcm>,
-    }
-
-    impl Protector {
-        pub fn new() -> Self {
-            Self { key: Aes256Gcm::generate_key(OsRng) }
-        }
-
-        pub fn encrypt(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
-            let cipher = Aes256Gcm::new(&self.key);
-            let nonce_bytes = Aes256Gcm::generate_nonce(&mut OsRng);
-            let ciphertext_and_tag = cipher.encrypt(&nonce_bytes, plaintext)
-                .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("AES encryption failed: {:?}", e))) as Box<dyn std::error::Error>)?;
-            Ok((nonce_bytes.to_vec(), ciphertext_and_tag))
-        }
-
-        pub fn decrypt(&self, nonce_bytes: &[u8], ciphertext_and_tag: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-            let cipher = Aes256Gcm::new(&self.key);
-            let nonce = Nonce::from_slice(nonce_bytes);
-            Ok(cipher.decrypt(nonce, ciphertext_and_tag)
-                .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("AES decryption failed: {:?}", e))) as Box<dyn std::error::Error>)?)
-        }
-
-        pub fn zeroize(&mut self) {
-            self.key.as_mut_slice().zeroize();
         }
     }
 }
@@ -249,6 +209,23 @@ impl MemoryProtector {
             decrypted.zeroize();
         }
         Ok(commands)
+    }
+
+    /// Decrypt and remove the first queued command, or return None if empty.
+    pub fn pop_command(&mut self) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+        if self.encrypted_command_queue.is_empty() {
+            return Ok(None);
+        }
+        let (nonce, ciphertext) = self.encrypted_command_queue.remove(0);
+        let mut decrypted = self.protector.decrypt(&nonce, &ciphertext)?;
+        let result = decrypted.clone();
+        decrypted.zeroize();
+        Ok(Some(result))
+    }
+
+    /// Return the number of queued commands without decrypting them.
+    pub fn command_queue_len(&self) -> usize {
+        self.encrypted_command_queue.len()
     }
 
     //  Complete cleanup

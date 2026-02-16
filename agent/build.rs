@@ -2,8 +2,9 @@ use std::env;
 use std::fs;
 use std::path::Path;
 
-/// Optimized key derivation using Blake3 one-shot hashing
-/// Blake3 is faster and more secure than DefaultHasher while being size-efficient
+/// Key derivation using ChaCha20 quarter-round mixing over DefaultHasher seed.
+/// IMPORTANT: This implementation MUST match config.rs derive_key_from_seed() exactly.
+/// Build scripts cannot import from the main crate, so this is intentionally duplicated.
 #[cfg(any(feature = "encryption-aes", feature = "encryption-chacha"))]
 fn derive_key_from_seed(seed: &str) -> [u8; 32] {
     // Use Blake3's one-shot API for optimal performance and size
@@ -46,8 +47,7 @@ fn derive_key_from_seed(seed: &str) -> [u8; 32] {
         chacha20_quarter_round(&mut state, 2, 7, 8, 13);
         chacha20_quarter_round(&mut state, 3, 4, 9, 14);
     }
-    
-    // Extract 32 bytes from the mixed state
+        // Extract 32 bytes from the mixed state
     for (i, chunk) in state[0..8].iter().enumerate() {
         let bytes = chunk.to_le_bytes();
         key[i * 4..(i + 1) * 4].copy_from_slice(&bytes);
@@ -100,12 +100,12 @@ fn derive_key_from_seed(seed: &str) -> [u8; 32] {
 }
 
 // --- AES Encryption Logic ---
+// NOTE: When both encryption-aes and encryption-chacha features are enabled,
+// AES takes priority. The chacha variant below is guarded with not(encryption-aes).
 #[cfg(feature = "encryption-aes")]
 fn encrypt_config(config_json: &str, payload_id: &str) -> (Vec<u8>, String) {
     use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
     use aes_gcm::{Aes256Gcm, Key};
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
 
     // Derive a proper 256-bit key from payload_id using multiple hash rounds
     let key_material = derive_key_from_seed(payload_id);
@@ -121,7 +121,7 @@ fn encrypt_config(config_json: &str, payload_id: &str) -> (Vec<u8>, String) {
 }
 
 // --- ChaCha20 Encryption Logic ---
-#[cfg(feature = "encryption-chacha")]
+#[cfg(all(feature = "encryption-chacha", not(feature = "encryption-aes")))]
 fn encrypt_config(config_json: &str, payload_id: &str) -> (Vec<u8>, String) {
     use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
     use chacha20poly1305::{ChaCha20Poly1305, Key};
@@ -137,6 +137,18 @@ fn encrypt_config(config_json: &str, payload_id: &str) -> (Vec<u8>, String) {
     let mut encrypted_data = nonce.to_vec();
     encrypted_data.extend_from_slice(&ciphertext);
     (encrypted_data, payload_id.to_string())
+}
+
+// --- Fallback: XOR obfuscation when no encryption feature is enabled ---
+#[cfg(not(any(feature = "encryption-aes", feature = "encryption-chacha")))]
+fn encrypt_config(config_json: &str, payload_id: &str) -> (Vec<u8>, String) {
+    let key = derive_key_from_seed(payload_id);
+    let encrypted: Vec<u8> = config_json.as_bytes()
+        .iter()
+        .enumerate()
+        .map(|(i, b)| b ^ key[i % key.len()])
+        .collect();
+    (encrypted, payload_id.to_string())
 }
 
 fn log_build(msg: &str) {

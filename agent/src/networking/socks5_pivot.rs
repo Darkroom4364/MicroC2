@@ -74,7 +74,12 @@ impl Socks5PivotHandler {
                 if let Some(stream) = self.streams.get(&frame.stream_id) {
                     let mut stream = stream.lock().await;
                     log::debug!("[SOCKS5-PIVOT] Writing {} bytes to stream {}", frame.payload.len(), frame.stream_id);
-                    let _ = stream.write_all(&frame.payload).await;
+                    if let Err(e) = stream.write_all(&frame.payload).await {
+                        log::error!(
+                            "[SOCKS5-PIVOT] Failed to write {} bytes to stream {}: {}",
+                            frame.payload.len(), frame.stream_id, e
+                        );
+                    }
                 } else {
                     log::warn!("[SOCKS5-PIVOT] No stream found for stream_id {}", frame.stream_id);
                 }
