@@ -1,14 +1,14 @@
-// This file will be moved to the new 'listeners' folder as 'listener.go'.
-
 package listeners
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	behaviour "microc2/server/internal/behaviour"
-	"microc2/server/internal/common" // Import BaseProtocolConfig
+	"microc2/server/internal/common"
 	"net"
 	"net/http"
 	"os"
@@ -86,13 +86,10 @@ type Listener struct {
 	Headers         map[string]string `json:"headers,omitempty"`
 	UserAgent       string            `json:"user_agent,omitempty"`
 	mu              sync.RWMutex
-	fileHandler     *FileHandler
-	cmdQueue        *CommandQueue
-	stopChan        chan struct{}
 	listener        net.Listener
-	tlsConfig       *tls.Config
+	server          *http.Server
 	protocolHandler http.Handler // HTTP handler for http
-	Protocol        Protocol     // underlying protocol instance
+	Protocol        common.Protocol
 }
 
 // ListenerStats tracks operational statistics for a listener
@@ -103,6 +100,51 @@ type ListenerStats struct {
 	BytesReceived     int64     `json:"bytes_received"`
 	BytesSent         int64     `json:"bytes_sent"`
 	FailedConnections int64     `json:"failed_connections"`
+}
+
+type ListenerSnapshot struct {
+	Config    ListenerConfig    `json:"config"`
+	Status    ListenerStatus    `json:"status"`
+	Error     string            `json:"error,omitempty"`
+	StartTime time.Time         `json:"start_time"`
+	StopTime  time.Time         `json:"stop_time,omitempty"`
+	Stats     ListenerStats     `json:"stats"`
+	URIs      []string          `json:"uris,omitempty"`
+	Headers   map[string]string `json:"headers,omitempty"`
+	UserAgent string            `json:"user_agent,omitempty"`
+}
+
+func (l *Listener) Snapshot() ListenerSnapshot {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	return ListenerSnapshot{
+		Config:    l.Config,
+		Status:    l.Status,
+		Error:     l.Error,
+		StartTime: l.StartTime,
+		StopTime:  l.StopTime,
+		Stats:     l.Stats,
+		URIs:      append([]string(nil), l.URIs...),
+		Headers:   cloneStringMap(l.Headers),
+		UserAgent: l.UserAgent,
+	}
+}
+
+func (l *Listener) MarshalJSON() ([]byte, error) {
+	snapshot := l.Snapshot()
+	return json.Marshal(snapshot)
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 // NewListener creates a new listener instance with the given configuration
@@ -116,6 +158,8 @@ type ListenerStats struct {
 //   - Listener is in stopped state
 //   - Returns error if the protocol is not supported or configuration is invalid
 func NewListener(config ListenerConfig) (*Listener, error) {
+	config.Protocol = strings.ToLower(config.Protocol)
+
 	// Create listener-specific directory in static/listeners
 	listenerDir := filepath.Join("static", "listeners", config.Name)
 	if err := os.MkdirAll(listenerDir, 0755); err != nil {
@@ -133,15 +177,9 @@ func NewListener(config ListenerConfig) (*Listener, error) {
 		return nil, fmt.Errorf("failed to save listener config: %v", err)
 	}
 
-	// Initialize file handler with the listener-specific directory
-	fileHandler, err := NewFileHandler(listenerDir)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create file handler: %v", err)
-	}
-
 	// Initialize protocol handler based on config
 	var protoHandler http.Handler
-	var proto Protocol
+	var proto common.Protocol
 	switch config.Protocol {
 	case "http", "https":
 		protoConfig := common.BaseProtocolConfig{
@@ -153,45 +191,22 @@ func NewListener(config ListenerConfig) (*Listener, error) {
 		proto = httpProto
 		// Ensure upload directory exists
 		os.MkdirAll(protoConfig.UploadDir, 0755)
-	case "DNSoverHTTPS":
+	case "dns", "dnsoverhttps":
 		// DNSoverHTTPS logic (may be implemented later)
 		return nil, fmt.Errorf("DNSoverHTTPS protocol is not implemented yet")
+	default:
+		return nil, fmt.Errorf("unsupported protocol: %s", config.Protocol)
 	}
 
 	// Construct listener instance
 	l := &Listener{
 		Config:          config,
 		Status:          StatusStopped,
-		stopChan:        make(chan struct{}),
 		Stats:           ListenerStats{},
-		fileHandler:     fileHandler,
-		cmdQueue:        NewCommandQueue(),
 		protocolHandler: protoHandler,
 		Protocol:        proto,
 	}
 	return l, nil
-}
-
-// GetFileHandler returns the listener's file handler
-//
-// Pre-conditions:
-//   - None
-//
-// Post-conditions:
-//   - Returns the file handler associated with the listener
-func (l *Listener) GetFileHandler() *FileHandler {
-	return l.fileHandler
-}
-
-// GetCommandQueue returns the listener's command queue
-//
-// Pre-conditions:
-//   - None
-//
-// Post-conditions:
-//   - Returns the command queue associated with the listener
-func (l *Listener) GetCommandQueue() *CommandQueue {
-	return l.cmdQueue
 }
 
 // Start initiates the listener
@@ -212,37 +227,77 @@ func (l *Listener) Start() error {
 	if l.Status == StatusActive {
 		return fmt.Errorf("listener %s is already running", l.Config.Name)
 	}
+	if l.protocolHandler == nil {
+		return fmt.Errorf("listener %s has no protocol handler for %s", l.Config.Name, l.Config.Protocol)
+	}
 
 	l.Error = ""
+	if l.Config.BindHost == "" {
+		l.Config.BindHost = "0.0.0.0"
+	}
 	addr := fmt.Sprintf("%s:%d", l.Config.BindHost, l.Config.Port)
 
-	server := &http.Server{
-		Addr:    addr,
-		Handler: l.protocolHandler,
+	var tlsConfig *tls.Config
+	if l.usesTLS() {
+		certFile, keyFile := l.tlsCertFiles()
+		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			l.Error = err.Error()
+			return fmt.Errorf("failed to load TLS certificate for listener %s: %w", l.Config.Name, err)
+		}
+		tlsConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
 	}
+
+	server := &http.Server{
+		Addr:      addr,
+		Handler:   l.protocolHandler,
+		TLSConfig: tlsConfig,
+	}
+
+	tcpListener, err := net.Listen("tcp", addr)
+	if err != nil {
+		l.Error = err.Error()
+		return fmt.Errorf("failed to bind listener %s on %s: %w", l.Config.Name, addr, err)
+	}
+
+	l.listener = tcpListener
+	l.server = server
+	l.Status = StatusActive
+	l.StartTime = time.Now()
+	l.StopTime = time.Time{}
 
 	go func() {
 		var err error
-		if l.Config.Protocol == "https" {
-			certFile := "certs/server.crt"
-			keyFile := "certs/server.key"
+		if l.usesTLS() {
 			// log.Printf("[DEBUG] Loading TLS configuration from %s and %s", certFile, keyFile)
 			// log.Printf("[DEBUG] Starting HTTPS server on %s", addr)
-			err = server.ListenAndServeTLS(certFile, keyFile)
+			err = server.ServeTLS(tcpListener, "", "")
 		} else {
 			// log.Printf("[DEBUG] Starting HTTP server on %s", addr)
-			err = server.ListenAndServe()
+			err = server.Serve(tcpListener)
 		}
 		if err != nil && err != http.ErrServerClosed {
 			log.Printf("[ERROR] HTTP server error: %v", err)
+			_ = tcpListener.Close()
 			l.SetError(err)
 		}
 	}()
 
-	l.Status = StatusActive
-	l.StartTime = time.Now()
-	l.StopTime = time.Time{}
 	return nil
+}
+
+func (l *Listener) usesTLS() bool {
+	return l.Config.Protocol == "https" || l.Config.TLSConfig != nil
+}
+
+func (l *Listener) tlsCertFiles() (string, string) {
+	if l.Config.TLSConfig != nil {
+		return l.Config.TLSConfig.CertFile, l.Config.TLSConfig.KeyFile
+	}
+	return "certs/server.crt", "certs/server.key"
 }
 
 // Stop halts the listener operation
@@ -258,22 +313,44 @@ func (l *Listener) Start() error {
 //   - Returns error if the listener can't be stopped cleanly
 func (l *Listener) Stop() error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if l.Status != StatusActive {
+	if l.Status != StatusActive && l.Status != StatusError {
+		l.mu.Unlock()
 		return fmt.Errorf("listener %s is not running", l.Config.Name)
 	}
 
-	// Signal the stop channel to shut down the handler
-	close(l.stopChan)
-
-	if err := l.listener.Close(); err != nil {
-		l.Error = err.Error()
-		return fmt.Errorf("error stopping listener: %v", err)
-	}
+	server := l.server
+	tcpListener := l.listener
 
 	l.Status = StatusStopped
 	l.StopTime = time.Now()
+	l.server = nil
+	l.listener = nil
+	l.mu.Unlock()
+
+	if server != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil && err != http.ErrServerClosed && !errors.Is(err, net.ErrClosed) {
+			if tcpListener != nil {
+				_ = tcpListener.Close()
+			}
+			l.mu.Lock()
+			l.Error = err.Error()
+			l.mu.Unlock()
+			return fmt.Errorf("error stopping listener: %v", err)
+		}
+		if tcpListener != nil {
+			_ = tcpListener.Close()
+		}
+	} else if tcpListener != nil {
+		if err := tcpListener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			l.mu.Lock()
+			l.Error = err.Error()
+			l.mu.Unlock()
+			return fmt.Errorf("error stopping listener: %v", err)
+		}
+	}
+
 	log.Printf("[INFO] Stopped listener %s", l.Config.Name)
 	return nil
 }
@@ -317,123 +394,13 @@ func (l *Listener) SetError(err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	if l.Status == StatusStopped && (err == http.ErrServerClosed || errors.Is(err, net.ErrClosed)) {
+		return
+	}
 	l.Status = StatusError
 	if err != nil {
 		l.Error = err.Error()
 	} else {
 		l.Error = "Unknown error"
 	}
-}
-
-// Define the oneShotListener type.
-type oneShotListener struct {
-	conn net.Conn
-}
-
-func (o *oneShotListener) Accept() (net.Conn, error) {
-	if o.conn == nil {
-		return nil, fmt.Errorf("no connection available")
-	}
-	c := o.conn
-	o.conn = nil
-	return c, nil
-}
-
-func (o *oneShotListener) Close() error {
-	return nil
-}
-
-func (o *oneShotListener) Addr() net.Addr {
-	if o.conn != nil {
-		return o.conn.LocalAddr()
-	}
-	return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}
-}
-
-// Define the GetConnectionHandler function.
-func GetConnectionHandler(listener *Listener) (ConnectionHandler, error) {
-	switch strings.ToLower(listener.Config.Protocol) {
-	case "http", "https":
-		return NewPollingHandler(listener), nil
-	case "socks5":
-		return NewSOCKS5Handler(listener)
-	default:
-		return nil, fmt.Errorf("unsupported protocol: %s", listener.Config.Protocol)
-	}
-}
-
-// Define the ConnectionHandler interface.
-type ConnectionHandler interface {
-	HandleConnection(conn net.Conn) error
-	ValidateConnection(conn net.Conn) error
-}
-
-// Define the NewPollingHandler function.
-func NewPollingHandler(listener *Listener) *PollingHandler {
-	return &PollingHandler{
-		proto: behaviour.NewHTTPPollingProtocol(common.BaseProtocolConfig{
-			UploadDir: filepath.Join("static", "listeners", listener.Config.Name, "uploads"),
-		}),
-	}
-}
-
-// Define the NewSOCKS5Handler function.
-func NewSOCKS5Handler(listener *Listener) (*SOCKS5Handler, error) {
-	return &SOCKS5Handler{
-		listener: listener,
-	}, nil
-}
-
-// Define the PollingHandler type.
-type PollingHandler struct {
-	proto *behaviour.HTTPPollingProtocol
-}
-
-// Add the HandleConnection method to PollingHandler.
-func (h *PollingHandler) HandleConnection(conn net.Conn) error {
-	defer conn.Close()
-	server := &http.Server{Handler: h.proto.GetHTTPHandler()}
-	server.SetKeepAlivesEnabled(false)
-	return server.Serve(&oneShotListener{conn: conn})
-}
-
-// Add the ValidateConnection method to PollingHandler.
-func (h *PollingHandler) ValidateConnection(conn net.Conn) error {
-	// Placeholder implementation for validating connections.
-	return nil
-}
-
-// Define the SOCKS5Handler type.
-type SOCKS5Handler struct {
-	listener *Listener
-}
-
-// Add the HandleConnection method to SOCKS5Handler.
-func (h *SOCKS5Handler) HandleConnection(conn net.Conn) error {
-	defer conn.Close()
-	// Placeholder implementation for SOCKS5 connection handling.
-	return nil
-}
-
-// Add the ValidateConnection method to SOCKS5Handler.
-func (h *SOCKS5Handler) ValidateConnection(conn net.Conn) error {
-	// Placeholder implementation for validating SOCKS5 connections.
-	return nil
-}
-
-// Define missing types
-// FileHandler is a placeholder for the actual implementation
-type FileHandler struct{}
-
-// NewFileHandler is a placeholder function to resolve errors
-func NewFileHandler(dir string) (*FileHandler, error) {
-	return &FileHandler{}, nil
-}
-
-// CommandQueue is a placeholder for the actual implementation
-type CommandQueue struct{}
-
-// NewCommandQueue is a placeholder function to resolve errors
-func NewCommandQueue() *CommandQueue {
-	return &CommandQueue{}
 }

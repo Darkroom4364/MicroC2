@@ -1,52 +1,32 @@
-// This file will be moved to the new 'listeners' folder as 'listener_management.go'.
 package listeners
 
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
+	"microc2/server/internal/common"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
-	behaviour "microc2/server/internal/behaviour"
-	"microc2/server/internal/common"
-
 	"github.com/google/uuid"
 )
-
-// Define missing types
-// BaseProtocolConfig is a placeholder for the actual implementation
-// Removed local definition of BaseProtocolConfig
-
-// Define missing Protocol interface
-// Protocol defines the interface that all communication protocols must implement
-type Protocol interface {
-	Initialize() error
-	HandleCommand(cmd string) error
-	HandleFileUpload(filename string, fileData io.Reader) error
-	HandleFileDownload(filename string) (io.Reader, error)
-	HandleAgentHeartbeat(agentData []byte) error
-	GetRoutes() map[string]http.HandlerFunc
-	GetHTTPHandler() http.Handler
-}
 
 // ListenerManager handles the creation, management, and tracking of protocol listeners.
 // It maintains a thread-safe registry of all active and stopped listeners.
 type ListenerManager struct {
 	listeners map[string]*Listener
-	protocol  Protocol // Add field to hold the main protocol instance
+	protocol  common.Protocol
 	mu        sync.RWMutex
 }
 
 // NewListenerManager creates a new listener manager instance
-func NewListenerManager(proto Protocol) *ListenerManager { // Accept protocol instance
+func NewListenerManager(proto common.Protocol) *ListenerManager {
 	manager := &ListenerManager{
 		listeners: make(map[string]*Listener),
-		protocol:  proto, // Store the protocol instance
+		protocol:  proto,
 	}
 
 	// Load saved listener configurations
@@ -59,7 +39,6 @@ func NewListenerManager(proto Protocol) *ListenerManager { // Accept protocol in
 		return manager
 	}
 
-	// Pass the manager itself to NewListener when loading saved configs
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -79,8 +58,7 @@ func NewListenerManager(proto Protocol) *ListenerManager { // Accept protocol in
 			continue
 		}
 
-		// Create a new listener instance with STOPPED status, passing the manager
-		listener, err := NewListener(config) // Updated function signature
+		listener, err := NewListener(config)
 		if err != nil {
 			log.Printf("[WARNING] Failed to create listener instance for %s: %v", config.Name, err)
 			continue
@@ -95,7 +73,7 @@ func NewListenerManager(proto Protocol) *ListenerManager { // Accept protocol in
 }
 
 // GetProtocol returns the protocol instance associated with the manager
-func (m *ListenerManager) GetProtocol() Protocol {
+func (m *ListenerManager) GetProtocol() common.Protocol {
 	return m.protocol
 }
 
@@ -112,61 +90,29 @@ func (m *ListenerManager) CreateListener(config ListenerConfig) (*Listener, erro
 	defer m.mu.Unlock()
 
 	config.ID = uuid.New().String()
+	if config.BindHost == "" {
+		config.BindHost = "0.0.0.0"
+	}
+	config.Protocol = strings.ToLower(config.Protocol)
 	if err := m.validateListenerConfig(config); err != nil {
 		return nil, err
 	}
-
-	// HTTP polling uses a dedicated HTTP server
-	if config.Protocol == "http" {
-		// Prepare listener directory and save config.json
-		listenerDir := filepath.Join("static", "listeners", config.Name)
-		if err := os.MkdirAll(listenerDir, 0755); err != nil {
-			return nil, fmt.Errorf("failed to create listener directory: %w", err)
-		}
-		cfgPath := filepath.Join(listenerDir, "config.json")
-		cfgBytes, err := json.MarshalIndent(config, "", "  ")
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal listener config: %w", err)
-		}
-		if err := os.WriteFile(cfgPath, cfgBytes, 0644); err != nil {
-			return nil, fmt.Errorf("failed to save listener config: %w", err)
-		}
-		// Setup upload directory inside listener
-		uploadDir := filepath.Join(listenerDir, "uploads")
-		protoConfig := common.BaseProtocolConfig{UploadDir: uploadDir, Port: fmt.Sprintf("%d", config.Port)}
-		httpProto := behaviour.NewHTTPPollingProtocol(protoConfig)
-		// Use config.BindHost if provided, otherwise default to 0.0.0.0
-		bindHost := config.BindHost
-		if bindHost == "" {
-			bindHost = "0.0.0.0"
-		}
-		bindAddr := fmt.Sprintf("%s:%d", bindHost, config.Port)
-		handler := httpProto.GetHTTPHandler()
-		if handler == nil {
-			log.Fatalf("[FATAL] HTTPPollingProtocol.GetHTTPHandler() returned nil for listener %s on %s", config.Name, bindAddr)
-			panic("HTTPPollingProtocol.GetHTTPHandler() returned nil")
-		}
-		log.Printf("[INFO] Starting HTTP server for listener %s on %s with handler type: %T", config.Name, bindAddr, handler)
-		go func() {
-			if config.TLSConfig != nil {
-				log.Printf("[INFO] Starting HTTPS polling listener %s on %s", config.Name, bindAddr)
-				http.ListenAndServeTLS(bindAddr, config.TLSConfig.CertFile, config.TLSConfig.KeyFile, handler)
-			} else {
-				log.Printf("[INFO] Starting HTTP polling listener %s on %s", config.Name, bindAddr)
-				http.ListenAndServe(bindAddr, handler)
-			}
-		}()
-		l := &Listener{Config: config, Status: StatusActive, StartTime: time.Now(), Protocol: httpProto}
-		m.listeners[config.ID] = l
-		return l, nil
+	if m.hasNameConflict(config) {
+		return nil, fmt.Errorf("listener name %q is already registered", config.Name)
+	}
+	if m.hasPortConflict(config) {
+		return nil, fmt.Errorf("port %d is already used by an active listener", config.Port)
 	}
 
-	// Fallback: use raw TCP listener for other protocols
 	listener, err := NewListener(config)
 	if err != nil {
 		return nil, err
 	}
 	if err := listener.Start(); err != nil {
+		listenerDir := filepath.Join("static", "listeners", config.Name)
+		if cleanupErr := os.RemoveAll(listenerDir); cleanupErr != nil {
+			log.Printf("[WARNING] Failed to cleanup listener directory %s after start failure: %v", listenerDir, cleanupErr)
+		}
 		return nil, err
 	}
 	m.listeners[config.ID] = listener
@@ -252,7 +198,7 @@ func (m *ListenerManager) RemoveListener(id string) error {
 	}
 
 	// Stop the listener if it's running
-	if listener.Status == StatusActive {
+	if listener.GetStatus() == StatusActive || listener.GetStatus() == StatusError {
 		if err := listener.Stop(); err != nil {
 			log.Printf("[WARNING] Failed to stop listener %s: %v", id, err)
 		}
@@ -274,14 +220,15 @@ func (m *ListenerManager) RemoveListener(id string) error {
 //   - Returns error if the listener doesn't exist or can't be stopped
 func (m *ListenerManager) StopListener(id string) error {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	listener, exists := m.listeners[id]
-	m.mu.Unlock()
 
 	if !exists {
 		return fmt.Errorf("listener not found: %s", id)
 	}
 
-	if listener.Status == StatusStopped {
+	if listener.GetStatus() == StatusStopped {
 		return nil // Already stopped
 	}
 
@@ -303,19 +250,28 @@ func (m *ListenerManager) StopListener(id string) error {
 //   - Returns error if the listener doesn't exist or can't be started
 func (m *ListenerManager) StartListener(id string) error {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	listener, exists := m.listeners[id]
-	m.mu.Unlock()
 
 	if !exists {
 		return fmt.Errorf("listener not found: %s", id)
 	}
 
-	if listener.Status == StatusActive {
+	status := listener.GetStatus()
+	if status == StatusActive {
 		return nil // Already running
 	}
+	if status == StatusError {
+		if err := listener.Stop(); err != nil {
+			return fmt.Errorf("failed to cleanup errored listener before restart: %w", err)
+		}
+	}
 
-	// Create a new stop channel since the old one was closed
-	listener.stopChan = make(chan struct{})
+	conflict := m.hasPortConflict(listener.Config)
+	if conflict {
+		return fmt.Errorf("port %d is already used by an active listener", listener.Config.Port)
+	}
 
 	// Start the listener
 	if err := listener.Start(); err != nil {
@@ -345,7 +301,7 @@ func (m *ListenerManager) DeleteListener(id string) error {
 	}
 
 	// If listener is active, stop it first
-	if listener.Status == StatusActive {
+	if listener.GetStatus() == StatusActive || listener.GetStatus() == StatusError {
 		if err := listener.Stop(); err != nil {
 			return fmt.Errorf("failed to stop listener before deletion: %v", err)
 		}
@@ -377,7 +333,7 @@ func (m *ListenerManager) StopAll() []error {
 
 	var errors []error
 	for id, listener := range m.listeners {
-		if listener.Status == StatusActive {
+		if listener.GetStatus() == StatusActive || listener.GetStatus() == StatusError {
 			if err := listener.Stop(); err != nil {
 				errors = append(errors, fmt.Errorf("failed to stop listener %s: %v", id, err))
 			}
@@ -401,7 +357,7 @@ func (m *ListenerManager) DeleteAll() []error {
 
 	var errors []error
 	for id, listener := range m.listeners {
-		if listener.Status == StatusActive {
+		if listener.GetStatus() == StatusActive || listener.GetStatus() == StatusError {
 			if err := listener.Stop(); err != nil {
 				errors = append(errors, fmt.Errorf("failed to stop listener %s: %v", id, err))
 				continue // Skip deletion if stopping fails
@@ -429,15 +385,18 @@ func (m *ListenerManager) validateListenerConfig(config ListenerConfig) error {
 		log.Printf("[ERROR] Listener validation failed: protocol is required")
 		return fmt.Errorf("protocol is required")
 	}
+	protocol := strings.ToLower(config.Protocol)
+	switch protocol {
+	case "http", "https":
+	case "dns", "dnsoverhttps":
+		return fmt.Errorf("DNSoverHTTPS protocol is not implemented yet")
+	default:
+		return fmt.Errorf("unsupported protocol: %s", config.Protocol)
+	}
 
 	if config.Port < 1 || config.Port > 65535 {
 		log.Printf("[ERROR] Listener validation failed: invalid port number %d", config.Port)
 		return fmt.Errorf("invalid port number: %d", config.Port)
-	}
-
-	if config.BindHost == "" {
-		log.Printf("[INFO] BindHost not provided, defaulting to 0.0.0.0")
-		config.BindHost = "0.0.0.0" // Set default bind address
 	}
 
 	// Validate TLS configuration if provided
@@ -462,8 +421,19 @@ func (m *ListenerManager) validateListenerConfig(config ListenerConfig) error {
 func (m *ListenerManager) hasPortConflict(config ListenerConfig) bool {
 	for id, l := range m.listeners {
 		// Check against other listeners (not itself if config.ID is provided and matches)
-		if l.Config.Port == config.Port && l.Status == StatusActive && id != config.ID {
+		status := l.GetStatus()
+		if l.Config.Port == config.Port && (status == StatusActive || status == StatusError) && id != config.ID {
 			log.Printf("[WARN] Port conflict detected: Port %d is already used by active listener %s (%s)", config.Port, l.Config.Name, id)
+			return true
+		}
+	}
+	return false
+}
+
+func (m *ListenerManager) hasNameConflict(config ListenerConfig) bool {
+	for id, l := range m.listeners {
+		if l.Config.Name == config.Name && id != config.ID {
+			log.Printf("[WARN] Name conflict detected: listener %q is already registered as %s", config.Name, id)
 			return true
 		}
 	}
@@ -483,8 +453,12 @@ func (m *ListenerManager) CleanupInactive(threshold time.Duration) {
 
 	now := time.Now()
 	for id, listener := range m.listeners {
-		if listener.Status == StatusStopped && !listener.StopTime.IsZero() {
-			if now.Sub(listener.StopTime) > threshold {
+		listener.mu.RLock()
+		status := listener.Status
+		stopTime := listener.StopTime
+		listener.mu.RUnlock()
+		if status == StatusStopped && !stopTime.IsZero() {
+			if now.Sub(stopTime) > threshold {
 				delete(m.listeners, id)
 			}
 		}
@@ -503,7 +477,8 @@ func (m *ListenerManager) LoadSavedListener(configPath string) (*Listener, error
 		return nil, fmt.Errorf("failed to parse config: %v", err)
 	}
 
-	listener, err := NewListener(config) // Updated function signature
+	config.Protocol = strings.ToLower(config.Protocol)
+	listener, err := NewListener(config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create listener: %v", err)
 	}
