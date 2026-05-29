@@ -14,7 +14,7 @@ import (
 )
 
 type ServerManager struct {
-	protocol        listeners.Protocol
+	protocol        common.Protocol
 	config          *ServerConfig
 	listenerManager *listeners.ListenerManager
 }
@@ -36,7 +36,7 @@ func NewServerManager(config *ServerConfig) (*ServerManager, error) {
 		Port:      config.Port,
 	}
 
-	var protocol listeners.Protocol
+	var protocol common.Protocol
 	switch config.ProtocolType {
 	case "http":
 		protocol = behaviour.NewHTTPPollingProtocol(baseConfig)
@@ -60,7 +60,7 @@ func NewServerManager(config *ServerConfig) (*ServerManager, error) {
 }
 
 // GetProtocol returns the current protocol instance
-func (sm *ServerManager) GetProtocol() listeners.Protocol {
+func (sm *ServerManager) GetProtocol() common.Protocol {
 	return sm.protocol
 }
 

@@ -31,10 +31,6 @@ type HTTPPollingProtocol struct {
 		sync.Mutex
 		list map[string]*Agent
 	}
-	listeners struct {
-		sync.Mutex
-		list map[string]*Listener
-	}
 }
 
 type CommandResult struct {
@@ -62,10 +58,6 @@ func NewHTTPPollingProtocol(config common.BaseProtocolConfig) *HTTPPollingProtoc
 			sync.Mutex
 			list map[string]*Agent
 		}{list: make(map[string]*Agent)},
-		listeners: struct {
-			sync.Mutex
-			list map[string]*Listener
-		}{list: make(map[string]*Listener)},
 	}
 	p.commands.queue = make(map[string][]string)
 	p.results.history = make(map[string][]CommandResult)
@@ -463,26 +455,6 @@ func (p *HTTPPollingProtocol) handleListAgents(w http.ResponseWriter, r *http.Re
 	json.NewEncoder(w).Encode(p.agents.list)
 }
 
-// Keep this method for internal use even though we're not exposing it via HTTP
-func (p *HTTPPollingProtocol) handleListeners(w http.ResponseWriter, r *http.Request) {
-	enableCors(&w)
-	w.Header().Set("Content-Type", "application/json")
-
-	p.listeners.Lock()
-	defer p.listeners.Unlock()
-
-	// Convert map to slice for JSON response
-	listenersList := make([]*Listener, 0, len(p.listeners.list))
-	for _, listener := range p.listeners.list {
-		listenersList = append(listenersList, listener)
-	}
-
-	if err := json.NewEncoder(w).Encode(listenersList); err != nil {
-		http.Error(w, "Error encoding listeners", http.StatusInternalServerError)
-		return
-	}
-}
-
 // GetAllAgents returns a map of all agents for aggregation
 func (p *HTTPPollingProtocol) GetAllAgents() map[string]interface{} {
 	p.agents.Lock()
@@ -537,12 +509,3 @@ func (p *HTTPPollingProtocol) GetResults(AgentID string) []map[string]interface{
 	// log.Printf("[DEBUG] Returning %d results for AgentID=%s", len(results), AgentID)
 	return results
 }
-
-// Define missing types
-// BaseProtocolConfig is a placeholder for the actual implementation
-type BaseProtocolConfig struct {
-	UploadDir string
-}
-
-// Listener is a placeholder for the actual implementation
-type Listener struct{}

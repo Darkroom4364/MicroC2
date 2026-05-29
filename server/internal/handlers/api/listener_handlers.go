@@ -151,7 +151,7 @@ func (h *ListenerHandlers) HandleStartListener(w http.ResponseWriter, r *http.Re
 	}
 
 	// Check if it's already running
-	if listener.Status == "active" {
+	if listener.GetStatus() == listeners.StatusActive {
 		sendJSONResponse(w, map[string]string{"status": "success", "message": "Listener is already active"})
 		return
 	}
