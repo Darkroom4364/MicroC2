@@ -75,7 +75,7 @@ func NewListenerManager(proto Protocol) *ListenerManager { // Accept protocol in
 
 		var config ListenerConfig
 		if err := json.Unmarshal(configData, &config); err != nil {
-			log.Printf("[WARNING] Failed to parse config for listener %s: %v", entry.Name, err)
+			log.Printf("[WARNING] Failed to parse config for listener %s: %v", entry.Name(), err)
 			continue
 		}
 
