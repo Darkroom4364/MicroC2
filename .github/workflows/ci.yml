@@ -16,6 +16,10 @@ permissions:
   contents: read
   pull-requests: read
 
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -41,7 +45,6 @@ jobs:
       agent: ${{ steps.filter.outputs.agent }}
       static: ${{ steps.filter.outputs.static }}
       format: ${{ steps.filter.outputs.format }}
-      workflow: ${{ steps.filter.outputs.workflow }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,10 +54,6 @@ jobs:
         uses: dorny/paths-filter@v3
         with:
           filters: |
-            workflow:
-              - '.github/**'
-              - '.foxguard.yml'
-              - '.foxguard/**'
             server:
               - '.github/workflows/ci.yml'
               - 'server/**'
@@ -140,6 +139,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+
+      - name: Fetch dependencies
+        run: cargo fetch --locked
 
       - name: Test
         run: cargo test --locked
@@ -241,6 +243,10 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Fetch agent dependencies
+        working-directory: agent
+        run: cargo fetch --locked
 
       - name: Build server package
         working-directory: server
