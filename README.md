@@ -79,6 +79,8 @@ This framework can be used to:
 
 ## 🔧 Technical Documentation
 
+- [Development workflow and CI](docs/development-workflow.md)
+
 ---
 
 ## 🏗️ Architecture Overview

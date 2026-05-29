@@ -1,0 +1,377 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "fingerprint": "2c24077c90aa7c07f4c83bead2d4a0ece65b0f1db8508f44d6f3e160fd4408f8",
+      "rule_id": "manifest/cargo-pq-vulnerable-dep",
+      "file": "agent/Cargo.lock",
+      "line": 41
+    },
+    {
+      "fingerprint": "9423f360967942b01ee8175c13cae290e8d04f2d4693fb2177d0b11ae045bfe0",
+      "rule_id": "manifest/cargo-pq-vulnerable-dep",
+      "file": "agent/Cargo.lock",
+      "line": 666
+    },
+    {
+      "fingerprint": "a56021ee81784aa1203e877145d71c2822bab0a25e34ba6caa693deb13e77ec8",
+      "rule_id": "manifest/cargo-pq-vulnerable-dep",
+      "file": "agent/Cargo.lock",
+      "line": 681
+    },
+    {
+      "fingerprint": "2a5ff2eed8b360630bbc6429d48c8e16c37272ed55a4f7cbbbc3d91a932861a6",
+      "rule_id": "manifest/cargo-pq-vulnerable-dep",
+      "file": "agent/Cargo.lock",
+      "line": 992
+    },
+    {
+      "fingerprint": "b0993338bc3bc67a15bb9028ab2c77f6e4b57ac600d1644bdf2cd05b2404ddcd",
+      "rule_id": "manifest/cargo-pq-vulnerable-dep",
+      "file": "agent/Cargo.lock",
+      "line": 1493
+    },
+    {
+      "fingerprint": "20485e522e793fc81c350811062ab36f1522e8aa1b43654522845849ce4b8557",
+      "rule_id": "manifest/cargo-pq-vulnerable-dep",
+      "file": "agent/Cargo.lock",
+      "line": 1560
+    },
+    {
+      "fingerprint": "619f89928fee133bdb3b01ae198ebdc8fa057d64963e5d1e751743dd6f40a170",
+      "rule_id": "manifest/cargo-pq-vulnerable-dep",
+      "file": "agent/Cargo.lock",
+      "line": 1582
+    },
+    {
+      "fingerprint": "d228b9c216eb55265c369f0f011573f6ae360e73edfc5c432b641599a18589e2",
+      "rule_id": "manifest/cargo-pq-vulnerable-dep",
+      "file": "agent/Cargo.lock",
+      "line": 1902
+    },
+    {
+      "fingerprint": "e35087feeca8c7d6400b39b2d12ca39e26d1cfb4390918ed3624c85502f51fd9",
+      "rule_id": "manifest/cargo-pq-vulnerable-dep",
+      "file": "agent/Cargo.lock",
+      "line": 1912
+    },
+    {
+      "fingerprint": "4382a49055f05cbe4e2f1c57c5890c753b00d33e69fdd00b46f1ac2eb4c44186",
+      "rule_id": "rs/no-command-injection",
+      "file": "agent/src/commands/command_shell.rs",
+      "line": 57
+    },
+    {
+      "fingerprint": "34f66143dc109a51ea997a1d6015db7669dc293af64c7fa72cec15f1e1558d53",
+      "rule_id": "rs/no-ssrf",
+      "file": "agent/src/commands/command_shell.rs",
+      "line": 90
+    },
+    {
+      "fingerprint": "d1e19e6c541f7c88ef988a4aa0d49925d26470f4f8ada9ce71605ef52379f0d3",
+      "rule_id": "rs/no-ssrf",
+      "file": "agent/src/commands/command_shell.rs",
+      "line": 178
+    },
+    {
+      "fingerprint": "89a2d3a22cecbbdd0b649931df9fa621dcf014ec779841e97cafd6df2e423a1b",
+      "rule_id": "rs/no-ssrf",
+      "file": "agent/src/commands/command_shell.rs",
+      "line": 209
+    },
+    {
+      "fingerprint": "36861977a7d1cd71c6287328b21b0e5dafd130fa17111920c4bec737f534d1d3",
+      "rule_id": "rs/no-ssrf",
+      "file": "agent/src/commands/command_shell.rs",
+      "line": 265
+    },
+    {
+      "fingerprint": "7ae518e40b16f944a0316e8ea2fb14d07f40096502189f25496ec4c02683a1a2",
+      "rule_id": "rs/no-ssrf",
+      "file": "agent/src/config.rs",
+      "line": 18
+    },
+    {
+      "fingerprint": "822aaa72293d519d9a08e442e93d7493aff56778b78d031adf07bde892cac989",
+      "rule_id": "rs/tls-verify-disabled",
+      "file": "agent/src/config.rs",
+      "line": 207
+    },
+    {
+      "fingerprint": "3fe44058116961b0843b1ca1584e8a075489cf8ce740e26caf5b610474560fc0",
+      "rule_id": "rs/no-ssrf",
+      "file": "agent/src/file_handling/download.rs",
+      "line": 11
+    },
+    {
+      "fingerprint": "91e0c571cf5b02d084dd89c080722f0ce75f5d1814bb94d7d79146e4dbf711b7",
+      "rule_id": "rs/no-ssrf",
+      "file": "agent/src/file_handling/upload.rs",
+      "line": 11
+    },
+    {
+      "fingerprint": "b579ed9dfc4713f6fbbd647ee63a9e83c60eaef990fa9da0185d607a43d5efb3",
+      "rule_id": "rs/transmute-usage",
+      "file": "agent/src/win_api_hiding.rs",
+      "line": 60
+    },
+    {
+      "fingerprint": "f3bb0d7bdc13948860df829212a42b3a6537fbaa91af329a001bd1e9ab905fac",
+      "rule_id": "go/taint-path-traversal",
+      "file": "server/internal/handlers/web/static_handlers.go",
+      "line": 48
+    },
+    {
+      "fingerprint": "76908de1b319240b5a40a19ed16bad02580ee98d431982c48a251d130a5068b6",
+      "rule_id": "go/taint-path-traversal",
+      "file": "server/internal/handlers/web/static_handlers.go",
+      "line": 48
+    },
+    {
+      "fingerprint": "4f641f967439cbe539a9e810475f9bc7e5a99e6c47464a13c7f9175281b64abc",
+      "rule_id": "go/taint-path-traversal",
+      "file": "server/internal/handlers/web/static_handlers.go",
+      "line": 49
+    },
+    {
+      "fingerprint": "5cdc956846d5a0e6145e418fcccb46fc6d48a794fd1c898fd3d994b13b922d95",
+      "rule_id": "go/taint-path-traversal",
+      "file": "server/internal/websocket/terminal_session.go",
+      "line": 124
+    },
+    {
+      "fingerprint": "489ef46a1e489c7a6aa4f186c66463ee1d04cba16bb5a1dde54c54e285fe6f51",
+      "rule_id": "go/taint-path-traversal",
+      "file": "server/internal/websocket/terminal_session.go",
+      "line": 126
+    },
+    {
+      "fingerprint": "6439d773d0954f979852e9e28f644d4d123200e1f712bd88c3f6c38e6f7bbfab",
+      "rule_id": "go/taint-path-traversal",
+      "file": "server/internal/websocket/terminal_session.go",
+      "line": 129
+    },
+    {
+      "fingerprint": "8f25bc22595bebee2fb189783a625bfb779591e05ffb20f3d3b4244844c3923f",
+      "rule_id": "go/taint-command-injection",
+      "file": "server/internal/websocket/terminal_session.go",
+      "line": 149
+    },
+    {
+      "fingerprint": "a66e81baa3030ddd01b4081e6fab0716d390f738ed236e586689376167ce5aae",
+      "rule_id": "go/taint-path-traversal",
+      "file": "server/internal/websocket/terminal_session.go",
+      "line": 274
+    },
+    {
+      "fingerprint": "44656f647fecc02b48b2453aa160c58f961e759e887d979d95863d6db5b50d45",
+      "rule_id": "go/taint-path-traversal",
+      "file": "server/internal/websocket/terminal_session.go",
+      "line": 325
+    },
+    {
+      "fingerprint": "1eadcc6a0df94d4a88ffdec92944a06f9f7c9bb682a82b32bf985b89196e3401",
+      "rule_id": "go/no-ssrf",
+      "file": "server/pkg/communication/httpS_client.go",
+      "line": 36
+    },
+    {
+      "fingerprint": "e95269a7eedb451002b0e25692d70dc02d44c2f5b923f80b3b02734bc1d5228c",
+      "rule_id": "go/no-ssrf",
+      "file": "server/pkg/communication/httpS_client.go",
+      "line": 50
+    },
+    {
+      "fingerprint": "a967186da8729f921702d93051582418a54b15863a1bbe4f66445b66ca2326fb",
+      "rule_id": "go/no-ssrf",
+      "file": "server/pkg/communication/httpS_client.go",
+      "line": 64
+    },
+    {
+      "fingerprint": "24dfb7e142f4013bd4097ad0faab46868a1aa0c1774683be00ff9d87ca85122e",
+      "rule_id": "go/no-ssrf",
+      "file": "server/pkg/communication/httpS_client.go",
+      "line": 78
+    },
+    {
+      "fingerprint": "c9d9ef39865d0e18096a3dde5e26b967e15b513af48a60680270b263962ea279",
+      "rule_id": "js/no-xss-innerhtml",
+      "file": "server/web/js/file-drop.js",
+      "line": 119
+    },
+    {
+      "fingerprint": "8973b218141be2060ccb31b08ec47b20e1811b02645200cf58e74c13bbf1c0db",
+      "rule_id": "js/no-xss-innerhtml",
+      "file": "server/web/js/file-drop.js",
+      "line": 153
+    },
+    {
+      "fingerprint": "27c35286118d18fcd662e4fc626411d535cae6c4dc3fbbaad2921634e2450096",
+      "rule_id": "js/no-ssrf",
+      "file": "server/web/js/file-drop.js",
+      "line": 175
+    },
+    {
+      "fingerprint": "6c40eb00b2340571478484ca8117e02c5fbfbe66603ebe6d2d69156b91a34799",
+      "rule_id": "js/no-xss-innerhtml",
+      "file": "server/web/js/index.js",
+      "line": 157
+    },
+    {
+      "fingerprint": "bcd6b3fcd95d9c88965b91e1c858e5644e4464c62afab8baf94d736d1e8ce55f",
+      "rule_id": "js/no-ssrf",
+      "file": "server/web/js/index.js",
+      "line": 202
+    },
+    {
+      "fingerprint": "c9c7d397038e852d55572c87cfc1a892cc8fe7ee3f19016b6f5a22e740ec9be4",
+      "rule_id": "js/no-xss-innerhtml",
+      "file": "server/web/js/index.js",
+      "line": 246
+    },
+    {
+      "fingerprint": "0443209034e2697232c9c4774f35e684f9b1cb4e6bfbe5176e51ee28c2f265fa",
+      "rule_id": "js/no-xss-innerhtml",
+      "file": "server/web/js/index.js",
+      "line": 310
+    },
+    {
+      "fingerprint": "7c389f9df1b1980e02f20f7242153e511f88e3bf289f0cd812b173aa10af85d4",
+      "rule_id": "js/no-xss-innerhtml",
+      "file": "server/web/js/index.js",
+      "line": 314
+    },
+    {
+      "fingerprint": "0f2c862278252584b1926f144b1e09e9f8e5fb640c316621d651ff3457ed6950",
+      "rule_id": "js/no-ssrf",
+      "file": "server/web/js/index.js",
+      "line": 325
+    },
+    {
+      "fingerprint": "c983c49c9b4e7f2960cf9533b828a3812467ec3893d6e8ad03f061068a7e6b3d",
+      "rule_id": "js/no-ssrf",
+      "file": "server/web/js/index.js",
+      "line": 361
+    },
+    {
+      "fingerprint": "9684791e9ed6f579002ff97bb7d3d7c8a25e8a9b7bd84bbf7067f7f070e90ae8",
+      "rule_id": "js/no-ssrf",
+      "file": "server/web/js/index.js",
+      "line": 396
+    },
+    {
+      "fingerprint": "4ff71849ca7375f5630c99bb61c0fb9f105189a7b76b1241fa2bfea67dc3c8c8",
+      "rule_id": "js/no-ssrf",
+      "file": "server/web/js/index.js",
+      "line": 429
+    },
+    {
+      "fingerprint": "5ee37a569c7602ec09cbb1d60f61c1028352546bf6cf747505f31679c5a1b77a",
+      "rule_id": "js/no-ssrf",
+      "file": "server/web/js/index.js",
+      "line": 440
+    },
+    {
+      "fingerprint": "4301feb14ea20034a7e0c400f733e7d9ce05246e1d1d9c08448b3660140e2e03",
+      "rule_id": "js/no-xss-innerhtml",
+      "file": "server/web/js/index.js",
+      "line": 486
+    },
+    {
+      "fingerprint": "2bcd85eaa04a7beef877a808315d1a6eecfaf68a44082d0cdcb68703a48d17bb",
+      "rule_id": "js/no-xss-innerhtml",
+      "file": "server/web/js/index.js",
+      "line": 535
+    },
+    {
+      "fingerprint": "7417308564db518c4124529264a1ba1a972392d8bd6c0a1cff7cb13802c03a61",
+      "rule_id": "js/no-xss-innerhtml",
+      "file": "server/web/js/index.js",
+      "line": 538
+    },
+    {
+      "fingerprint": "0552ada4cb97a27976120a9f786a354b9e00da87cc169edba8722f6d05399b39",
+      "rule_id": "js/no-ssrf",
+      "file": "server/web/js/index.js",
+      "line": 570
+    },
+    {
+      "fingerprint": "8631174b3f967d2ce5ec401b2a812b7b672f07707cf96f6039d7c9ece7ca8d9e",
+      "rule_id": "js/no-ssrf",
+      "file": "server/web/js/index.js",
+      "line": 600
+    },
+    {
+      "fingerprint": "e8e59ff0de9d027492162ca7c47fa55da93f6518c1f2c42560b9e4f82e57c450",
+      "rule_id": "js/no-xss-innerhtml",
+      "file": "server/web/js/index.js",
+      "line": 611
+    },
+    {
+      "fingerprint": "8938f749d60fb8d2ae6cf7a5eb317f7818ed393bf1314f9754f49ae764da62af",
+      "rule_id": "js/no-xss-innerhtml",
+      "file": "server/web/js/index.js",
+      "line": 619
+    },
+    {
+      "fingerprint": "d41a91707d69321273eafe752a5cfdf4b2bbeb35085b9d68632c8584ff0b0e2a",
+      "rule_id": "js/no-xss-innerhtml",
+      "file": "server/web/js/listeners.js",
+      "line": 253
+    },
+    {
+      "fingerprint": "a17e245caa00d8c4816a62a918478816b9a67c89574ee7ac752cc93652303426",
+      "rule_id": "js/no-xss-innerhtml",
+      "file": "server/web/js/listeners.js",
+      "line": 258
+    },
+    {
+      "fingerprint": "aba0ff3180a805c127bf5d55a44b953dce34f9307a46e608e0f8a66acb80e262",
+      "rule_id": "js/no-ssrf",
+      "file": "server/web/js/listeners.js",
+      "line": 296
+    },
+    {
+      "fingerprint": "125411d2abb4be3ee9eb8a07a1bad97fb26932b5d863ff71c67419a0739415b1",
+      "rule_id": "js/no-ssrf",
+      "file": "server/web/js/listeners.js",
+      "line": 343
+    },
+    {
+      "fingerprint": "4ec6a4d85d3492d5c2ae598b165165ef447b205ea216c19274988a254d845609",
+      "rule_id": "js/no-ssrf",
+      "file": "server/web/js/listeners.js",
+      "line": 389
+    },
+    {
+      "fingerprint": "2e3a49c01e806f0455b0223cc2fae87e644ee1adf4b2fc678d4c859094ee2db4",
+      "rule_id": "js/no-ssrf",
+      "file": "server/web/js/listeners.js",
+      "line": 434
+    },
+    {
+      "fingerprint": "69dbde3ceb12cd1a3ce45dadadf6229f6e0ebeb2a9b108c0e97b48af568dd086",
+      "rule_id": "js/no-ssrf",
+      "file": "server/web/js/listeners.js",
+      "line": 452
+    },
+    {
+      "fingerprint": "5c001ec661af6c58618a409bc41d7f8390f5c6c030b6d3dc40bd5dd3a7511824",
+      "rule_id": "js/no-xss-innerhtml",
+      "file": "server/web/js/payload.js",
+      "line": 109
+    },
+    {
+      "fingerprint": "8915d1069a00ad2f1631c2bb926f8128b8a3764ec88ee123bbb0737ae4a0b50e",
+      "rule_id": "js/no-xss-innerhtml",
+      "file": "server/web/js/payload.js",
+      "line": 130
+    },
+    {
+      "fingerprint": "2f451380ba1b5440c3a4a7732ed4dccb3ea8a394adf20a972292f1c3aef20098",
+      "rule_id": "js/no-xss-innerhtml",
+      "file": "server/web/js/terminal.js",
+      "line": 229
+    }
+  ]
+}

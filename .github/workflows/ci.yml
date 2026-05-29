@@ -1,0 +1,262 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  merge_group:
+  pull_request:
+    branches:
+      - main
+      - dev
+  push:
+    branches:
+      - main
+      - dev
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  branch-policy:
+    name: Branch Policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate pull request target
+        if: github.event_name == 'pull_request'
+        run: |
+          if [ "${{ github.base_ref }}" = "main" ] && [ "${{ github.head_ref }}" != "dev" ]; then
+            echo "::error::Stable promotions into main must come from dev."
+            exit 1
+          fi
+
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      server: ${{ steps.filter.outputs.server }}
+      agent: ${{ steps.filter.outputs.agent }}
+      static: ${{ steps.filter.outputs.static }}
+      format: ${{ steps.filter.outputs.format }}
+      workflow: ${{ steps.filter.outputs.workflow }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Filter paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            workflow:
+              - '.github/**'
+              - '.foxguard.yml'
+              - '.foxguard/**'
+            server:
+              - '.github/workflows/ci.yml'
+              - 'server/**'
+            agent:
+              - '.github/workflows/ci.yml'
+              - 'agent/**'
+            static:
+              - '.github/workflows/ci.yml'
+              - 'install.sh'
+              - 'agent/build.sh'
+              - 'server/web/**'
+            format:
+              - '.github/workflows/ci.yml'
+              - 'server/**'
+              - 'agent/**'
+
+  server:
+    name: Go Server
+    runs-on: ubuntu-latest
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || github.base_ref == 'main' || github.ref == 'refs/heads/main' || needs.changes.outputs.server == 'true'
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.8"
+          cache-dependency-path: server/go.sum
+
+      - name: Test
+        run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build -o /tmp/microc2-server ./cmd
+
+  static:
+    name: Static Assets And Scripts
+    runs-on: ubuntu-latest
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || github.base_ref == 'main' || github.ref == 'refs/heads/main' || needs.changes.outputs.static == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check shell scripts
+        run: |
+          for file in install.sh agent/build.sh; do
+            bash -n "$file"
+          done
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Check web JavaScript syntax
+        run: |
+          for file in server/web/js/*.js; do
+            node --check "$file"
+          done
+
+  agent:
+    name: Rust Agent
+    runs-on: ubuntu-latest
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || github.base_ref == 'main' || github.ref == 'refs/heads/main' || needs.changes.outputs.agent == 'true'
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets
+
+      - name: Build
+        run: cargo build --locked
+
+  format:
+    name: Format Advisory
+    runs-on: ubuntu-latest
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || github.base_ref == 'main' || github.ref == 'refs/heads/main' || needs.changes.outputs.format == 'true'
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.8"
+          cache-dependency-path: server/go.sum
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check Go formatting
+        run: test -z "$(gofmt -l server)"
+
+      - name: Check Rust formatting
+        working-directory: agent
+        run: cargo fmt --check
+
+  ci-gate:
+    name: CI Gate
+    runs-on: ubuntu-latest
+    needs:
+      - branch-policy
+      - changes
+      - server
+      - static
+      - agent
+      - format
+    if: always()
+    steps:
+      - name: Require selected suites
+        run: |
+          failed=0
+
+          for result in \
+            "${{ needs.branch-policy.result }}" \
+            "${{ needs.changes.result }}" \
+            "${{ needs.server.result }}" \
+            "${{ needs.static.result }}" \
+            "${{ needs.agent.result }}"; do
+            case "$result" in
+              success|skipped)
+                ;;
+              *)
+                echo "::error::Required CI job finished with status: $result"
+                failed=1
+                ;;
+            esac
+          done
+
+          case "${{ needs.format.result }}" in
+            success|skipped)
+              ;;
+            failure)
+              echo "::warning::Format Advisory failed. It is intentionally non-blocking until the formatting backlog is cleaned up."
+              ;;
+            *)
+              echo "::error::Format Advisory finished with status: ${{ needs.format.result }}"
+              failed=1
+              ;;
+          esac
+
+          exit "$failed"
+
+  package:
+    name: Release Package
+    runs-on: ubuntu-latest
+    needs: ci-gate
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || github.base_ref == 'main' || github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.8"
+          cache-dependency-path: server/go.sum
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build server package
+        working-directory: server
+        run: |
+          mkdir -p ../dist
+          go build -o ../dist/microc2-server ./cmd
+
+      - name: Build agent package
+        working-directory: agent
+        run: |
+          cargo build --release --locked
+          mkdir -p ../dist
+          cp target/release/agent ../dist/microc2-agent-linux
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: microc2-${{ github.sha }}
+          path: dist/

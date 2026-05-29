@@ -1,5 +1,5 @@
+/.togi-cache/
 /agent/target/*
-/agent/Cargo.lock
 /agent/static/payloads/*
 /server/server
 /server/target/*
@@ -8,4 +8,3 @@
 /server/static/*
 /server/uploads/*
 /server/certs/
-
