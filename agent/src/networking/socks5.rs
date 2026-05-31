@@ -1,11 +1,11 @@
-use tokio::net::TcpStream;
-use tokio_socks::tcp::Socks5Stream;
-use std::net::SocketAddr;
-use std::time::Duration;
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use log::{debug, info, warn, error};
+use tokio_socks::tcp::Socks5Stream;
 
 // SOCKS5 Protocol Constants
 pub const SOCKS5_VERSION: u8 = 0x05;
@@ -118,7 +118,10 @@ pub struct Socks5Client {
 
 impl Socks5Client {
     pub fn new(proxy_addr: String, proxy_port: u16) -> Self {
-        info!("[SOCKS5] Creating new client for proxy {}:{}", proxy_addr, proxy_port);
+        info!(
+            "[SOCKS5] Creating new client for proxy {}:{}",
+            proxy_addr, proxy_port
+        );
         Self {
             proxy_addr,
             proxy_port,
@@ -159,16 +162,24 @@ impl Socks5Client {
         debug!("[SOCKS5] Storing connection to pool for {}", target);
         let mut pool = self.connection_pool.lock().await;
         let connections = pool.entry(target).or_insert_with(Vec::new);
-        if connections.len() < 10 { // Max 10 connections per target
+        if connections.len() < 10 {
+            // Max 10 connections per target
             connections.push(conn);
         } else {
             debug!("[SOCKS5] Connection pool for target full, dropping connection.");
         }
     }
 
-    pub async fn connect_to(&self, target_addr: String, target_port: u16) -> Result<TcpStream, Socks5Error> {
+    pub async fn connect_to(
+        &self,
+        target_addr: String,
+        target_port: u16,
+    ) -> Result<TcpStream, Socks5Error> {
         let target_key = format!("{}:{}", target_addr, target_port);
-        info!("[SOCKS5] Attempting to connect to {} via proxy {}:{}", target_key, self.proxy_addr, self.proxy_port);
+        info!(
+            "[SOCKS5] Attempting to connect to {} via proxy {}:{}",
+            target_key, self.proxy_addr, self.proxy_port
+        );
         if let Some(conn) = self.get_pooled_connection(&target_key).await {
             info!("[SOCKS5] Using pooled connection for {}", target_key);
             return Ok(conn);
@@ -186,47 +197,49 @@ impl Socks5Client {
 
         let stream = match (&self.username, &self.password) {
             (Some(user), Some(pass)) => {
-                info!("[SOCKS5] Connecting with authentication as user '{}'.", user);
+                info!(
+                    "[SOCKS5] Connecting with authentication as user '{}'.",
+                    user
+                );
                 match tokio::time::timeout(
                     self.timeout,
-                    Socks5Stream::connect_with_password(
-                        addr,
-                        target.clone(),
-                        user,
-                        pass,
-                    )
-                ).await {
+                    Socks5Stream::connect_with_password(addr, target.clone(), user, pass),
+                )
+                .await
+                {
                     Ok(Ok(s)) => {
-                        info!("[SOCKS5] Authenticated SOCKS5 connection established to {}.", target);
+                        info!(
+                            "[SOCKS5] Authenticated SOCKS5 connection established to {}.",
+                            target
+                        );
                         s
-                    },
+                    }
                     Ok(Err(e)) => {
                         error!("[SOCKS5] SOCKS5 connection failed: {}", e);
                         return Err(Socks5Error::ConnectionFailed(e.to_string()));
-                    },
+                    }
                     Err(_) => {
                         error!("[SOCKS5] SOCKS5 connection to {} timed out.", target);
                         return Err(Socks5Error::Timeout);
                     }
                 }
-            },
+            }
             _ => {
                 info!("[SOCKS5] Connecting without authentication.");
                 match tokio::time::timeout(
                     self.timeout,
-                    Socks5Stream::connect(
-                        addr,
-                        target.clone(),
-                    )
-                ).await {
+                    Socks5Stream::connect(addr, target.clone()),
+                )
+                .await
+                {
                     Ok(Ok(s)) => {
                         info!("[SOCKS5] SOCKS5 connection established to {}.", target);
                         s
-                    },
+                    }
                     Ok(Err(e)) => {
                         error!("[SOCKS5] SOCKS5 connection failed: {}", e);
                         return Err(Socks5Error::ConnectionFailed(e.to_string()));
-                    },
+                    }
                     Err(_) => {
                         error!("[SOCKS5] SOCKS5 connection to {} timed out.", target);
                         return Err(Socks5Error::Timeout);
@@ -239,16 +252,29 @@ impl Socks5Client {
         Ok(tcp_stream)
     }
 
-    pub async fn connect_with_retries(&self, target_addr: String, target_port: u16, retries: u32) -> Result<TcpStream, Socks5Error> {
+    pub async fn connect_with_retries(
+        &self,
+        target_addr: String,
+        target_port: u16,
+        retries: u32,
+    ) -> Result<TcpStream, Socks5Error> {
         let mut attempts = 0;
         let mut last_error = None;
-        info!("[SOCKS5] Connecting to {}:{} with up to {} retries.", target_addr, target_port, retries);
+        info!(
+            "[SOCKS5] Connecting to {}:{} with up to {} retries.",
+            target_addr, target_port, retries
+        );
         while attempts < retries {
             match self.connect_to(target_addr.clone(), target_port).await {
                 Ok(stream) => {
-                    info!("[SOCKS5] Connection to {}:{} succeeded on attempt {}.", target_addr, target_port, attempts + 1);
+                    info!(
+                        "[SOCKS5] Connection to {}:{} succeeded on attempt {}.",
+                        target_addr,
+                        target_port,
+                        attempts + 1
+                    );
                     return Ok(stream);
-                },
+                }
                 Err(e) => {
                     warn!("[SOCKS5] Attempt {} failed: {}", attempts + 1, e);
                     last_error = Some(e);
@@ -262,7 +288,9 @@ impl Socks5Client {
             }
         }
         error!("[SOCKS5] All {} connection attempts failed.", retries);
-        Err(last_error.unwrap_or(Socks5Error::ConnectionFailed("Max retries exceeded".to_string())))
+        Err(last_error.unwrap_or(Socks5Error::ConnectionFailed(
+            "Max retries exceeded".to_string(),
+        )))
     }
 }
 
@@ -272,9 +300,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_socks5_connection() {
-        let client = Socks5Client::new("127.0.0.1".to_string(), 1080)
-            .with_timeout(Duration::from_secs(5));
-        
+        let client =
+            Socks5Client::new("127.0.0.1".to_string(), 1080).with_timeout(Duration::from_secs(5));
+
         let result = client.connect_to("example.com".to_string(), 80).await;
         match result {
             Ok(_) => info!("Connection successful"),
@@ -287,8 +315,10 @@ mod tests {
         let client = Socks5Client::new("127.0.0.1".to_string(), 1080)
             .with_auth("user".to_string(), "pass".to_string())
             .with_timeout(Duration::from_secs(5));
-        
-        let result = client.connect_with_retries("example.com".to_string(), 80, 3).await;
+
+        let result = client
+            .connect_with_retries("example.com".to_string(), 80, 3)
+            .await;
         match result {
             Ok(_) => info!("Authenticated connection successful"),
             Err(e) => error!("Authenticated connection failed: {}", e),

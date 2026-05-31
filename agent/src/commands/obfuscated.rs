@@ -13,7 +13,7 @@ pub fn xor_deobfuscate(hex: &str, key: &str) -> Option<String> {
     let key_bytes = key.as_bytes();
     let bytes: Result<Vec<u8>, _> = (0..hex.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i+2], 16))
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
         .collect();
     bytes.ok().map(|v| {
         v.into_iter()
@@ -25,8 +25,16 @@ pub fn xor_deobfuscate(hex: &str, key: &str) -> Option<String> {
 
 pub fn obfuscate_command(cmd: &str) -> String {
     let mapping = [
-        ('a', 'ᵃ'), ('e', 'ᵉ'), ('o', 'ᵒ'), ('i', 'ᶦ'), ('s', 'ˢ'),
-        ('l', 'ˡ'), ('t', 'ᵗ'), ('n', 'ⁿ'), ('r', 'ʳ'), ('d', 'ᵈ')
+        ('a', 'ᵃ'),
+        ('e', 'ᵉ'),
+        ('o', 'ᵒ'),
+        ('i', 'ᶦ'),
+        ('s', 'ˢ'),
+        ('l', 'ˡ'),
+        ('t', 'ᵗ'),
+        ('n', 'ⁿ'),
+        ('r', 'ʳ'),
+        ('d', 'ᵈ'),
     ];
     let mut result = String::with_capacity(cmd.len());
     for c in cmd.chars() {

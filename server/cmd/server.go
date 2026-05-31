@@ -137,7 +137,7 @@ func main() {
 	// --- HTTPS Support ---
 	certFile := cfg.Server.TLS.CertFile
 	keyFile := cfg.Server.TLS.KeyFile
-	
+
 	// Determine ports based on redirect configuration
 	var httpAddr, httpsAddr string
 	if cfg.Server.Redirect.Enabled {
@@ -152,24 +152,24 @@ func main() {
 	if cfg.Server.Redirect.Enabled {
 		go func() {
 			log.Printf("[STARTUP] Starting HTTP redirect server on %s -> HTTPS %s", httpAddr, httpsAddr)
-			
+
 			redirectHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				// Build target URL, handling both with and without port in Host header
 				host := r.Host
 				if host == "" {
 					host = "localhost" + httpsAddr
 				}
-				
+
 				// Remove HTTP port and replace with HTTPS port
 				if host == "localhost:"+cfg.Server.Redirect.HTTPPort {
 					host = "localhost" + httpsAddr
 				}
-				
+
 				target := "https://" + host + r.URL.RequestURI()
 				log.Printf("[REDIRECT] %s -> %s", r.URL.String(), target)
 				http.Redirect(w, r, target, http.StatusMovedPermanently)
 			})
-			
+
 			if err := http.ListenAndServe(httpAddr, redirectHandler); err != nil {
 				log.Printf("[ERROR] HTTP redirect server error: %v", err)
 			}

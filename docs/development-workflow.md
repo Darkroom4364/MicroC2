@@ -57,19 +57,19 @@ It also enforces that pull requests into `main` come from `dev`.
   `agent/`.
 - Static UI or script changes run `Static Assets And Scripts`: shell syntax
   checks and JavaScript syntax checks.
+- Server or agent changes run `Format`: `gofmt` validation for `server/` and
+  `cargo fmt --check` for `agent/`.
 - Pull requests into `main` run every suite regardless of path, because they are
   release-promotion candidates.
 - Documentation-only changes to `dev` can pass through `CI Gate` without running
   server or agent builds.
 
-`Format Advisory` is intentionally non-blocking until the existing formatting
-backlog is cleaned up. Once formatting has been normalized, it can become a
-blocking suite.
+Format checks are blocking whenever they are selected by the path filters.
 
 ## Foxguard
 
 Foxguard runs as a GitHub App check and is configured by `.foxguard.yml`.
-Existing high-severity findings are tracked in `.foxguard/baseline.json` so new
+Existing scanner findings are tracked in `.foxguard/baseline.json` so new
 findings can be separated from legacy debt. Secret scanning uses
 `.foxguard/secrets-baseline.json`.
 

@@ -7,6 +7,7 @@
     "socks5_enabled": false,
     "socks5_host": "127.0.0.1",
     "socks5_port": 9050,
+    "allow_invalid_certs": false,
     "base_score_threshold_bg_to_reduced": 20.0,
     "base_score_threshold_reduced_to_full": 60.0,
     "min_duration_full_opsec_secs": 300,
