@@ -1,11 +1,11 @@
 pub mod commands;
 pub mod config;
-pub mod networking;
-pub mod opsec;
-pub mod util;
 pub mod dormant;
-pub mod state;
 pub mod file_handling;
 pub mod high_threat_tools;
+pub mod networking;
+pub mod opsec;
+pub mod state;
+pub mod util;
 #[cfg(target_os = "windows")]
 pub mod win_api_hiding;

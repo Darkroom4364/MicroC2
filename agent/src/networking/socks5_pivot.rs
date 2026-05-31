@@ -1,16 +1,16 @@
-use tokio::sync::mpsc;
 use std::collections::HashMap;
-use tokio::io::AsyncWriteExt;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::OwnedWriteHalf;
+use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 
 #[derive(Debug)]
 pub enum PivotFrameType {
-    Open,   // Open new connection
-    Data,   // Data for a connection
-    Close,  // Close connection
-    Error,  // Error
+    Open,  // Open new connection
+    Data,  // Data for a connection
+    Close, // Close connection
+    Error, // Error
 }
 
 #[derive(Debug)]
@@ -19,7 +19,6 @@ pub struct PivotFrame {
     pub frame_type: PivotFrameType,
     pub payload: Vec<u8>,
 }
-
 
 // Implementing the PivotFrame struct
 impl PivotFrame {
@@ -67,16 +66,25 @@ impl Socks5PivotHandler {
     pub async fn handle_frame(&mut self, frame: PivotFrame) {
         log::info!(
             "[SOCKS5-PIVOT] Received frame: type={:?}, stream_id={}, payload_len={}",
-            frame.frame_type, frame.stream_id, frame.payload.len()
+            frame.frame_type,
+            frame.stream_id,
+            frame.payload.len()
         );
         match frame.frame_type {
             PivotFrameType::Data => {
                 if let Some(stream) = self.streams.get(&frame.stream_id) {
                     let mut stream = stream.lock().await;
-                    log::debug!("[SOCKS5-PIVOT] Writing {} bytes to stream {}", frame.payload.len(), frame.stream_id);
+                    log::debug!(
+                        "[SOCKS5-PIVOT] Writing {} bytes to stream {}",
+                        frame.payload.len(),
+                        frame.stream_id
+                    );
                     let _ = stream.write_all(&frame.payload).await;
                 } else {
-                    log::warn!("[SOCKS5-PIVOT] No stream found for stream_id {}", frame.stream_id);
+                    log::warn!(
+                        "[SOCKS5-PIVOT] No stream found for stream_id {}",
+                        frame.stream_id
+                    );
                 }
             }
             PivotFrameType::Close => {

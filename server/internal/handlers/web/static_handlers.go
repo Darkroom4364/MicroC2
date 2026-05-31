@@ -43,7 +43,7 @@ func (h *StaticHandler) HandleRoot(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/home/", http.StatusMovedPermanently)
 		return
 	}
-	
+
 	// Serve other static files from the web directory
 	if _, err := os.Stat(filepath.Join(h.webDir, r.URL.Path)); err == nil {
 		http.ServeFile(w, r, filepath.Join(h.webDir, r.URL.Path))

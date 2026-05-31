@@ -175,12 +175,12 @@ func (h *TerminalHandler) HandleConnection(w http.ResponseWriter, r *http.Reques
 //   - Handles file/directory completion and basic command completion
 func (h *TerminalHandler) handleTabCompletion(conn *websocket.Conn, session *TerminalSession, partial string) {
 	completions := h.getCompletions(session, partial)
-	
+
 	response := TerminalResponse{
 		Type:        "tab_completion",
 		Completions: completions,
 	}
-	
+
 	msg, _ := json.Marshal(response)
 	conn.WriteMessage(websocket.TextMessage, msg)
 }
@@ -197,18 +197,18 @@ func (h *TerminalHandler) handleTabCompletion(conn *websocket.Conn, session *Ter
 func (h *TerminalHandler) getCompletions(session *TerminalSession, partial string) []string {
 	// Split command into words
 	words := strings.Fields(partial)
-	
+
 	// If no words or first word, suggest commands
 	if len(words) == 0 || (len(words) == 1 && !strings.HasSuffix(partial, " ")) {
 		return h.getCommandCompletions(partial)
 	}
-	
+
 	// Otherwise, complete file paths for the last word
 	lastWord := words[len(words)-1]
 	if strings.HasSuffix(partial, " ") {
 		lastWord = ""
 	}
-	
+
 	return h.getPathCompletions(session, lastWord)
 }
 
@@ -227,14 +227,14 @@ func (h *TerminalHandler) getCommandCompletions(partial string) []string {
 		"tar", "gzip", "gunzip", "zip", "unzip", "curl", "wget", "ssh", "scp",
 		"git", "nano", "vim", "emacs", "python", "python3", "node", "go", "make",
 	}
-	
+
 	var matches []string
 	for _, cmd := range commands {
 		if strings.HasPrefix(cmd, partial) {
 			matches = append(matches, cmd)
 		}
 	}
-	
+
 	sort.Strings(matches)
 	return matches
 }
@@ -250,7 +250,7 @@ func (h *TerminalHandler) getCommandCompletions(partial string) []string {
 //   - Handles relative and absolute paths, and ~ expansion
 func (h *TerminalHandler) getPathCompletions(session *TerminalSession, partial string) []string {
 	var searchDir, prefix string
-	
+
 	// Handle different path types
 	if partial == "" {
 		searchDir = session.WorkingDir
@@ -287,31 +287,31 @@ func (h *TerminalHandler) getPathCompletions(session *TerminalSession, partial s
 			prefix = partial
 		}
 	}
-	
+
 	// Read directory contents
 	entries, err := os.ReadDir(searchDir)
 	if err != nil {
 		return []string{}
 	}
-	
+
 	var matches []string
 	for _, entry := range entries {
 		name := entry.Name()
-		
+
 		// Skip hidden files unless prefix starts with .
 		if strings.HasPrefix(name, ".") && !strings.HasPrefix(prefix, ".") {
 			continue
 		}
-		
+
 		// Check if name matches prefix
 		if strings.HasPrefix(name, prefix) {
 			completionName := name
-			
+
 			// Add trailing slash for directories
 			if entry.IsDir() {
 				completionName += "/"
 			}
-			
+
 			// Build the full completion based on the original partial path
 			var fullCompletion string
 			if strings.HasPrefix(partial, "/") {
@@ -330,11 +330,11 @@ func (h *TerminalHandler) getPathCompletions(session *TerminalSession, partial s
 			} else {
 				fullCompletion = completionName
 			}
-			
+
 			matches = append(matches, fullCompletion)
 		}
 	}
-	
+
 	sort.Strings(matches)
 	return matches
 }

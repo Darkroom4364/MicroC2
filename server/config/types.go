@@ -6,7 +6,7 @@ type Config struct {
 		HTTPSPort string `yaml:"httpsPort"`
 		UploadDir string `yaml:"uploadDir"`
 		StaticDir string `yaml:"staticDir"`
-		TLS struct {
+		TLS       struct {
 			Enabled  bool   `yaml:"enabled"`
 			CertFile string `yaml:"certFile"`
 			KeyFile  string `yaml:"keyFile"`

