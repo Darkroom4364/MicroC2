@@ -79,6 +79,9 @@ This framework can be used to:
 
 ## 🔧 Technical Documentation
 
+- [Architecture](docs/architecture.md)
+- [Design notes](docs/design.md)
+- [Roadmap](docs/roadmap.md)
 - [Development workflow and CI](docs/development-workflow.md)
 
 ---
