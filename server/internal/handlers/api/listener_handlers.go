@@ -177,11 +177,11 @@ func sendJSONResponse(w http.ResponseWriter, data interface{}) {
 	json.NewEncoder(w).Encode(data)
 }
 
-// SetupRoutes registers all listener-related routes
-func (h *ListenerHandlers) SetupRoutes() {
-	http.HandleFunc("/api/listeners/create", h.HandleCreateListener)
-	http.HandleFunc("/api/listeners/list", h.HandleListListeners)
-	http.HandleFunc("/api/listeners/", func(w http.ResponseWriter, r *http.Request) {
+// RegisterRoutes registers all listener-related routes on the provided mux.
+func (h *ListenerHandlers) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/api/listeners/create", h.HandleCreateListener)
+	mux.HandleFunc("/api/listeners/list", h.HandleListListeners)
+	mux.HandleFunc("/api/listeners/", func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/api/listeners/")
 		if strings.HasSuffix(path, "/stop") {
 			h.HandleStopListener(w, r)
@@ -200,4 +200,9 @@ func (h *ListenerHandlers) SetupRoutes() {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
+}
+
+// SetupRoutes registers listener routes on the default mux for legacy callers.
+func (h *ListenerHandlers) SetupRoutes() {
+	h.RegisterRoutes(http.DefaultServeMux)
 }

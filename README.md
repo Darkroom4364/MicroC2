@@ -184,7 +184,8 @@ This framework was built by someone running on way too much caffeine. If you enc
    ./server
    ```
 2. **Access the web interface:**
-   - Open your browser and go to: [https://localhost:8080/home/](https://localhost:8080/home/) (or the port you configured).
+   - Open your browser and go to: [https://localhost:8443/home/](https://localhost:8443/home/) with the default config. Port `8080` redirects to HTTPS when redirects are enabled.
+   - The operator UI/API and WebSocket routes live on the web/API port. Agent polling routes live on the listener ports you create.
 
 ### Configuration
 - Edit `server/config/settings.yaml` for server settings.

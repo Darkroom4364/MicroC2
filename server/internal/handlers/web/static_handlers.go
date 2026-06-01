@@ -52,7 +52,7 @@ func (h *StaticHandler) HandleRoot(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
-// SetupStaticRoutes sets up routes for static file serving
+// RegisterRoutes sets up routes for static file serving on the provided mux.
 //
 // Pre-conditions:
 //   - staticDir and webDir exist and contain necessary files
@@ -61,12 +61,17 @@ func (h *StaticHandler) HandleRoot(w http.ResponseWriter, r *http.Request) {
 //   - Routes are registered with the HTTP server
 //   - /static/ paths are served from staticDir
 //   - /home/ paths are served from webDir
-func (h *StaticHandler) SetupStaticRoutes() {
+func (h *StaticHandler) RegisterRoutes(mux *http.ServeMux) {
 	// Handle /static/ paths for backward compatibility
 	fs := http.FileServer(http.Dir(h.staticDir))
-	http.Handle("/static/", http.StripPrefix("/static/", fs))
+	mux.Handle("/static/", http.StripPrefix("/static/", fs))
 
 	// Serve web assets from the web directory
 	webFs := http.FileServer(http.Dir(h.webDir))
-	http.Handle("/home/", http.StripPrefix("/home/", webFs))
+	mux.Handle("/home/", http.StripPrefix("/home/", webFs))
+}
+
+// SetupStaticRoutes registers static routes on the default mux for legacy callers.
+func (h *StaticHandler) SetupStaticRoutes() {
+	h.RegisterRoutes(http.DefaultServeMux)
 }

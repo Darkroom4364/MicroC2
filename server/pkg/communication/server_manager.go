@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"microc2/server/internal/behaviour"
 	"microc2/server/internal/common"
@@ -65,6 +66,8 @@ func (sm *ServerManager) GetProtocol() common.Protocol {
 }
 
 func (sm *ServerManager) Start() error {
+	mux := http.NewServeMux()
+
 	// Register protocol-specific routes
 	for path, handler := range sm.protocol.GetRoutes() {
 		// Skip routes that might conflict with API handlers
@@ -72,11 +75,11 @@ func (sm *ServerManager) Start() error {
 			log.Printf("[ROUTES] Skipping protocol route %s to avoid conflicts with API handlers", path)
 			continue
 		}
-		http.HandleFunc(path, handler)
+		mux.HandleFunc(path, handler)
 	}
 
 	if httpProto, ok := sm.protocol.(*behaviour.HTTPPollingProtocol); ok {
-		http.HandleFunc("/api/agent/", httpProto.HandleAgentRequests)
+		mux.HandleFunc("/api/agent/", httpProto.HandleAgentRequests)
 	}
 
 	log.Printf("[STARTUP] Server initializing with %s protocol...", sm.config.ProtocolType)
@@ -85,7 +88,15 @@ func (sm *ServerManager) Start() error {
 	log.Printf("[CONFIG] File Drop directory: %s/file_drop", sm.config.StaticDir)
 	log.Printf("[NETWORK] Port: %s", sm.config.Port)
 
-	return http.ListenAndServe(":"+sm.config.Port, nil)
+	server := &http.Server{
+		Addr:              ":" + sm.config.Port,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	return server.ListenAndServe()
 }
 
 func (sm *ServerManager) GetListenerManager() *listeners.ListenerManager {

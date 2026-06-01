@@ -84,6 +84,20 @@ go vet ./...
 go build -o /tmp/microc2-server ./cmd
 ```
 
+For route-boundary changes, also use this smoke path in a controlled local lab:
+
+1. Start the operator server and confirm
+   `https://localhost:8443/api/agents/list` responds.
+2. Confirm the operator port does not serve agent polling by checking
+   `https://localhost:8443/api/agent/test/heartbeat` returns `404`.
+3. Create or start an HTTP listener on a separate port.
+4. POST a heartbeat to the listener at `/api/agent/test/heartbeat`.
+5. Queue a command through the operator API at `/api/agents/command` with
+   `agent_id` in the JSON body.
+6. Poll the command from the listener at `/api/agent/test/command`.
+7. POST a result to the listener at `/api/agent/test/result`.
+8. Read results through the operator API at `/api/agents/test/results`.
+
 ```sh
 cd agent
 cargo test --locked

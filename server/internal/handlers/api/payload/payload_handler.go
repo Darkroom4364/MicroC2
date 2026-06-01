@@ -503,7 +503,7 @@ func (h *PayloadHandler) loadListenerConfig(listenerID string) (ListenerConfig, 
 	return ListenerConfig{}, fmt.Errorf("no listener found with ID %s", listenerID)
 }
 
-// SetupRoutes registers all payload-related routes
+// RegisterRoutes registers all payload-related routes on the provided mux.
 //
 // Pre-conditions:
 //   - HTTP server is initialized and ready to accept route registrations
@@ -511,7 +511,12 @@ func (h *PayloadHandler) loadListenerConfig(listenerID string) (ListenerConfig, 
 // Post-conditions:
 //   - Routes for payload generation and download are registered
 //   - Requests to these routes will be handled by the appropriate methods
+func (h *PayloadHandler) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/api/payload/generate", h.HandleGeneratePayload)
+	mux.HandleFunc("/api/payload/download/", h.HandleDownloadPayload)
+}
+
+// SetupRoutes registers payload routes on the default mux for legacy callers.
 func (h *PayloadHandler) SetupRoutes() {
-	http.HandleFunc("/api/payload/generate", h.HandleGeneratePayload)
-	http.HandleFunc("/api/payload/download/", h.HandleDownloadPayload)
+	h.RegisterRoutes(http.DefaultServeMux)
 }
