@@ -299,29 +299,30 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_socks5_connection() {
-        let client =
-            Socks5Client::new("127.0.0.1".to_string(), 1080).with_timeout(Duration::from_secs(5));
+    async fn rejects_invalid_proxy_address_without_network_io() {
+        let client = Socks5Client::new("not a socket addr".to_string(), 1080)
+            .with_timeout(Duration::from_millis(10));
 
-        let result = client.connect_to("example.com".to_string(), 80).await;
-        match result {
-            Ok(_) => info!("Connection successful"),
-            Err(e) => error!("Connection failed: {}", e),
+        match client.connect_to("example.com".to_string(), 80).await {
+            Err(Socks5Error::InvalidAddress(_)) => {}
+            other => panic!("expected invalid proxy address error, got {:?}", other),
         }
     }
 
     #[tokio::test]
-    async fn test_socks5_auth_connection() {
+    async fn zero_retries_returns_failure_without_network_io() {
         let client = Socks5Client::new("127.0.0.1".to_string(), 1080)
             .with_auth("user".to_string(), "pass".to_string())
-            .with_timeout(Duration::from_secs(5));
+            .with_timeout(Duration::from_millis(10));
 
-        let result = client
-            .connect_with_retries("example.com".to_string(), 80, 3)
-            .await;
-        match result {
-            Ok(_) => info!("Authenticated connection successful"),
-            Err(e) => error!("Authenticated connection failed: {}", e),
+        match client
+            .connect_with_retries("example.com".to_string(), 80, 0)
+            .await
+        {
+            Err(Socks5Error::ConnectionFailed(message)) => {
+                assert_eq!(message, "Max retries exceeded")
+            }
+            other => panic!("expected max retries failure, got {:?}", other),
         }
     }
 }
