@@ -73,7 +73,8 @@ Current constraints:
 - The server terminal is powerful and should remain local-lab only until safety
   controls exist.
 
-The intended direction is to split surfaces first, then harden them:
+The server now keeps the route surfaces explicit so they can be hardened
+independently:
 
 ```text
 Operator UI/API/WebSockets -> auth, origin checks, audit, local-lab defaults
@@ -81,6 +82,9 @@ Agent listener endpoints   -> minimal polling API, stable task/result schemas
 Payload builder            -> reproducible profiles and build provenance
 Storage                    -> durable agents, tasks, results, files, events
 ```
+
+Operator routes are served by the web/API port. Agent polling routes are served
+by listener ports and should not be mounted on the operator mux.
 
 ## Agent Design
 

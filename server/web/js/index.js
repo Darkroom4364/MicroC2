@@ -196,15 +196,15 @@ class DashboardManager {
 
         if (command) {
             try {
-                // Always send to main API server (default port 8080)
-                const apiPort = 8080; // Change if your main API server uses a different port
-                const apiBaseUrl = `${window.location.protocol}//${window.location.hostname}:${apiPort}`;
-                const response = await fetch(`${apiBaseUrl}/api/agents/${this.selectedAgentID}/command`, {
+                const response = await fetch('/api/agents/command', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
                     },
-                    body: JSON.stringify({ command })
+                    body: JSON.stringify({
+                        agent_id: this.selectedAgentID,
+                        command
+                    })
                 });
 
                 if (!response.ok) {

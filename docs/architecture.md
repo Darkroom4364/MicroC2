@@ -28,11 +28,11 @@ Rust agents
 In-memory task/result state on the server
 ```
 
-The server hosts both operator-facing routes and agent-facing routes in one
-process. Listener instances can bind additional ports for agent polling, but
-operator UI/API routes, WebSockets, and listener management are still registered
-on the same default `net/http` mux. Splitting operator and agent surfaces is
-tracked by #75.
+The server process now keeps an explicit operator mux for the browser UI,
+operator APIs, and WebSockets. Agent polling routes stay on listener-owned muxes
+bound to listener ports. This does not add authentication yet, but it makes route
+ownership explicit so operator-only controls and agent-facing endpoints can be
+hardened independently.
 
 ## Repository Layout
 
@@ -66,10 +66,18 @@ enabled, a separate HTTP listener redirects to the configured HTTPS port.
 Current implementation note: `server.tls.enabled` exists in configuration, but
 the entry point always starts the main server with `ListenAndServeTLS`.
 
-The current server uses Go's default HTTP mux for most routes. That keeps the
-prototype simple, but it also means route ownership and trust boundaries are not
-strongly expressed in code yet. Unknown `/api/*` paths currently fall through to
-a generic `{"status":"ok"}` response, which can hide unsupported UI calls.
+The operator server uses an explicit `http.ServeMux`. Unknown `/api/*` paths
+return `404`, so unsupported operator calls and accidental agent endpoint calls
+are visible during development.
+
+### Route Surfaces
+
+| Surface | Served by | Route families |
+| --- | --- | --- |
+| Operator UI | operator web/API port | `/`, `/home/`, `/static/` |
+| Operator API | operator web/API port | `/api/agents/*`, `/api/listeners/*`, `/api/payload/*`, `/api/file_drop/*`, `/api/socks5/*` |
+| Operator WebSockets | operator web/API port | `/ws/logs`, `/ws/terminal` |
+| Agent listener API | listener ports | `/api/agent/{agent_id}/heartbeat`, `/command`, `/result`, `/tasks`, `/results` |
 
 ### Operator Routes
 
@@ -83,6 +91,7 @@ a generic `{"status":"ok"}` response, which can hide unsupported UI calls.
 | `/api/listeners/{id}/start` | `internal/handlers/api` | Start a stopped listener. |
 | `/api/listeners/{id}/stop` | `internal/handlers/api` | Stop a running listener. |
 | `/api/agents/list` | `internal/handlers/api` | Aggregate agents across listeners. |
+| `/api/agents/command` | `internal/handlers/api` | Queue a raw command string for an agent using a JSON `agent_id`. |
 | `/api/agents/{id}/command` | `internal/handlers/api` | Queue a raw command string for an agent. |
 | `/api/agents/{id}/results` | `internal/handlers/api` | Fetch stored command results. |
 | `/api/file_drop/upload` | `internal/handlers/api` | Upload operator files into the server file store. |
@@ -97,7 +106,7 @@ a generic `{"status":"ok"}` response, which can hide unsupported UI calls.
 The operator APIs and WebSockets currently lack a complete authentication,
 authorization, origin, and CSRF boundary. The server terminal can execute shell
 commands on the host running MicroC2 and should be treated as a local lab-only
-tool until #75 and #78 are complete.
+tool until #78 is complete.
 
 ### Agent Listener Routes
 
@@ -216,8 +225,6 @@ The UI talks directly to the REST and WebSocket routes listed above. It does not
 currently have a separate frontend build system. A few UI paths are ahead of the
 backend:
 
-- dashboard command submission still contains a hard-coded `8080` API base in
-  one path, while the default HTTPS UI/API port is `8443`;
 - agent removal calls `DELETE /api/agents/{id}`, which has no real handler yet;
 - listener and file-drop JavaScript reference EventSource streams that are not
   registered by the server.

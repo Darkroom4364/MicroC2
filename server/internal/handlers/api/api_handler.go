@@ -24,6 +24,11 @@ func (h *APIHandler) HandleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.Method == http.MethodPost && r.URL.Path == "/api/agents/command" {
+		h.handleQueueAgentCommandFromBody(w, r)
+		return
+	}
+
 	// Handle POST /api/agents/{AgentID}/command
 	if r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/agents/") && strings.HasSuffix(r.URL.Path, "/command") {
 		trimmed := strings.TrimPrefix(r.URL.Path, "/api/agents/")
@@ -44,7 +49,8 @@ func (h *APIHandler) HandleRequest(w http.ResponseWriter, r *http.Request) {
 
 	// Default handler for API requests
 	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"status":"ok"}`))
+	w.WriteHeader(http.StatusNotFound)
+	w.Write([]byte(`{"error":"unknown operator API route"}`))
 }
 
 func (h *APIHandler) handleListAgents(w http.ResponseWriter, r *http.Request) {
@@ -59,20 +65,37 @@ func (h *APIHandler) handleListAgents(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(agents)
 }
 
+type queueCommandRequest struct {
+	AgentID string `json:"agent_id,omitempty"`
+	Command string `json:"command"`
+}
+
+func (h *APIHandler) handleQueueAgentCommandFromBody(w http.ResponseWriter, r *http.Request) {
+	var req queueCommandRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.AgentID == "" || req.Command == "" {
+		log.Printf("[DEBUG] Invalid command request")
+		http.Error(w, "Invalid command request", http.StatusBadRequest)
+		return
+	}
+
+	h.queueAgentCommandResponse(w, req.AgentID, req.Command)
+}
+
 // handleQueueAgentCommand handles POST /api/agents/{AgentID}/command
 func (h *APIHandler) handleQueueAgentCommand(w http.ResponseWriter, r *http.Request, AgentID string) {
 	// log.Printf("[DEBUG] handleQueueAgentCommand entered for AgentID=%s", AgentID)
-	type cmdReq struct {
-		Command string `json:"command"`
-	}
-	var req cmdReq
+	var req queueCommandRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Command == "" {
-		log.Printf("[DEBUG] JSON decode failed or empty command: err=%v, req=%+v", err, req)
+		log.Printf("[DEBUG] Invalid path-based command request")
 		http.Error(w, "Invalid command", http.StatusBadRequest)
 		return
 	}
 	// log.Printf("[DEBUG] handleQueueAgentCommand: AgentID=%s, command=%s", AgentID, req.Command)
 
+	h.queueAgentCommandResponse(w, AgentID, req.Command)
+}
+
+func (h *APIHandler) queueAgentCommandResponse(w http.ResponseWriter, AgentID, command string) {
 	// Find the listener/protocol for this agent
 	listenerMgr := h.serverManager.GetListenerManager()
 	var queued bool
@@ -85,7 +108,7 @@ func (h *APIHandler) handleQueueAgentCommand(w http.ResponseWriter, r *http.Requ
 					if commander, ok := listener.Protocol.(interface {
 						QueueCommand(AgentID, cmd string)
 					}); ok {
-						commander.QueueCommand(AgentID, req.Command)
+						commander.QueueCommand(AgentID, command)
 						queued = true
 						break
 					}
@@ -94,7 +117,7 @@ func (h *APIHandler) handleQueueAgentCommand(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	// log.Printf("[DEBUG] Command queued for agent %s: %s (queued=%v)", AgentID, req.Command, queued)
+	// log.Printf("[DEBUG] Command queued for agent %s: %s (queued=%v)", AgentID, command, queued)
 
 	if queued {
 		w.WriteHeader(http.StatusOK)

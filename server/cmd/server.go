@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"microc2/server/config"
 	"microc2/server/internal/filestore"
@@ -89,39 +90,40 @@ func main() {
 	payloadDir := filepath.Join(cfg.Server.StaticDir, "payloads")
 	agentSourceDir := "../agent" // Relative path to agent source code
 	payloadHandler := api.PayloadHandlerSetup(payloadDir, agentSourceDir, serverManager.GetListenerManager())
+	operatorMux := http.NewServeMux()
 
 	// Set up HTTP routes
-	staticHandlers.SetupStaticRoutes()
+	staticHandlers.RegisterRoutes(operatorMux)
 
 	// Set up file handling routes
-	http.HandleFunc("/api/file_drop/upload", fileHandlers.HandleFileUpload)
-	http.HandleFunc("/api/file_drop/list", fileHandlers.HandleFileList)
-	http.HandleFunc("/api/file_drop/download/", fileHandlers.HandleFileDownload)
-	http.HandleFunc("/api/file_drop/delete/", fileHandlers.HandleFileDelete)
+	operatorMux.HandleFunc("/api/file_drop/upload", fileHandlers.HandleFileUpload)
+	operatorMux.HandleFunc("/api/file_drop/list", fileHandlers.HandleFileList)
+	operatorMux.HandleFunc("/api/file_drop/download/", fileHandlers.HandleFileDownload)
+	operatorMux.HandleFunc("/api/file_drop/delete/", fileHandlers.HandleFileDelete)
 
 	// Set up WebSocket routes
-	http.HandleFunc("/ws/logs", wsHandlers.HandleLogStream)
-	http.HandleFunc("/ws/terminal", wsHandlers.HandleTerminal)
+	operatorMux.HandleFunc("/ws/logs", wsHandlers.HandleLogStream)
+	operatorMux.HandleFunc("/ws/terminal", wsHandlers.HandleTerminal)
 
 	// Set up listener management routes
-	listenerHandlers.SetupRoutes()
+	listenerHandlers.RegisterRoutes(operatorMux)
 
 	// Set up payload generator routes
-	payloadHandler.SetupRoutes()
+	payloadHandler.RegisterRoutes(operatorMux)
 
 	// Set up root route to redirect / to /home/
-	http.HandleFunc("/", staticHandlers.HandleRoot)
+	operatorMux.HandleFunc("/", staticHandlers.HandleRoot)
 
 	// Set up API routes
 	apiHandler := api.NewAPIHandler(serverManager)
-	http.HandleFunc("/api/", apiHandler.HandleRequest)
+	operatorMux.HandleFunc("/api/", apiHandler.HandleRequest)
 
 	// Set up SOCKS5 management routes if protocol is SOCKS5
 	if cfg.Communication.Protocol == "socks5" {
 		if socks5Protocol, ok := serverManager.GetProtocol().(*protocols.SOCKS5Protocol); ok {
 			socks5Handler := api.NewSOCKS5Handler(socks5Protocol)
 			for route, handler := range socks5Handler.RegisterRoutes() {
-				http.HandleFunc(route, handler)
+				operatorMux.HandleFunc(route, handler)
 			}
 		}
 	}
@@ -170,7 +172,15 @@ func main() {
 				http.Redirect(w, r, target, http.StatusMovedPermanently)
 			})
 
-			if err := http.ListenAndServe(httpAddr, redirectHandler); err != nil {
+			redirectServer := &http.Server{
+				Addr:              httpAddr,
+				Handler:           redirectHandler,
+				ReadHeaderTimeout: 5 * time.Second,
+				ReadTimeout:       15 * time.Second,
+				WriteTimeout:      15 * time.Second,
+				IdleTimeout:       60 * time.Second,
+			}
+			if err := redirectServer.ListenAndServe(); err != nil {
 				log.Printf("[ERROR] HTTP redirect server error: %v", err)
 			}
 		}()
@@ -178,7 +188,15 @@ func main() {
 
 	// Start HTTPS server
 	log.Printf("[STARTUP] Starting HTTPS server on %s ...", httpsAddr)
-	if err := http.ListenAndServeTLS(httpsAddr, certFile, keyFile, nil); err != nil {
+	operatorServer := &http.Server{
+		Addr:              httpsAddr,
+		Handler:           operatorMux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	if err := operatorServer.ListenAndServeTLS(certFile, keyFile); err != nil {
 		log.Fatalf("[ERROR] HTTPS server error: %v", err)
 	}
 	// Remove or comment out the old serverManager.Start() call:
