@@ -11,6 +11,10 @@ pub fn xor_obfuscate(data: &str, key: &str) -> String {
 /// XOR deobfuscate a hex string with a key (agent_id)
 pub fn xor_deobfuscate(hex: &str, key: &str) -> Option<String> {
     let key_bytes = key.as_bytes();
+    if key_bytes.is_empty() || (hex.len() & 1) != 0 {
+        return None;
+    }
+
     let bytes: Result<Vec<u8>, _> = (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
@@ -90,4 +94,34 @@ pub fn random_char_insertion(s: &str, probability: f32) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xor_obfuscation_round_trips() {
+        let obfuscated = xor_obfuscate("command output", "agent-one");
+
+        assert_ne!(obfuscated, "command output");
+        assert_eq!(
+            xor_deobfuscate(&obfuscated, "agent-one").as_deref(),
+            Some("command output")
+        );
+    }
+
+    #[test]
+    fn xor_deobfuscation_rejects_malformed_input() {
+        assert_eq!(xor_deobfuscate("f", "agent-one"), None);
+        assert_eq!(xor_deobfuscate("zz", "agent-one"), None);
+        assert_eq!(xor_deobfuscate("00", ""), None);
+    }
+
+    #[test]
+    fn probability_zero_transforms_are_identity() {
+        assert_eq!(random_case("Echo Ping", 0.0), "Echo Ping");
+        assert_eq!(random_quote_insertion("echo ping", 0.0), "echo ping");
+        assert_eq!(random_char_insertion("echo", 0.0), "echo");
+    }
 }

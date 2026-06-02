@@ -1,4 +1,3 @@
-use log::{debug, error, info, warn};
 use reqwest::Client; // Use reqwest::Client
 use std::error::Error;
 use std::path::Path;
@@ -30,47 +29,72 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
-    use tokio::runtime::Runtime;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
-    // Basic test requires a running web server to serve the file.
-    // This test structure assumes such a server exists at 127.0.0.1:8080.
-    #[test]
-    fn test_download_functionality() {
-        let rt = Runtime::new().unwrap();
-        rt.block_on(async {
-            let test_file_url = "http://127.0.0.1:8080/test_download.txt"; // Example URL
-            let download_path = PathBuf::from("downloaded_test_file.txt");
+    #[tokio::test]
+    async fn downloads_successful_response_to_disk() {
+        let url = spawn_one_response_server("200 OK", b"downloaded body").await;
+        let download_path = unique_temp_path("download-success.txt");
 
-            // Ensure the test file doesn't exist before download
-            if download_path.exists() {
-                fs::remove_file(&download_path).unwrap();
-            }
+        if let Err(err) = download_file(&url, &download_path).await {
+            panic!("download should succeed: {}", err);
+        }
 
-            // Attempt download
-            match download_file(test_file_url, &download_path).await {
-                Ok(_) => {
-                    info!("Download successful.");
-                    // Verify file exists
-                    assert!(download_path.exists());
-                    // Optional: Verify file content if known
-                    // let content = fs::read_to_string(&download_path).unwrap();
-                    // assert_eq!(content, "Expected content");
-                }
-                Err(e) => {
-                    // If the server isn't running, this error is expected.
-                    warn!(
-                        "Download failed (is test server running at {}?): {}",
-                        test_file_url, e
-                    );
-                    // We don't fail the test here, as the server might not be running.
-                    // assert!(false, "Download failed: {}", e);
-                }
-            }
+        let content = must(fs::read_to_string(&download_path), "read downloaded file");
+        assert_eq!(content, "downloaded body");
+        let _ = fs::remove_file(download_path);
+    }
 
-            // Cleanup
-            if download_path.exists() {
-                fs::remove_file(&download_path).unwrap();
-            }
+    #[tokio::test]
+    async fn returns_error_for_unsuccessful_response() {
+        let url = spawn_one_response_server("404 Not Found", b"missing").await;
+        let download_path = unique_temp_path("download-missing.txt");
+
+        let err = match download_file(&url, &download_path).await {
+            Ok(()) => panic!("download should fail for 404 response"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("404"));
+        assert!(!download_path.exists());
+    }
+
+    async fn spawn_one_response_server(status: &'static str, body: &'static [u8]) -> String {
+        let listener = must(TcpListener::bind("127.0.0.1:0").await, "bind test server");
+        let addr = must(listener.local_addr(), "read test server address");
+        tokio::spawn(async move {
+            let (mut stream, _) = must(listener.accept().await, "accept test request");
+            let mut request = [0_u8; 1024];
+            let _ = must(stream.read(&mut request).await, "read test request");
+            let headers = format!(
+                "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                status,
+                body.len()
+            );
+            must(
+                stream.write_all(headers.as_bytes()).await,
+                "write test response headers",
+            );
+            must(stream.write_all(body).await, "write test response body");
         });
+        format!("http://{}", addr)
+    }
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let nanos = must(
+            SystemTime::now().duration_since(UNIX_EPOCH),
+            "read system time",
+        )
+        .as_nanos();
+        std::env::temp_dir().join(format!("microc2-{}-{}-{}", std::process::id(), nanos, name))
+    }
+
+    fn must<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T {
+        match result {
+            Ok(value) => value,
+            Err(err) => panic!("{}: {}", context, err),
+        }
     }
 }

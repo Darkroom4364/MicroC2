@@ -387,7 +387,9 @@ async fn submit_result_with_client(
 
 fn is_weak_command(cmd: &str) -> bool {
     let quiet = [obfstr!("ping").to_string(), obfstr!("echo").to_string()];
-    quiet.iter().any(|q| cmd.starts_with(q))
+    quiet
+        .iter()
+        .any(|q| starts_with_command_token(cmd, q.as_str()))
 }
 
 fn is_strong_command(cmd: &str) -> bool {
@@ -404,7 +406,21 @@ fn is_strong_command(cmd: &str) -> bool {
         obfstr!("uname").to_string(),
         obfstr!("cat").to_string(),
     ];
-    noisy.iter().any(|n| cmd.starts_with(n))
+    noisy
+        .iter()
+        .any(|n| starts_with_command_token(cmd, n.as_str()))
+}
+
+fn starts_with_command_token(cmd: &str, token: &str) -> bool {
+    let trimmed = cmd.trim_start();
+    if !trimmed.starts_with(token) {
+        return false;
+    }
+
+    match trimmed[token.len()..].chars().next() {
+        Some(next) => next.is_whitespace(),
+        None => true,
+    }
 }
 
 // Check if the command should be executed based on the current opsec mode
@@ -657,5 +673,18 @@ mod tests {
         };
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn classifies_commands_on_token_boundaries() {
+        assert!(is_weak_command("ping 127.0.0.1"));
+        assert!(is_weak_command("  echo hello"));
+        assert!(!is_weak_command("pinger"));
+        assert!(!is_weak_command("echoed"));
+
+        assert!(is_strong_command("download report.txt"));
+        assert!(is_strong_command("whoami"));
+        assert!(!is_strong_command("downloaded"));
+        assert!(!is_strong_command("echo hello"));
     }
 }
