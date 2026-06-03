@@ -124,6 +124,20 @@ func TestOperatorAPIRejectsInvalidCommandRequests(t *testing.T) {
 			wantStatus: http.StatusBadRequest,
 		},
 		{
+			name:       "path route rejects empty agent id",
+			method:     http.MethodPost,
+			path:       "/api/agents//command",
+			body:       map[string]string{"command": "whoami"},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "path route rejects malformed agent id",
+			method:     http.MethodPost,
+			path:       "/api/agents/agent-one/extra/command",
+			body:       map[string]string{"command": "whoami"},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
 			name:       "unknown agent cannot be queued",
 			method:     http.MethodPost,
 			path:       "/api/agents/missing/command",

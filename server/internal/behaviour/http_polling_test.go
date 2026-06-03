@@ -92,6 +92,77 @@ func TestHTTPPollingProtocolAgentLifecycle(t *testing.T) {
 	}
 }
 
+func TestHTTPPollingProtocolIsolatesMultipleAgentsPerListener(t *testing.T) {
+	proto := NewHTTPPollingProtocol(common.BaseProtocolConfig{
+		UploadDir: t.TempDir(),
+		Port:      "0",
+	})
+	handler := proto.GetHTTPHandler()
+
+	for _, agentID := range []string{"agent-one", "agent-two"} {
+		heartbeatBody, err := json.Marshal(map[string]interface{}{
+			"id":         agentID,
+			"payload_id": "payload-shared",
+			"os":         "linux",
+			"hostname":   agentID + "-host",
+			"ip":         "127.0.0.1",
+		})
+		if err != nil {
+			t.Fatalf("marshal heartbeat for %s: %v", agentID, err)
+		}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/agent/"+agentID+"/heartbeat", bytes.NewReader(heartbeatBody))
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected heartbeat 200 for %s, got %d: %s", agentID, rec.Code, rec.Body.String())
+		}
+	}
+
+	agents := proto.GetAllAgents()
+	if len(agents) != 2 {
+		t.Fatalf("expected two distinct agents, got %#v", agents)
+	}
+
+	proto.QueueCommand("agent-one", "whoami")
+	proto.QueueCommand("agent-two", "pwd")
+	assertNextListenerCommand(t, handler, "agent-one", "whoami")
+	assertNextListenerCommand(t, handler, "agent-two", "pwd")
+	assertNoListenerCommand(t, handler, "agent-one")
+	assertNoListenerCommand(t, handler, "agent-two")
+
+	postListenerResult(t, handler, "agent-one", "whoami", xorHex("one\n", "agent-one"))
+	postListenerResult(t, handler, "agent-two", "pwd", xorHex("two\n", "agent-two"))
+
+	agentOneResults := proto.GetResults("agent-one")
+	agentTwoResults := proto.GetResults("agent-two")
+	if len(agentOneResults) != 1 || agentOneResults[0]["output"] != "one\n" {
+		t.Fatalf("unexpected agent-one results: %#v", agentOneResults)
+	}
+	if len(agentTwoResults) != 1 || agentTwoResults[0]["output"] != "two\n" {
+		t.Fatalf("unexpected agent-two results: %#v", agentTwoResults)
+	}
+}
+
+func TestHTTPPollingProtocolRejectsHeartbeatIDMismatch(t *testing.T) {
+	proto := NewHTTPPollingProtocol(common.BaseProtocolConfig{
+		UploadDir: t.TempDir(),
+		Port:      "0",
+	})
+	handler := proto.GetHTTPHandler()
+	heartbeatBody := []byte(`{"id":"body-agent","os":"linux","hostname":"host","ip":"127.0.0.1"}`)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/agent/path-agent/heartbeat", bytes.NewReader(heartbeatBody))
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected mismatch heartbeat 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(proto.GetAllAgents()) != 0 {
+		t.Fatalf("mismatched heartbeat should not register an agent: %#v", proto.GetAllAgents())
+	}
+}
+
 func TestHTTPPollingProtocolRejectsMalformedAndOperatorRoutes(t *testing.T) {
 	proto := NewHTTPPollingProtocol(common.BaseProtocolConfig{
 		UploadDir: t.TempDir(),
@@ -153,4 +224,51 @@ func xorHex(data, key string) string {
 		out[i] = b ^ keyBytes[i%len(keyBytes)]
 	}
 	return hex.EncodeToString(out)
+}
+
+func assertNextListenerCommand(t *testing.T, handler http.Handler, agentID, want string) {
+	t.Helper()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/agent/"+agentID+"/command", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected command 200 for %s, got %d: %s", agentID, rec.Code, rec.Body.String())
+	}
+	var response map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode command response: %v", err)
+	}
+	if response["command"] != want {
+		t.Fatalf("expected command %q for %s, got %q", want, agentID, response["command"])
+	}
+}
+
+func assertNoListenerCommand(t *testing.T, handler http.Handler, agentID string) {
+	t.Helper()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/agent/"+agentID+"/command", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected no command 204 for %s, got %d: %s", agentID, rec.Code, rec.Body.String())
+	}
+}
+
+func postListenerResult(t *testing.T, handler http.Handler, agentID, command, output string) {
+	t.Helper()
+
+	body, err := json.Marshal(map[string]string{
+		"command": command,
+		"output":  output,
+	})
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/agent/"+agentID+"/result", bytes.NewReader(body))
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected result post 200 for %s, got %d: %s", agentID, rec.Code, rec.Body.String())
+	}
 }

@@ -13,7 +13,7 @@ use once_cell::sync::Lazy;
 use os_info;
 use reqwest::{Method, StatusCode, Url};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::env;
 use std::io;
@@ -232,15 +232,15 @@ pub async fn send_heartbeat_with_client(
     };
     let egress_ip = get_egress_ip(server_addr);
 
-    let data = json!({
-        "id": agent_id,
-        "os": os.os_type().to_string(),
-        "hostname": hostname,
-        "ip": ip,
-        "ip_list": ip_list,
-        "egress_ip": egress_ip,
-        "commands": Vec::<String>::new()
-    });
+    let data = build_heartbeat_payload(
+        config,
+        agent_id,
+        os.os_type().to_string(),
+        hostname,
+        ip,
+        ip_list,
+        egress_ip,
+    );
 
     match client.request(Method::POST, url).json(&data).send().await {
         Ok(response) => {
@@ -264,6 +264,28 @@ pub async fn send_heartbeat_with_client(
             Err(io::Error::new(io::ErrorKind::Other, e))
         }
     }
+}
+
+fn build_heartbeat_payload(
+    config: &AgentConfig,
+    agent_id: &str,
+    os: String,
+    hostname: String,
+    ip: String,
+    ip_list: Vec<String>,
+    egress_ip: String,
+) -> Value {
+    json!({
+        "id": agent_id,
+        "payload_id": config.payload_id,
+        "listener_id": config.listener_id,
+        "os": os,
+        "hostname": hostname,
+        "ip": ip,
+        "ip_list": ip_list,
+        "egress_ip": egress_ip,
+        "commands": Vec::<String>::new()
+    })
 }
 
 // Fetch command from the server
@@ -686,5 +708,29 @@ mod tests {
         assert!(is_strong_command("whoami"));
         assert!(!is_strong_command("downloaded"));
         assert!(!is_strong_command("echo hello"));
+    }
+
+    #[test]
+    fn heartbeat_payload_separates_agent_payload_and_listener_ids() {
+        let config = AgentConfig {
+            payload_id: "payload-one".to_string(),
+            listener_id: "listener-one".to_string(),
+            ..Default::default()
+        };
+
+        let payload = build_heartbeat_payload(
+            &config,
+            "agent-runtime-one",
+            "linux".to_string(),
+            "workstation".to_string(),
+            "127.0.0.1".to_string(),
+            vec!["127.0.0.1".to_string()],
+            "203.0.113.10".to_string(),
+        );
+
+        assert_eq!(payload["id"], "agent-runtime-one");
+        assert_eq!(payload["payload_id"], "payload-one");
+        assert_eq!(payload["listener_id"], "listener-one");
+        assert_ne!(payload["id"], payload["payload_id"]);
     }
 }

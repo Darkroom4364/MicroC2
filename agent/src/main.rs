@@ -100,7 +100,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .unwrap_or_else(|| config.get_server_url());
 
-    let agent_id = config.payload_id.clone();
+    let agent_id = agent::identity::resolve_runtime_agent_id(&config);
+    info!("[INFO] Payload ID: {}", config.payload_id);
     info!("[INFO] Agent ID: {}", agent_id);
 
     info!("[AGENT] Starting main loop. Agent ID: {}", agent_id);

