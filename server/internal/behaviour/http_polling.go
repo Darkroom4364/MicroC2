@@ -165,8 +165,6 @@ func (p *HTTPPollingProtocol) handleAgentHeartbeat(w http.ResponseWriter, r *htt
 		return
 	}
 
-	log.Printf("[DEBUG] Received heartbeat data from agent %s: %s", AgentID, string(body))
-
 	if err := p.processAgentHeartbeat(body, AgentID); err != nil {
 		log.Printf("[ERROR] Failed to process heartbeat from agent %s: %v", AgentID, err)
 		http.Error(w, fmt.Sprintf("Error processing agent data: %v", err), http.StatusBadRequest)
