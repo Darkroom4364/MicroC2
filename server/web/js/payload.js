@@ -275,6 +275,9 @@ class PayloadManager {
             this.currentPayloadId = result.id;
             
             this.addLogEntry('payload', `Successfully generated payload: ${result.filename} (${formatBytes(result.size)})`, 'INFO');
+            if (result.mutation_seed) {
+                this.addLogEntry('payload', `Mutation seed: ${result.mutation_seed} (record it with the git revision to reproduce this build)`, 'INFO');
+            }
             
             downloadSection.classList.remove('hidden');
             

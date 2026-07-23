@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"microc2/server/internal/filestore"
 	"microc2/server/internal/handlers/api/payload"
 	"microc2/server/internal/listeners" // Updated from `networking`
@@ -41,6 +42,10 @@ func (h *FileHandlers) HandleFileUpload(w http.ResponseWriter, r *http.Request) 
 
 	err := h.fileStore.HandleUpload(r)
 	if err != nil {
+		if errors.Is(err, filestore.ErrInvalidFileName) {
+			http.Error(w, "Invalid file name", http.StatusBadRequest)
+			return
+		}
 		http.Error(w, "Failed to upload file: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -98,6 +103,10 @@ func (h *FileHandlers) HandleFileDownload(w http.ResponseWriter, r *http.Request
 
 	err := h.fileStore.ServeFile(fileName, w, r)
 	if err != nil {
+		if errors.Is(err, filestore.ErrInvalidFileName) {
+			http.Error(w, "Invalid file name", http.StatusBadRequest)
+			return
+		}
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
 	}
@@ -128,7 +137,9 @@ func (h *FileHandlers) HandleFileDelete(w http.ResponseWriter, r *http.Request) 
 
 	err := h.fileStore.DeleteFile(fileName)
 	if err != nil {
-		if err == os.ErrNotExist {
+		if errors.Is(err, filestore.ErrInvalidFileName) {
+			http.Error(w, "Invalid file name", http.StatusBadRequest)
+		} else if err == os.ErrNotExist {
 			http.Error(w, "File not found", http.StatusNotFound)
 		} else {
 			http.Error(w, "Failed to delete file: "+err.Error(), http.StatusInternalServerError)

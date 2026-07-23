@@ -217,6 +217,76 @@ func TestHTTPPollingProtocolRejectsMalformedAndOperatorRoutes(t *testing.T) {
 	}
 }
 
+func TestHTTPPollingProtocolCORSUsesConfiguredOrigins(t *testing.T) {
+	proto := NewHTTPPollingProtocol(common.BaseProtocolConfig{
+		UploadDir:      t.TempDir(),
+		Port:           "0",
+		AllowedOrigins: []string{"https://operator.lab:8443"},
+	})
+	handler := proto.GetHTTPHandler()
+
+	tests := []struct {
+		name       string
+		origin     string
+		wantHeader string
+	}{
+		{"allowed origin is reflected", "https://operator.lab:8443", "https://operator.lab:8443"},
+		{"unconfigured loopback origin gets no CORS header", "http://localhost:8080", ""},
+		{"disallowed origin gets no CORS header", "https://evil.example", ""},
+		{"no origin header gets no CORS header", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/api/agent/agent-one/command", nil)
+			if tt.origin != "" {
+				req.Header.Set("Origin", tt.origin)
+			}
+			handler.ServeHTTP(rec, req)
+
+			got := rec.Header().Get("Access-Control-Allow-Origin")
+			if got != tt.wantHeader {
+				t.Fatalf("Access-Control-Allow-Origin = %q, want %q", got, tt.wantHeader)
+			}
+		})
+	}
+}
+
+func TestHTTPPollingProtocolCORSWildcardIsExplicitEscapeHatch(t *testing.T) {
+	proto := NewHTTPPollingProtocol(common.BaseProtocolConfig{
+		UploadDir:      t.TempDir(),
+		Port:           "0",
+		AllowedOrigins: []string{"*"},
+	})
+	handler := proto.GetHTTPHandler()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/agent/agent-one/command", nil)
+	req.Header.Set("Origin", "https://evil.example")
+	handler.ServeHTTP(rec, req)
+
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("expected wildcard CORS header when explicitly configured, got %q", got)
+	}
+}
+
+func TestHTTPPollingProtocolRejectsTraversalUploadFilename(t *testing.T) {
+	proto := NewHTTPPollingProtocol(common.BaseProtocolConfig{
+		UploadDir: t.TempDir(),
+		Port:      "0",
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/files/upload", bytes.NewBufferString("pwn"))
+	req.Header.Set("X-Filename", "../evil.sh")
+	proto.handleFileUpload(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected traversal upload filename 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func xorHex(data, key string) string {
 	keyBytes := []byte(key)
 	out := make([]byte, len(data))

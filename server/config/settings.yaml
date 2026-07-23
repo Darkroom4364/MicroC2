@@ -21,7 +21,16 @@ communication:
     
 security:
   enableCORS: true
-  corsOrigins: ["*"]
+  # CORS origins for agent polling routes. Use ["*"] only as an explicit
+  # escape hatch; empty list means no cross-origin access.
+  corsOrigins: ["https://localhost:8443", "http://localhost:8080"]
+  # Shared token protecting the operator API, file drop, and server terminal.
+  # Empty means loopback-only operator access (safe lab default).
+  # Can also be set via the MICROC2_OPERATOR_TOKEN environment variable.
+  operatorToken: ""
+  # Origins allowed to open operator WebSockets (log stream, terminal).
+  # Same-host and loopback origins are always allowed.
+  operatorAllowedOrigins: ["https://localhost:8443", "http://localhost:8080"]
   
 logging:
   level: info

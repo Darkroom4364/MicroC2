@@ -14,6 +14,7 @@ LISTENER_PORT="" # Primarily set by --listener-port arg
 LISTENER_ID=${LISTENER_ID:-""}
 PAYLOAD_ID="" # Primarily set by --payload-id arg or derived
 PROTOCOL="" # Primarily set by --protocol arg or derived
+MUTATION_SEED=${MUTATION_SEED:-""} # Hex u64; empty means build.rs falls back to the fixed dev seed
 
 SLEEP_INTERVAL=${SLEEP_INTERVAL:-60}
 JITTER=${JITTER:-2}
@@ -77,6 +78,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --protocol)
       PROTOCOL="$2"
+      shift 2
+      ;;
+    --mutation-seed)
+      MUTATION_SEED="$2" # CLI arg overrides env/default
       shift 2
       ;;
     --socks5-enabled)
@@ -395,6 +400,14 @@ export PROTOCOL="$PROTOCOL" # Actual protocol
 export SOCKS5_ENABLED="$SOCKS5_ENABLED"
 export SOCKS5_HOST="$SOCKS5_HOST"
 export SOCKS5_PORT="$SOCKS5_PORT"
+
+# Only export when set; an unset MUTATION_SEED triggers the build.rs dev-seed fallback with a warning.
+if [ -n "$MUTATION_SEED" ]; then
+    export MUTATION_SEED="$MUTATION_SEED"
+    echo "  Mutation Seed: $MUTATION_SEED"
+else
+    echo "  Mutation Seed: <not set, build.rs will use the fixed dev seed>"
+fi
 
 export BASE_SCORE_THRESHOLD_BG_TO_REDUCED="$BASE_SCORE_THRESHOLD_BG_TO_REDUCED"
 export BASE_SCORE_THRESHOLD_REDUCED_TO_FULL="$BASE_SCORE_THRESHOLD_REDUCED_TO_FULL"

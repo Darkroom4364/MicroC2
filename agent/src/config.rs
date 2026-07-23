@@ -375,4 +375,33 @@ mod tests {
         assert!(deobfuscate_config("zz", "k").is_err());
         assert!(deobfuscate_config("00", "").is_err());
     }
+
+    #[test]
+    fn obfuscated_config_round_trips_with_seed_derived_key() {
+        // build.rs derives the XOR key from the mutation seed (issue #67); the
+        // deobfuscation path must round-trip with any non-empty random key.
+        let json = r#"{"server_url":"https://c2.example:8443","sleep_interval":5,"jitter":2,"payload_id":"payload-one","protocol":"https"}"#;
+        let key = "9f3ac71b04e5d2881642aa07ccdefb53";
+        let key_bytes = key.as_bytes();
+
+        let mut obfuscated = json.as_bytes().to_vec();
+        for (i, byte) in obfuscated.iter_mut().enumerate() {
+            *byte ^= key_bytes[i % key_bytes.len()];
+        }
+        let hex: String = obfuscated.iter().map(|b| format!("{:02x}", b)).collect();
+
+        let decoded = deobfuscate_config(&hex, key).expect("config should round-trip");
+        let config: AgentConfig = serde_json::from_str(&decoded).expect("valid config JSON");
+        assert_eq!(config.server_url, "https://c2.example:8443");
+        assert_eq!(config.payload_id, "payload-one");
+    }
+
+    #[test]
+    fn embedded_config_deobfuscates_with_embedded_key() {
+        // The generated EMBEDDED_CONFIG_* consts must always be consistent,
+        // regardless of which seed produced them.
+        let decoded = deobfuscate_config(EMBEDDED_CONFIG_HEX, EMBEDDED_CONFIG_XOR_KEY)
+            .expect("embedded config should deobfuscate with embedded key");
+        serde_json::from_str::<AgentConfig>(&decoded).expect("embedded config should parse");
+    }
 }

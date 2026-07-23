@@ -191,6 +191,32 @@ This framework was built by someone running on way too much caffeine. If you enc
 - Edit `server/config/settings.yaml` for server settings.
 - Edit `agent/src/config.rs` or use environment variables for agent configuration.
 
+### Safe lab defaults
+
+- With `security.operatorToken` empty, the operator UI, API, file drop, log
+  stream, and terminal accept loopback clients only. This keeps the default
+  local workflow available without exposing operator control to the lab
+  network.
+- For remote operator access, set a strong token through the environment
+  instead of committing it to YAML:
+
+  ```sh
+  MICROC2_OPERATOR_TOKEN='<random-lab-secret>' ./server
+  ```
+
+  Remote API clients must send that value in `X-Operator-Token`. Browser
+  origins must also appear in `security.operatorAllowedOrigins`.
+- Agent-listener CORS is limited by `security.corsOrigins`. An empty list
+  disables cross-origin browser access; `"*"` is an explicit unsafe escape
+  hatch and should not be used for normal lab runs.
+- Agent TLS certificate validation is enabled by default.
+  `ALLOW_INVALID_CERTS=true` is the explicit build-time escape hatch for a
+  controlled lab using an otherwise-untrusted certificate.
+- Bind listeners only to the isolated lab segment and keep detonation VMs
+  without direct internet egress. See
+  [`docs/research/r1-measurement-protocol.md`](docs/research/r1-measurement-protocol.md)
+  before executing measurement cells.
+
 ### TLS certificates for using HTTPS
 - Run the following in MicroC2/server/ to generate TLS certificates
     ```

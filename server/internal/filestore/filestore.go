@@ -1,6 +1,8 @@
 package filestore
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -8,6 +10,26 @@ import (
 	"strings"
 	"time"
 )
+
+// ErrInvalidFileName is returned when a file name is not a plain basename
+// (e.g. contains path separators or traversal segments).
+var ErrInvalidFileName = errors.New("invalid file name")
+
+// ValidateFileName ensures name is a plain basename that cannot escape the
+// store's base directory. It rejects empty names, "."/"..", path separators
+// (both OS and Windows style), and NUL bytes.
+func ValidateFileName(name string) error {
+	if name == "" || name == "." || name == ".." {
+		return fmt.Errorf("%w: %q", ErrInvalidFileName, name)
+	}
+	if strings.ContainsAny(name, "/\\\x00") {
+		return fmt.Errorf("%w: %q", ErrInvalidFileName, name)
+	}
+	if filepath.Base(name) != name {
+		return fmt.Errorf("%w: %q", ErrInvalidFileName, name)
+	}
+	return nil
+}
 
 // New creates a new FileStore instance
 //
@@ -42,6 +64,9 @@ func (fs *FileStore) HandleUpload(r *http.Request) error {
 
 	files := r.MultipartForm.File["files"]
 	for _, fileHeader := range files {
+		if err := ValidateFileName(fileHeader.Filename); err != nil {
+			return err
+		}
 		file, err := fileHeader.Open()
 		if err != nil {
 			return err
@@ -108,9 +133,9 @@ func (fs *FileStore) ListFiles() ([]FileInfo, error) {
 //   - File is served to the HTTP response writer
 //   - Returns an error if file doesn't exist or path is invalid
 func (fs *FileStore) ServeFile(fileName string, w http.ResponseWriter, r *http.Request) error {
-	// Prevent directory traversal
-	if strings.Contains(fileName, "..") {
-		return os.ErrNotExist
+	// Prevent directory traversal: only plain basenames are served
+	if err := ValidateFileName(fileName); err != nil {
+		return err
 	}
 
 	filePath := filepath.Join(fs.baseDir, fileName)
@@ -128,9 +153,9 @@ func (fs *FileStore) ServeFile(fileName string, w http.ResponseWriter, r *http.R
 //   - File is deleted from the filesystem
 //   - Returns an error if deletion fails or path is invalid
 func (fs *FileStore) DeleteFile(fileName string) error {
-	// Prevent directory traversal
-	if strings.Contains(fileName, "..") {
-		return os.ErrNotExist
+	// Prevent directory traversal: only plain basenames are deleted
+	if err := ValidateFileName(fileName); err != nil {
+		return err
 	}
 
 	return os.Remove(filepath.Join(fs.baseDir, fileName))

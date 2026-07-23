@@ -194,7 +194,11 @@ Exit criteria:
 Candidate issues:
 
 - #79 `[Agent] Reduce dependencies as much as possible`
-- #67 `[Agent] - Source-Level Mutation Engine (Phase 1)`
+- #67 `[Agent] - Source-Level Mutation Engine (Phase 1)` — v0 landed: seeded
+  mutation (`MUTATION_SEED`) covering the config XOR key, a junk-code module,
+  and surface strings, with build provenance recorded per payload (see
+  `docs/research/r1-mutation-engine.md`). Next axes: behavioral/transport
+  mutation via the Phase 2 transport profiles.
 - #66 `[Agent] - Selective Encryption routine`
 
 ## Phase 4: Extensibility And Research Modules
@@ -252,7 +256,7 @@ These items are valuable, but should wait until the core is stable and audited:
 - Additional transport channels.
 - Advanced payload packaging formats.
 - BOF-style extensibility.
-- OPSEC mutation research.
+- OPSEC mutation research beyond the Research Program tracks (see above).
 - Cross-platform in-memory execution research.
 - Automated scenario orchestration.
 - Optional OT/BACnet assessment bridge through BACillus evidence bundles.
@@ -282,6 +286,72 @@ Exit criteria:
   extension points.
 - Releases can be compared by test results, scenario outputs, and documented
   behavior changes.
+
+## Research Program: Reproducible Evasion Measurement
+
+Positioning from a literature scan (July 2026, arXiv/USENIX/IEEE S&P/CCS/NDSS):
+static evasion against ML classifiers is saturated (Adversarial EXEmples
+lineage, GAMMA, MAB-Malware, LLM-driven mutation such as LLMalMorph
+2507.09411), and C2 traffic *detection* is big-lab foundation-model territory.
+The open gap is measurement infrastructure: nobody has published a seeded,
+reproducible, source-level mutation of a *live* agent measured against
+behavioral EDR telemetry with detection-engineering output. That gap is
+exactly MicroC2's shape.
+
+Differentiation against the closest prior art:
+
+- ShellForge (arXiv:2607.07191, July 2026) benchmarks GA-evolved *shellcode*
+  variants against AV/EDR. MicroC2's angle is source-level mutation of a full
+  agent, seeded and reproducible, measurement-first, with open artifacts.
+- A GOAD-based EDR testbed (arXiv:2606.08168) measures commercial EDR under
+  autonomous configuration, but without per-build payload diversity or seeds.
+- An MCP-based LLM C2 (arXiv:2511.15998) claims a reduced detection surface
+  for agentic C2, but the claim is unmeasured.
+
+Publication posture: this space is moving fast and partially scooped already.
+Publish benchmark methodology, seeds, and datasets early; being open and
+measurement-first is the moat, not any single evasion trick.
+
+Research tracks:
+
+- **R1: Mutation engine as a measurement instrument** (extends #67, Phase 3).
+  Reframe the source-level mutation engine from an evasion feature into a
+  benchmark: N seeded builds of functionally identical agents, detection
+  *distributions* across EDR products, and per-telemetry-channel attribution
+  (Sysmon/ETW ground truth vs. EDR verdict). Includes a cross-layer ablation:
+  static-only vs. behavioral-only vs. transport-only mutation, attributing
+  which detector layer each axis moves. Every mutation decision derives from
+  one per-build seed recorded in build provenance, so any payload is
+  reproducible from (source revision, seed) — this resolves the tension
+  between Phase 3 reproducibility and mutation.
+- **R2: LLMjacking emulation module** (Phase 4 module SDK). No academic
+  baseline exists for AI-compute monetization ("LLMjacking"; industry-only
+  reporting from Sysdig, Microsoft, Permiso). Build a module that emulates the
+  kill chain endpoint-side in the lab: planted honeytoken LLM API keys, model
+  enumeration, inference proxied through the C2 to a local model, ORP-style
+  traffic under transport profiles. Measure which EDR products detect each
+  stage; credential theft is well covered, monetization behavior almost
+  certainly is not. Directly answers the "AI-as-a-service botnet" question
+  with a citable detection baseline.
+- **R3: LLM-in-the-loop transport controller** (Phase 2 transport profiles).
+  An LLM policy layer that selects jitter, working hours, host rotation, and
+  transport per beacon, evaluated against fixed malleable profiles under real
+  EDR/NDR. The contribution is the measurement, not the agent: does adaptive
+  tasking actually beat static profiles?
+- **R4: Longitudinal EDR drift dataset** (CI byproduct). Freeze a payload
+  suite and re-run it against auto-updating EDR versions over months; publish
+  the drift dataset. Near-zero marginal cost once R1 exists.
+
+Track dependencies:
+
+- R1 needs Phase 3 build provenance and Phase 5 reporting/telemetry views.
+- R2 needs the Phase 4 module SDK and its safety metadata.
+- R3 needs Phase 2 transport profiles as validated config.
+- R4 needs Phase 0 CI plus R1's frozen build artifacts.
+
+Explicit non-goals (saturated, skip): new byte-level attacks on static ML
+classifiers, LLM pentest agents, LLM phishing generation, DoH/DNS tunnel
+detection, Internet-scale botnet market measurement.
 
 ## Near-Term Order
 

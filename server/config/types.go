@@ -27,6 +27,14 @@ type Config struct {
 	Security struct {
 		EnableCORS  bool     `yaml:"enableCORS"`
 		CORSOrigins []string `yaml:"corsOrigins"`
+		// OperatorToken protects the operator API and server terminal for
+		// non-loopback clients. Empty means loopback-only operator access.
+		// Can also be set via the MICROC2_OPERATOR_TOKEN environment variable.
+		OperatorToken string `yaml:"operatorToken"`
+		// OperatorAllowedOrigins lists origins allowed to call operator APIs
+		// and open operator WebSockets (log stream, terminal). Same-host and
+		// loopback origins are always allowed; "*" disables origin checks.
+		OperatorAllowedOrigins []string `yaml:"operatorAllowedOrigins"`
 	} `yaml:"security"`
 
 	Logging struct {

@@ -64,6 +64,9 @@ jobs:
               - '.github/workflows/ci.yml'
               - 'install.sh'
               - 'agent/build.sh'
+              - 'agent/check_mutation_determinism.sh'
+              - 'lab/build_matrix.sh'
+              - 'lab/manifest*.json'
               - 'server/web/**'
             format:
               - '.github/workflows/ci.yml'
@@ -108,7 +111,7 @@ jobs:
 
       - name: Check shell scripts
         run: |
-          for file in install.sh agent/build.sh; do
+          for file in install.sh agent/build.sh agent/check_mutation_determinism.sh lab/build_matrix.sh; do
             bash -n "$file"
           done
 
@@ -151,6 +154,9 @@ jobs:
 
       - name: Build
         run: cargo build --locked
+
+      - name: Mutation determinism check
+        run: ./check_mutation_determinism.sh
 
   format:
     name: Format

@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"microc2/server/config"
+	"microc2/server/internal/behaviour"
 	"microc2/server/internal/filestore"
+	"microc2/server/internal/handlers"
 	"microc2/server/internal/handlers/api"
 	"microc2/server/internal/handlers/web"
 	"microc2/server/internal/handlers/ws"
@@ -50,6 +52,25 @@ func main() {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
+	// Set up the operator guard: loopback clients always pass; non-loopback
+	// clients need the configured operator token. Also enforces the origin
+	// policy for operator WebSockets.
+	operatorGuard := handlers.NewOperatorGuard(cfg.Security.OperatorToken, cfg.Security.OperatorAllowedOrigins)
+	logStreamer.SetCheckOrigin(operatorGuard.CheckOrigin)
+	if cfg.Security.OperatorToken == "" {
+		log.Printf("[SECURITY] No operator token configured: operator API and terminal are restricted to loopback clients")
+	} else {
+		log.Printf("[SECURITY] Operator token configured: non-loopback operator access requires the %s header", handlers.OperatorTokenHeader)
+	}
+
+	// Configure CORS origins for agent polling routes (wildcard only when
+	// explicitly configured).
+	var corsOrigins []string
+	if cfg.Security.EnableCORS {
+		corsOrigins = cfg.Security.CORSOrigins
+	}
+	behaviour.SetDefaultAllowedOrigins(corsOrigins)
+
 	// Create required directories
 	listenersDir := filepath.Join(cfg.Server.StaticDir, "listeners")
 	if err := os.MkdirAll(listenersDir, 0755); err != nil {
@@ -69,6 +90,7 @@ func main() {
 		Port:         cfg.Server.Port,
 		StaticDir:    cfg.Server.StaticDir,
 		ProtocolType: cfg.Communication.Protocol,
+		CORSOrigins:  corsOrigins,
 	}
 
 	// Create and start server manager
@@ -83,7 +105,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to initialize static handlers: %v", err)
 	}
-	wsHandlers := ws.New(logStreamer)
+	wsHandlers := ws.New(logStreamer, operatorGuard.CheckOrigin)
 	listenerHandlers := api.NewListenerHandlers(serverManager.GetListenerManager())
 
 	// Initialize payload handler
@@ -190,7 +212,7 @@ func main() {
 	log.Printf("[STARTUP] Starting HTTPS server on %s ...", httpsAddr)
 	operatorServer := &http.Server{
 		Addr:              httpsAddr,
-		Handler:           operatorMux,
+		Handler:           operatorGuard.Wrap(operatorMux),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,

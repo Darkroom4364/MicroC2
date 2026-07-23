@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 )
 
@@ -65,6 +66,127 @@ func TestGeneratePayloadCreatesBuildIDsDistinctFromListenerID(t *testing.T) {
 	}
 	if configData["agent_id"] != "" {
 		t.Fatalf("generated config should leave runtime agent_id empty, got %#v", configData["agent_id"])
+	}
+}
+
+func TestGeneratePayloadGeneratesSeedAndWritesProvenance(t *testing.T) {
+	tempDir := withTempWorkingDir(t)
+	agentDir := filepath.Join(tempDir, "agent")
+	writeFakeBuildScript(t, agentDir)
+	writeListenerConfig(t, ListenerConfig{
+		ID:       "listener-one",
+		Name:     "lab-listener",
+		Protocol: "http",
+		BindHost: "127.0.0.1",
+		Port:     9001,
+	})
+
+	handler := NewPayloadHandler(filepath.Join(tempDir, "static", "payloads"), agentDir)
+	config := PayloadConfig{
+		ListenerID: "listener-one",
+		AgentType:  "debugAgent",
+		Format:     "linux_elf",
+		Sleep:      5,
+	}
+
+	seedPattern := regexp.MustCompile(`^[0-9a-f]{16}$`)
+
+	first, err := handler.GeneratePayload(config)
+	if err != nil {
+		t.Fatalf("generate first payload: %v", err)
+	}
+	if !seedPattern.MatchString(first.MutationSeed) {
+		t.Fatalf("generated mutation seed %q does not match 16 lowercase hex chars", first.MutationSeed)
+	}
+
+	// The build script must receive the seed through its environment.
+	envSeed, err := os.ReadFile(filepath.Join(filepath.Dir(first.Path), "mutation_seed.env"))
+	if err != nil {
+		t.Fatalf("read recorded build env seed: %v", err)
+	}
+	if string(envSeed) != first.MutationSeed {
+		t.Fatalf("build script received MUTATION_SEED=%q, want %q", envSeed, first.MutationSeed)
+	}
+
+	provenance := readJSONFile(t, filepath.Join(filepath.Dir(first.Path), "provenance.json"))
+	if provenance["mutation_seed"] != first.MutationSeed {
+		t.Fatalf("provenance mutation_seed = %#v, want %q", provenance["mutation_seed"], first.MutationSeed)
+	}
+	if provenance["seed_generated_by_server"] != true {
+		t.Fatalf("provenance should mark the seed as server-generated: %#v", provenance["seed_generated_by_server"])
+	}
+	if provenance["git_revision"] == nil || provenance["git_revision"] == "" {
+		t.Fatalf("provenance should record a git revision (or \"unknown\"): %#v", provenance["git_revision"])
+	}
+	if provenance["target"] != "x86_64-unknown-linux-gnu" {
+		t.Fatalf("provenance target = %#v, want x86_64-unknown-linux-gnu", provenance["target"])
+	}
+	if provenance["config_sha256"] == nil || provenance["config_sha256"] == "" {
+		t.Fatalf("provenance should record the resolved config hash: %#v", provenance["config_sha256"])
+	}
+	if provenance["built_at"] == nil || provenance["built_at"] == "" {
+		t.Fatalf("provenance should record a build timestamp: %#v", provenance["built_at"])
+	}
+	flags, ok := provenance["mutation_flags"].([]interface{})
+	if !ok || len(flags) == 0 {
+		t.Fatalf("provenance should list mutation flags: %#v", provenance["mutation_flags"])
+	}
+
+	second, err := handler.GeneratePayload(config)
+	if err != nil {
+		t.Fatalf("generate second payload: %v", err)
+	}
+	if second.MutationSeed == first.MutationSeed {
+		t.Fatalf("distinct payloads should get distinct random seeds: %q", first.MutationSeed)
+	}
+}
+
+func TestGeneratePayloadHonoursSuppliedMutationSeed(t *testing.T) {
+	tempDir := withTempWorkingDir(t)
+	agentDir := filepath.Join(tempDir, "agent")
+	writeFakeBuildScript(t, agentDir)
+	writeListenerConfig(t, ListenerConfig{
+		ID:       "listener-one",
+		Name:     "lab-listener",
+		Protocol: "http",
+		BindHost: "127.0.0.1",
+		Port:     9001,
+	})
+
+	handler := NewPayloadHandler(filepath.Join(tempDir, "static", "payloads"), agentDir)
+	config := PayloadConfig{
+		ListenerID:   "listener-one",
+		AgentType:    "debugAgent",
+		Format:       "linux_elf",
+		Sleep:        5,
+		MutationSeed: "0123456789abcdef",
+	}
+
+	result, err := handler.GeneratePayload(config)
+	if err != nil {
+		t.Fatalf("generate payload with supplied seed: %v", err)
+	}
+	if result.MutationSeed != "0123456789abcdef" {
+		t.Fatalf("supplied mutation seed should be used verbatim, got %q", result.MutationSeed)
+	}
+
+	provenance := readJSONFile(t, filepath.Join(filepath.Dir(result.Path), "provenance.json"))
+	if provenance["seed_generated_by_server"] != false {
+		t.Fatalf("provenance should mark the seed as caller-supplied: %#v", provenance["seed_generated_by_server"])
+	}
+
+	config.MutationSeed = "0xABCD"
+	shortSeed, err := handler.GeneratePayload(config)
+	if err != nil {
+		t.Fatalf("generate payload with short prefixed seed: %v", err)
+	}
+	if shortSeed.MutationSeed != "000000000000abcd" {
+		t.Fatalf("short seed should be normalized to 16 hex chars, got %q", shortSeed.MutationSeed)
+	}
+
+	config.MutationSeed = "not-hex"
+	if _, err := handler.GeneratePayload(config); err == nil {
+		t.Fatalf("invalid mutation seed should be rejected")
 	}
 }
 
@@ -147,6 +269,7 @@ case "$format" in
 esac
 mkdir -p "$output"
 printf 'fake agent' > "$output/$artifact"
+printf '%s' "${MUTATION_SEED:-}" > "$output/mutation_seed.env"
 `
 	if err := os.WriteFile(filepath.Join(agentDir, "build.sh"), []byte(script), 0644); err != nil {
 		t.Fatalf("write fake build script: %v", err)

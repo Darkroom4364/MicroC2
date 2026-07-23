@@ -1,0 +1,165 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://microc2.local/lab/manifest.schema.json",
+  "title": "MicroC2 R1 Run Manifest",
+  "description": "One manifest per study run: an array of (seed, EDR slot) cells. Build-side fields are filled by lab/build_matrix.sh; EDR verdict and telemetry fields are filled per lab run following docs/research/r1-measurement-protocol.md.",
+  "type": "object",
+  "required": ["manifest_version", "cells"],
+  "additionalProperties": false,
+  "properties": {
+    "manifest_version": {
+      "type": "string",
+      "description": "Schema version of this manifest, e.g. \"1.0\"."
+    },
+    "study_id": {
+      "type": "string",
+      "description": "Identifier for the study this manifest belongs to."
+    },
+    "generated_by": {
+      "type": "string",
+      "description": "Tool that generated the skeleton, e.g. \"lab/build_matrix.sh\"."
+    },
+    "generated_at": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "UTC RFC 3339 timestamp of skeleton generation."
+    },
+    "cells": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/cell" }
+    }
+  },
+  "$defs": {
+    "cell": {
+      "type": "object",
+      "description": "One (seed, EDR slot) measurement cell.",
+      "additionalProperties": false,
+      "required": [
+        "cell_id",
+        "seed",
+        "git_revision",
+        "artifact",
+        "edr",
+        "timestamps",
+        "verdict",
+        "alert_names",
+        "telemetry",
+        "notes"
+      ],
+      "properties": {
+        "cell_id": {
+          "type": "string",
+          "description": "Unique cell identifier, conventionally <seed>@<edr-slot-id>."
+        },
+        "seed": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{1,16}$",
+          "description": "Mutation seed, hex u64 without 0x prefix (matches agent/build.sh --mutation-seed and provenance.json)."
+        },
+        "git_revision": {
+          "type": "string",
+          "description": "Source revision the payload was built from (commit SHA)."
+        },
+        "artifact": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "sha256"],
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Path to the payload artifact, relative to the manifest location."
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$",
+              "description": "SHA-256 of the payload artifact, lowercase hex."
+            },
+            "provenance_path": {
+              "type": ["string", "null"],
+              "description": "Path to the build's provenance.json, if present."
+            }
+          }
+        },
+        "edr": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["slot_id", "product", "version"],
+          "properties": {
+            "slot_id": {
+              "type": "string",
+              "description": "Configurable slot identifier from the lab matrix (e.g. \"slot-a\")."
+            },
+            "product": {
+              "type": ["string", "null"],
+              "description": "EDR product name; null until the slot is assigned."
+            },
+            "version": {
+              "type": ["string", "null"],
+              "description": "EDR product/engine version, including signature/content date where applicable."
+            }
+          }
+        },
+        "timestamps": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["built_at", "run_started_at", "run_finished_at"],
+          "properties": {
+            "built_at": {
+              "type": ["string", "null"],
+              "format": "date-time",
+              "description": "UTC RFC 3339 build timestamp."
+            },
+            "run_started_at": {
+              "type": ["string", "null"],
+              "format": "date-time",
+              "description": "UTC RFC 3339 payload execution start; null until the cell is run."
+            },
+            "run_finished_at": {
+              "type": ["string", "null"],
+              "format": "date-time",
+              "description": "UTC RFC 3339 end of dwell/evidence collection; null until the cell is run."
+            }
+          }
+        },
+        "verdict": {
+          "type": "string",
+          "enum": ["detected", "not-detected", "unknown"],
+          "description": "EDR verdict for this cell. \"unknown\" is both the pre-run placeholder and the verdict for invalid cells (see protocol §4)."
+        },
+        "alert_names": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "EDR alert/signature names raised during the cell window, as reported by the product console."
+        },
+        "telemetry": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["sysmon_evtx", "etw_etl", "agent_network_log", "edr_export"],
+          "properties": {
+            "sysmon_evtx": {
+              "type": ["string", "null"],
+              "description": "Path to the exported Sysmon event log (.evtx)."
+            },
+            "etw_etl": {
+              "type": ["string", "null"],
+              "description": "Path to the ETW trace (.etl), where the study includes ETW capture."
+            },
+            "agent_network_log": {
+              "type": ["string", "null"],
+              "description": "Path to the C2-side beacon/task log for this payload_id."
+            },
+            "edr_export": {
+              "type": ["string", "null"],
+              "description": "Path to the EDR console export (alerts detail) for this cell."
+            }
+          }
+        },
+        "notes": {
+          "type": "string",
+          "description": "Free-text notes: deviations from protocol, static vs. behavioral attribution, slot table snapshot, etc."
+        }
+      }
+    }
+  }
+}
