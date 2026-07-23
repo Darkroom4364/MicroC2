@@ -1,6 +1,9 @@
 package payload
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,6 +42,48 @@ func NewPayloadHandler(payloadsDir, agentSourceDir string) *PayloadHandler {
 		agentSourceDir: agentSourceDir,
 		payloads:       make(map[string]PayloadResult),
 	}
+}
+
+// resolveMutationSeed returns the caller-supplied seed or generates a random
+// one. The second return value reports whether the seed was server-generated.
+func resolveMutationSeed(supplied string) (string, bool, error) {
+	if supplied != "" {
+		trimmed := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(supplied)), "0x")
+		seed, err := strconv.ParseUint(trimmed, 16, 64)
+		if err != nil {
+			return "", false, fmt.Errorf("invalid mutation seed %q: expected hex u64", supplied)
+		}
+		return fmt.Sprintf("%016x", seed), false, nil
+	}
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", false, fmt.Errorf("failed to generate mutation seed: %w", err)
+	}
+	return fmt.Sprintf("%016x", binary.BigEndian.Uint64(b[:])), true, nil
+}
+
+// gitRevision returns the current git revision of dir, or "unknown".
+func gitRevision(dir string) string {
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// writeProvenance records the build inputs needed to reproduce a payload next
+// to the built artifact (issue #99).
+func writeProvenance(artifactDir string, provenance map[string]interface{}) error {
+	data, err := json.MarshalIndent(provenance, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal provenance: %w", err)
+	}
+	path := filepath.Join(artifactDir, "provenance.json")
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return fmt.Errorf("failed to write provenance: %w", err)
+	}
+	log.Printf("[INFO] Wrote build provenance to %s", path)
+	return nil
 }
 
 // HandleGeneratePayload processes a request to generate a payload
@@ -165,6 +211,15 @@ func (h *PayloadHandler) GeneratePayload(config PayloadConfig) (PayloadResult, e
 
 	payloadID := uuid.NewString()
 	log.Printf("[INFO] Generated payload build ID %s for listener %s", payloadID, listener.ID)
+
+	// Resolve the mutation seed: use the caller-supplied one for reproduction
+	// builds, otherwise generate a random seed per payload (issue #67).
+	mutationSeed, seedGenerated, err := resolveMutationSeed(config.MutationSeed)
+	if err != nil {
+		log.Printf("[ERROR] Failed to resolve mutation seed: %v", err)
+		return PayloadResult{}, err
+	}
+	log.Printf("[INFO] Using mutation seed %s (server-generated: %t)", mutationSeed, seedGenerated)
 
 	// Determine build type (debug or release)
 	buildType := "release"
@@ -336,6 +391,7 @@ func (h *PayloadHandler) GeneratePayload(config PayloadConfig) (PayloadResult, e
 		fmt.Sprintf("SOCKS5_ENABLED=%t", config.Socks5Enabled),
 		fmt.Sprintf("SOCKS5_HOST=%s", config.Socks5Host),
 		fmt.Sprintf("SOCKS5_PORT=%d", config.Socks5Port),
+		fmt.Sprintf("MUTATION_SEED=%s", mutationSeed),
 
 		// Add OPSEC ENV VARS
 		fmt.Sprintf("PROC_SCAN_INTERVAL_SECS=%d", config.ProcScanIntervalSecs),
@@ -454,15 +510,31 @@ func (h *PayloadHandler) GeneratePayload(config PayloadConfig) (PayloadResult, e
 		}
 	}
 
+	// Persist build provenance next to the artifact so any payload is
+	// reproducible from (git revision, seed) (issue #99).
+	provenance := map[string]interface{}{
+		"mutation_seed":            mutationSeed,
+		"seed_generated_by_server": seedGenerated,
+		"git_revision":             gitRevision(h.agentSourceDir),
+		"target":                   buildTarget,
+		"built_at":                 time.Now().UTC().Format(time.RFC3339),
+		"config_sha256":            fmt.Sprintf("%x", sha256.Sum256(configJSON)),
+		"mutation_flags":           []string{"config-xor-key", "junk-code", "surface-strings"},
+	}
+	if err := writeProvenance(filepath.Dir(payloadPath), provenance); err != nil {
+		log.Printf("[WARNING] Failed to write build provenance: %v", err)
+	}
+
 	// Create the result
 	result := PayloadResult{
-		ID:         payloadID,
-		PayloadID:  payloadID,
-		ListenerID: listener.ID,
-		Filename:   payloadFileName,
-		Path:       payloadPath,
-		Size:       fileInfo.Size(),
-		Created:    time.Now().Format(time.RFC3339),
+		ID:           payloadID,
+		PayloadID:    payloadID,
+		ListenerID:   listener.ID,
+		MutationSeed: mutationSeed,
+		Filename:     payloadFileName,
+		Path:         payloadPath,
+		Size:         fileInfo.Size(),
+		Created:      time.Now().Format(time.RFC3339),
 	}
 
 	log.Printf("[INFO] Successfully generated payload: %s (%s, %d bytes)",

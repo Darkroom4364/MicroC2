@@ -18,6 +18,10 @@ type PayloadConfig struct {
 	Socks5Host      string `json:"socks5_host"`
 	Socks5Port      int    `json:"socks5_port"`
 
+	// MutationSeed optionally pins the hex u64 seed for the source mutation
+	// engine; a random seed is generated when empty (issue #67).
+	MutationSeed string `json:"mutation_seed,omitempty"`
+
 	// OPSEC Configuration
 	ProcScanIntervalSecs              int     `json:"proc_scan_interval_secs"`
 	BaseThresholdEnterFullOpsec       float64 `json:"base_threshold_enter_full_opsec"`
@@ -37,13 +41,14 @@ type PayloadConfig struct {
 
 // PayloadResult contains information about a generated payload
 type PayloadResult struct {
-	ID         string `json:"id"`
-	PayloadID  string `json:"payload_id,omitempty"`
-	ListenerID string `json:"listener_id,omitempty"`
-	Filename   string `json:"filename"`
-	Path       string `json:"path"`
-	Size       int64  `json:"size"`
-	Created    string `json:"created"`
+	ID           string `json:"id"`
+	PayloadID    string `json:"payload_id,omitempty"`
+	ListenerID   string `json:"listener_id,omitempty"`
+	MutationSeed string `json:"mutation_seed,omitempty"`
+	Filename     string `json:"filename"`
+	Path         string `json:"path"`
+	Size         int64  `json:"size"`
+	Created      string `json:"created"`
 }
 
 // TLSConfig holds TLS configuration for secure listeners
