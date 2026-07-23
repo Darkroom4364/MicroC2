@@ -197,6 +197,15 @@ func pathWithinDirectoryWithCaseFolding(
 }
 
 func lexicallyWithinDirectory(directory, candidate string) (bool, error) {
+	// filepath.Rel cannot compare paths on different Windows volumes. Distinct
+	// volumes are definitively not contained, so treat that as a normal
+	// negative result rather than failing configuration validation.
+	if !strings.EqualFold(
+		filepath.VolumeName(directory),
+		filepath.VolumeName(candidate),
+	) {
+		return false, nil
+	}
 	relative, err := filepath.Rel(directory, candidate)
 	if err != nil {
 		return false, err
