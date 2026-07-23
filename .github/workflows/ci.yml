@@ -56,20 +56,24 @@ jobs:
           filters: |
             server:
               - '.github/workflows/ci.yml'
+              - 'docs/schemas/**'
               - 'server/**'
             agent:
               - '.github/workflows/ci.yml'
+              - 'docs/schemas/**'
               - 'agent/**'
             static:
               - '.github/workflows/ci.yml'
               - 'install.sh'
               - 'agent/build.sh'
               - 'agent/check_mutation_determinism.sh'
+              - 'docs/schemas/**'
               - 'lab/build_matrix.sh'
               - 'lab/manifest*.json'
               - 'server/web/**'
             format:
               - '.github/workflows/ci.yml'
+              - 'docs/schemas/**'
               - 'server/**'
               - 'agent/**'
 
@@ -122,9 +126,24 @@ jobs:
 
       - name: Check web JavaScript syntax
         run: |
-          for file in server/web/js/*.js; do
+          for file in server/web/js/*.js docs/schemas/*.js; do
             node --check "$file"
           done
+
+      - name: Test web JavaScript contracts
+        run: node --test server/web/js/*.test.js
+
+      - name: Check JSON documents
+        run: |
+          for file in docs/schemas/*.json docs/schemas/examples/*.json lab/manifest*.json; do
+            node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$file"
+          done
+
+      - name: Install pinned JSON Schema validator
+        run: npm install --no-save --package-lock=false --ignore-scripts --no-audit --no-fund ajv@8.17.1 ajv-formats@3.0.1
+
+      - name: Validate Draft 2020-12 contract examples
+        run: node docs/schemas/validate-examples.js
 
   agent:
     name: Rust Agent
@@ -157,6 +176,30 @@ jobs:
 
       - name: Mutation determinism check
         run: ./check_mutation_determinism.sh
+
+  agent-windows:
+    name: Rust Agent (Windows)
+    runs-on: windows-latest
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || github.base_ref == 'main' || github.ref == 'refs/heads/main' || needs.changes.outputs.agent == 'true'
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --locked
 
   format:
     name: Format
@@ -194,6 +237,7 @@ jobs:
       - server
       - static
       - agent
+      - agent-windows
       - format
     if: always()
     steps:
@@ -207,6 +251,7 @@ jobs:
             "${{ needs.server.result }}" \
             "${{ needs.static.result }}" \
             "${{ needs.agent.result }}" \
+            "${{ needs.agent-windows.result }}" \
             "${{ needs.format.result }}"; do
             case "$result" in
               success|skipped)

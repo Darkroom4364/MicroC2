@@ -12,8 +12,22 @@ class DashboardManager {
         this.initializeWebSocket();
         this.setupEventListeners();
 
-        this.selectedAgentId = null;
+        this.selectedAgentID = null;
         this.resultsPollingInterval = null;
+        this.taskStates = new Map();
+        this.taskRequestSequence = 0;
+        this.taskRequestController = null;
+        this.taskRequestAgentID = null;
+        this.taskRequestOffset = null;
+        this.taskRequestPromise = null;
+        this.taskPageAgentID = null;
+        this.taskPageOffset = 0;
+        this.taskDetailCache = new Map();
+        this.taskDetailRequests = new Map();
+        this.taskElements = new Map();
+        this.TASK_PAGE_LIMIT = 50;
+        this.MAX_TASK_DETAIL_CACHE = 20;
+        this.agentInteractionSequence = 0;
 
         // Periodically refresh active components
         this.loadActiveListeners();
@@ -153,11 +167,12 @@ class DashboardManager {
         const eventLog = document.getElementById('event-log');
         const logEntry = document.createElement('div');
         logEntry.className = 'log-entry';
-        
-        logEntry.innerHTML = `
-            <span class="message">${entry.message}</span>
-        `;
-        
+
+        const message = document.createElement('span');
+        message.className = 'message';
+        message.textContent = entry.message;
+        logEntry.appendChild(message);
+
         eventLog.appendChild(logEntry);
         
         if (this.autoScroll) {
@@ -166,7 +181,7 @@ class DashboardManager {
     }
 
     clearEventLog() {
-        document.getElementById('event-log').innerHTML = '';
+        document.getElementById('event-log').replaceChildren();
     }
 
     toggleAutoScroll() {
@@ -195,30 +210,47 @@ class DashboardManager {
         }
 
         if (command) {
+            const agentID = this.selectedAgentID;
             try {
-                const response = await fetch('/api/agents/command', {
+                const response = await fetch(`/api/agents/${encodeURIComponent(agentID)}/tasks`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
                     },
                     body: JSON.stringify({
-                        agent_id: this.selectedAgentID,
-                        command
+                        schema_version: 1,
+                        type: 'shell',
+                        arguments: {
+                            command
+                        },
+                        timeout_seconds: 30,
+                        expires_in_seconds: 300
                     })
                 });
 
-                if (!response.ok) {
-                    throw new Error(`Server returned ${response.status}`);
+                if (response.status !== 202) {
+                    throw new Error(`Server returned ${response.status}; expected 202 Accepted`);
                 }
+
+                const acceptedTask = await response.json();
+                const taskID = acceptedTask.id || acceptedTask.task_id;
+                const taskStatus = acceptedTask.status || 'queued';
+                if (!taskID) {
+                    throw new Error('Server accepted the task without returning a task ID');
+                }
+                this.taskStates.set(taskID, taskStatus);
 
                 this.appendLogEntry({
                     timestamp: new Date().toISOString(),
                     severity: 'INFO',
-                    message: `Command sent to agent ${this.selectedAgentID}: ${command}`,
+                    message: `Task ${taskID} accepted for agent ${agentID} (${taskStatus})`,
                     source: 'user'
                 });
 
                 commandInput.value = '';
+                if (this.selectedAgentID === agentID) {
+                    await this.loadAgentResults(agentID, 0);
+                }
             } catch (error) {
                 console.error('Error sending command:', error);
                 this.appendLogEntry({
@@ -243,21 +275,20 @@ class DashboardManager {
             const listenersContainer = document.getElementById('active-listeners');
             
             if (!Array.isArray(listeners) || listeners.length === 0) {
-                listenersContainer.innerHTML = `
-                    <div class="empty-state">
-                        <p>No active listeners</p>
-                        <p>Go to the Listeners page to create one</p>
-                    </div>
-                `;
+                this.replaceWithEmptyState(listenersContainer, [
+                    'No active listeners',
+                    'Go to the Listeners page to create one'
+                ]);
                 return;
             }
             
-            let html = '';
+            const listenerCards = [];
             listeners.forEach(listener => {
                 const config = listener.config || {};
                 const listenerId = config.id || listener.id;
                 const listenerName = config.name || listener.name || 'Unnamed';
-                const listenerProtocol = config.protocol || listener.Protocol || listener.type || 'Unknown';
+                const listenerProtocol = config.protocol || listener.protocol ||
+                    listener.Protocol || listener.type || 'Unknown';
                 const listenerHost = config.host || listener.host || 'Unknown';
                 const listenerPort = config.port || listener.port || 'Unknown';
                 const listenerStatus = listener.status || 'Unknown';
@@ -268,26 +299,15 @@ class DashboardManager {
                     return;
                 }
 
-                html += `
-                    <div class="listener-card" data-id="${listenerId}" data-host="${listenerHost}" data-port="${listenerPort}">
-                        <div class="listener-header">
-                            <span class="listener-name">${listenerName}</span>
-                            <span class="listener-type">${listenerProtocol}</span>
-                        </div>
-                        <div class="listener-details">
-                            <div class="listener-id">ID: ${listenerId}</div>
-                            <div>Host: ${listenerHost}:${listenerPort}</div>
-                            <div>Status: <span class="status-${listenerStatus.toLowerCase()}">${listenerStatus}</span></div>
-                            ${listenerError ? `<div class="error-message">Error: ${listenerError}</div>` : ''}
-                        </div>
-                        <div class="listener-actions">
-                            ${listenerStatus.toLowerCase() === 'stopped' ? 
-                              `<button class="action-button success" onclick="dashboardManager.startListener('${listenerId}')">Start</button>` : 
-                              `<button class="action-button" onclick="dashboardManager.stopListener('${listenerId}')">Stop</button>`}
-                            <button class="action-button delete" onclick="dashboardManager.deleteListener('${listenerId}', '${listenerName}')">Delete</button>
-                        </div>
-                    </div>
-                `;
+                listenerCards.push(this.createListenerCard({
+                    id: listenerId,
+                    name: listenerName,
+                    protocol: listenerProtocol,
+                    host: listenerHost,
+                    port: listenerPort,
+                    status: listenerStatus,
+                    error: listenerError
+                }));
                 
                 // Track listener state changes for notifications
                 if (listenerId && listenerName) {
@@ -307,22 +327,89 @@ class DashboardManager {
                 }
             });
             
-            listenersContainer.innerHTML = html;
+            listenersContainer.replaceChildren(...listenerCards);
             
         } catch (error) {
             console.error('Error loading listeners:', error);
-            document.getElementById('active-listeners').innerHTML = `
-                <div class="empty-state">
-                    <p>Error loading listeners</p>
-                    <p>${error.message}</p>
-                </div>
-            `;
+            this.replaceWithEmptyState(
+                document.getElementById('active-listeners'),
+                ['Error loading listeners', error.message]
+            );
         }
+    }
+
+    createListenerCard(listener) {
+        const card = document.createElement('div');
+        card.className = 'listener-card';
+        card.dataset.id = String(listener.id);
+        card.dataset.host = String(listener.host);
+        card.dataset.port = String(listener.port);
+
+        const header = document.createElement('div');
+        header.className = 'listener-header';
+        this.appendTextElement(header, 'span', 'listener-name', listener.name);
+        this.appendTextElement(header, 'span', 'listener-type', listener.protocol);
+        card.appendChild(header);
+
+        const details = document.createElement('div');
+        details.className = 'listener-details';
+        this.appendTextElement(details, 'div', 'listener-id', `ID: ${listener.id}`);
+        this.appendTextElement(details, 'div', '', `Host: ${listener.host}:${listener.port}`);
+
+        const statusLine = document.createElement('div');
+        statusLine.appendChild(document.createTextNode('Status: '));
+        this.appendTextElement(
+            statusLine,
+            'span',
+            this.listenerStatusClass(listener.status),
+            listener.status
+        );
+        details.appendChild(statusLine);
+
+        if (listener.error) {
+            this.appendTextElement(
+                details,
+                'div',
+                'error-message',
+                `Error: ${listener.error}`
+            );
+        }
+        card.appendChild(details);
+
+        const actions = document.createElement('div');
+        actions.className = 'listener-actions';
+        const stopped = String(listener.status).toLowerCase() === 'stopped';
+        const stateButton = this.createActionButton(
+            stopped ? 'action-button success' : 'action-button',
+            stopped ? 'Start' : 'Stop',
+            () => {
+                if (stopped) {
+                    void this.startListener(listener.id);
+                } else {
+                    void this.stopListener(listener.id);
+                }
+            }
+        );
+        actions.appendChild(stateButton);
+        actions.appendChild(this.createActionButton(
+            'action-button delete',
+            'Delete',
+            () => void this.deleteListener(listener.id, listener.name)
+        ));
+        card.appendChild(actions);
+
+        return card;
+    }
+
+    listenerStatusClass(status) {
+        const token = String(status).toLowerCase();
+        const allowedTokens = new Set(['active', 'inactive', 'stopped', 'pending']);
+        return `status-${allowedTokens.has(token) ? token : 'unknown'}`;
     }
 
     async startListener(id) {
         try {
-            const response = await fetch(`/api/listeners/${id}/start`, { 
+            const response = await fetch(`/api/listeners/${encodeURIComponent(id)}/start`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -358,7 +445,7 @@ class DashboardManager {
 
     async stopListener(id) {
         try {
-            const response = await fetch(`/api/listeners/${id}/stop`, { 
+            const response = await fetch(`/api/listeners/${encodeURIComponent(id)}/stop`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -393,7 +480,7 @@ class DashboardManager {
         if (!confirm(`Are you sure you want to delete ${name}?`)) return;
         
         try {
-            const response = await fetch(`/api/listeners/${id}`, { 
+            const response = await fetch(`/api/listeners/${encodeURIComponent(id)}`, {
                 method: 'DELETE',
                 headers: {
                     'Content-Type': 'application/json'
@@ -426,7 +513,7 @@ class DashboardManager {
 
     async handleStartListenerFallback(id) {
         try {
-            const response = await fetch(`/api/listeners/${id}`);
+            const response = await fetch(`/api/listeners/${encodeURIComponent(id)}`);
             if (!response.ok) {
                 throw new Error(`Failed to get listener details (${response.status})`);
             }
@@ -437,7 +524,7 @@ class DashboardManager {
             delete newConfig.id;
             
             // Delete the old listener
-            const deleteResponse = await fetch(`/api/listeners/${id}`, {
+            const deleteResponse = await fetch(`/api/listeners/${encodeURIComponent(id)}`, {
                 method: 'DELETE'
             });
             
@@ -483,16 +570,14 @@ class DashboardManager {
             const agentsContainer = document.getElementById('agent-list');
 
             if (!Array.isArray(agents) || agents.length === 0) {
-                agentsContainer.innerHTML = `
-                    <div class="empty-state">
-                        <p>No active agents</p>
-                        <p>Generate a payload to get started</p>
-                    </div>
-                `;
+                this.replaceWithEmptyState(agentsContainer, [
+                    'No active agents',
+                    'Generate a payload to get started'
+                ]);
                 return;
             }
 
-            let html = '';
+            const agentCards = [];
             agents.forEach(agent => {
                 const lastSeen = new Date(agent.last_seen || Date.now()).toLocaleString();
                 const agentStatus = agent.connected ? 'active' : 'disconnected';
@@ -509,45 +594,102 @@ class DashboardManager {
                 }
                 this.previousAgentStates.set(agent.id, agentStatus);
 
-                html += `
-                    <div class="agent-card" data-id="${agent.id}">
-                        <div class="agent-header">
-                            <div class="agent-title">
-                                <div class="agent-status ${agentStatus}"></div>
-                                <span class="agent-name">${agent.id}</span>
-                            </div>
-                            <span class="agent-type">${agent.type || 'Standard'}</span>
-                        </div>
-                        <div class="agent-details">
-                            <div>Last Seen: ${lastSeen}</div>
-                            <div>IP: ${agent.ip || 'Unknown'}</div>
-                            <div>Hostname: ${agent.hostname || 'Unknown'}</div>
-                            <div>OS: ${agent.os || 'Unknown'}</div>
-                        </div>
-                        <div class="agent-actions">
-                            <button class="action-button" onclick="dashboardManager.interactWithAgent('${agent.id}')">Interact</button>
-                            <button class="action-button delete" onclick="dashboardManager.removeAgent('${agent.id}')">Remove</button>
-                        </div>
-                    </div>
-                `;
+                agentCards.push(this.createAgentCard(agent, lastSeen, agentStatus));
             });
 
-            agentsContainer.innerHTML = html;
+            agentsContainer.replaceChildren(...agentCards);
         } catch (error) {
             console.error('Error loading agents:', error);
-            document.getElementById('agent-list').innerHTML = `
-                <div class="empty-state">
-                    <p>Error loading agents</p>
-                    <p>${error.message}</p>
-                </div>
-            `;
+            this.replaceWithEmptyState(
+                document.getElementById('agent-list'),
+                ['Error loading agents', error.message]
+            );
         }
     }
 
+    createAgentCard(agent, lastSeen, agentStatus) {
+        const card = document.createElement('div');
+        card.className = 'agent-card';
+        card.dataset.id = String(agent.id);
+
+        const header = document.createElement('div');
+        header.className = 'agent-header';
+        const title = document.createElement('div');
+        title.className = 'agent-title';
+        const statusIndicator = document.createElement('div');
+        statusIndicator.className = agentStatus === 'active'
+            ? 'agent-status active'
+            : 'agent-status disconnected';
+        title.appendChild(statusIndicator);
+        this.appendTextElement(title, 'span', 'agent-name', agent.id);
+        header.appendChild(title);
+        this.appendTextElement(header, 'span', 'agent-type', agent.type || 'Standard');
+        card.appendChild(header);
+
+        const details = document.createElement('div');
+        details.className = 'agent-details';
+        this.appendTextElement(details, 'div', '', `Last Seen: ${lastSeen}`);
+        this.appendTextElement(details, 'div', '', `IP: ${agent.ip || 'Unknown'}`);
+        this.appendTextElement(details, 'div', '', `Hostname: ${agent.hostname || 'Unknown'}`);
+        this.appendTextElement(details, 'div', '', `OS: ${agent.os || 'Unknown'}`);
+        card.appendChild(details);
+
+        const actions = document.createElement('div');
+        actions.className = 'agent-actions';
+        actions.appendChild(this.createActionButton(
+            'action-button',
+            'Interact',
+            () => void this.interactWithAgent(agent.id)
+        ));
+        actions.appendChild(this.createActionButton(
+            'action-button delete',
+            'Remove',
+            () => void this.removeAgent(agent.id)
+        ));
+        card.appendChild(actions);
+
+        return card;
+    }
+
+    appendTextElement(parent, tag, className, value) {
+        const element = document.createElement(tag);
+        if (className) {
+            element.className = className;
+        }
+        element.textContent = String(value);
+        parent.appendChild(element);
+        return element;
+    }
+
+    createActionButton(className, label, action) {
+        const button = document.createElement('button');
+        button.className = className;
+        button.textContent = label;
+        button.addEventListener('click', action);
+        return button;
+    }
+
+    replaceWithEmptyState(container, messages) {
+        const emptyState = document.createElement('div');
+        emptyState.className = 'empty-state';
+        messages.forEach(message => {
+            this.appendTextElement(emptyState, 'p', '', message);
+        });
+        container.replaceChildren(emptyState);
+    }
+
     async interactWithAgent(AgentID) {
+        const interactionSequence = ++this.agentInteractionSequence;
+        const previousAgentID = this.selectedAgentID;
+
         // Select the agent for interaction
         // This will be used by the command shell
         this.selectedAgentID = AgentID;
+        if (previousAgentID !== AgentID) {
+            this.abortTaskDetailRequests();
+            this.taskPageAgentID = AgentID;
+            this.taskPageOffset = 0;
+        }
         
         this.appendLogEntry({
             timestamp: new Date().toISOString(),
@@ -560,14 +702,29 @@ class DashboardManager {
         const input = document.getElementById('command-input');
         input.placeholder = `Enter command for agent ${AgentID}...`;
 
-        this.loadAgentResults(AgentID);
+        if (this.resultsPollingInterval) {
+            clearInterval(this.resultsPollingInterval);
+            this.resultsPollingInterval = null;
+        }
+        await this.loadAgentResults(AgentID);
+        if (
+            this.selectedAgentID !== AgentID ||
+            this.agentInteractionSequence !== interactionSequence
+        ) {
+            return;
+        }
+        this.resultsPollingInterval = setInterval(() => {
+            if (document.visibilityState === 'visible' && this.selectedAgentID === AgentID) {
+                void this.loadAgentResults(AgentID);
+            }
+        }, 2000);
     }
 
     async removeAgent(AgentID) {
         if (!confirm(`Are you sure you want to remove agent ${AgentID}?`)) return;
 
         try {
-            const response = await fetch(`/api/agents/${AgentID}`, {
+            const response = await fetch(`/api/agents/${encodeURIComponent(AgentID)}`, {
                 method: 'DELETE'
             });
 
@@ -593,36 +750,447 @@ class DashboardManager {
         }
     }
 
-    async loadAgentResults(AgentID) {
+    loadAgentResults(AgentID, requestedOffset = this.taskPageOffsetFor(AgentID)) {
         const outputDiv = document.getElementById('command-output');
-        outputDiv.innerHTML = '<div>Loading results...</div>';
-        try {
-            const response = await fetch(`/api/agents/${AgentID}/results`);
-            if (!response.ok) {
-                outputDiv.innerHTML = '<div>No results found.</div>';
-                return;
-            }
-            const results = await response.json();
-            console.log('Results from backend:', results);
-            if (!Array.isArray(results) || results.length === 0) {
-                outputDiv.innerHTML = '<div>No results found.</div>';
-                return;
-            }
-            outputDiv.innerHTML = results.map(res => `
-                <div class="command-result">
-                    <span class="timestamp">${res.timestamp || ''}</span>
-                    <span class="command">${res.command || ''}</span>
-                    <pre class="output">${res.output || ''}</pre>
-                </div>
-            `).join('');
-        } catch (e) {
-            outputDiv.innerHTML = `<div>Error loading results: ${e.message}</div>`;
+        if (!Number.isInteger(requestedOffset) || requestedOffset < 0) {
+            throw new Error('Task page offset must be a nonnegative integer');
         }
+        if (this.taskRequestController) {
+            if (
+                this.taskRequestAgentID === AgentID &&
+                this.taskRequestOffset === requestedOffset &&
+                this.taskRequestPromise
+            ) {
+                return this.taskRequestPromise;
+            }
+            this.taskRequestController.abort();
+        }
+
+        const requestSequence = ++this.taskRequestSequence;
+        const requestController = new AbortController();
+        this.taskRequestController = requestController;
+        this.taskRequestAgentID = AgentID;
+        this.taskRequestOffset = requestedOffset;
+        this.taskPageAgentID = AgentID;
+        this.taskPageOffset = requestedOffset;
+        const isCurrentRequest = () => (
+            this.selectedAgentID === AgentID &&
+            this.taskRequestSequence === requestSequence &&
+            this.taskRequestController === requestController
+        );
+
+        if (!outputDiv.hasChildNodes()) {
+            this.replaceTaskOutputMessage(outputDiv, 'Loading tasks...');
+        }
+
+        const requestPromise = this.fetchAgentTaskSummaries(
+            AgentID,
+            outputDiv,
+            requestController,
+            isCurrentRequest,
+            requestedOffset
+        );
+        this.taskRequestPromise = requestPromise;
+        requestPromise.then(
+            () => this.clearTaskRequest(requestController, requestPromise),
+            () => this.clearTaskRequest(requestController, requestPromise)
+        );
+        return requestPromise;
+    }
+
+    async fetchAgentTaskSummaries(
+        AgentID,
+        outputDiv,
+        requestController,
+        isCurrentRequest,
+        requestedOffset
+    ) {
+        try {
+            const response = await fetch(
+                `/api/agents/${encodeURIComponent(AgentID)}/tasks` +
+                    `?limit=${this.TASK_PAGE_LIMIT}&offset=${requestedOffset}`,
+                {signal: requestController.signal}
+            );
+            if (!isCurrentRequest()) {
+                return;
+            }
+            if (!response.ok) {
+                const statusText = response.statusText ? ` ${response.statusText}` : '';
+                throw new Error(
+                    `Task request failed with HTTP ${response.status}${statusText}`
+                );
+            }
+            const payload = await response.json();
+            if (!isCurrentRequest()) {
+                return;
+            }
+            if (!this.isValidTaskPage(payload, requestedOffset)) {
+                throw new Error('Task list response did not match schema version 1');
+            }
+            const tasks = payload.tasks;
+
+            outputDiv.replaceChildren();
+            this.taskElements.clear();
+            if (tasks.length === 0) {
+                this.appendTextElement(
+                    outputDiv,
+                    'div',
+                    '',
+                    payload.total === 0 ? 'No tasks found.' : 'No tasks found on this page.'
+                );
+            } else {
+                tasks.forEach(task => {
+                    if (task.id || task.task_id) {
+                        this.taskStates.set(task.id || task.task_id, task.status || 'unknown');
+                    }
+                    outputDiv.appendChild(this.createTaskResultElement(task, AgentID));
+                });
+            }
+            this.appendTaskPagination(outputDiv, AgentID, payload);
+        } catch (e) {
+            if (e.name === 'AbortError' || !isCurrentRequest()) {
+                return;
+            }
+            this.taskElements.clear();
+            this.replaceTaskOutputMessage(outputDiv, `Error loading tasks: ${e.message}`);
+        }
+    }
+
+    clearTaskRequest(requestController, requestPromise) {
+        if (
+            this.taskRequestController === requestController &&
+            this.taskRequestPromise === requestPromise
+        ) {
+            this.taskRequestController = null;
+            this.taskRequestAgentID = null;
+            this.taskRequestOffset = null;
+            this.taskRequestPromise = null;
+        }
+    }
+
+    taskPageOffsetFor(AgentID) {
+        return this.taskPageAgentID === AgentID ? this.taskPageOffset : 0;
+    }
+
+    isValidTaskPage(payload, requestedOffset) {
+        if (
+            !payload ||
+            payload.schema_version !== 1 ||
+            !Array.isArray(payload.tasks) ||
+            !Number.isInteger(payload.limit) ||
+            payload.limit !== this.TASK_PAGE_LIMIT ||
+            !Number.isInteger(payload.offset) ||
+            payload.offset !== requestedOffset ||
+            !Number.isInteger(payload.total) ||
+            payload.total < 0 ||
+            payload.tasks.length > payload.limit
+        ) {
+            return false;
+        }
+
+        const pageEnd = payload.offset + payload.tasks.length;
+        if (
+            (payload.offset <= payload.total && pageEnd > payload.total) ||
+            (payload.offset > payload.total && payload.tasks.length !== 0)
+        ) {
+            return false;
+        }
+
+        return payload.next_offset === null || (
+            Number.isInteger(payload.next_offset) &&
+            payload.next_offset > payload.offset &&
+            payload.next_offset <= payload.total
+        );
+    }
+
+    appendTaskPagination(outputDiv, AgentID, page) {
+        const hasNewerPage = page.offset > 0;
+        const hasOlderPage = page.next_offset !== null;
+        if (!hasNewerPage && !hasOlderPage) {
+            return;
+        }
+
+        const pagination = document.createElement('div');
+        pagination.className = 'task-pagination button-group';
+        const rangeStart = page.tasks.length === 0 ? 0 : page.offset + 1;
+        const rangeEnd = page.offset + page.tasks.length;
+        this.appendTextElement(
+            pagination,
+            'span',
+            'timestamp',
+            `Tasks ${rangeStart}-${rangeEnd} of ${page.total}`
+        );
+
+        if (hasNewerPage) {
+            const newerOffset = Math.max(0, page.offset - page.limit);
+            pagination.appendChild(this.createActionButton(
+                'action-button secondary',
+                'Newer',
+                () => void this.navigateTaskPage(AgentID, newerOffset)
+            ));
+        }
+        if (hasOlderPage) {
+            pagination.appendChild(this.createActionButton(
+                'action-button secondary',
+                'Older',
+                () => void this.navigateTaskPage(AgentID, page.next_offset)
+            ));
+        }
+        outputDiv.appendChild(pagination);
+    }
+
+    navigateTaskPage(AgentID, offset) {
+        if (this.selectedAgentID !== AgentID) {
+            return Promise.resolve();
+        }
+        this.abortTaskDetailRequests();
+        return this.loadAgentResults(AgentID, offset);
+    }
+
+    replaceTaskOutputMessage(outputDiv, message) {
+        const messageElement = document.createElement('div');
+        messageElement.textContent = message;
+        outputDiv.replaceChildren(messageElement);
+    }
+
+    createTaskResultElement(task, AgentID) {
+        const container = document.createElement('div');
+        container.className = 'command-result';
+        const taskID = task.id || task.task_id || 'unknown';
+        const cacheKey = this.taskCacheKey(AgentID, taskID);
+        const renderedTask = this.taskDetailCache.get(cacheKey) || task;
+        this.renderTaskResultElement(container, renderedTask, AgentID);
+        this.taskElements.set(cacheKey, container);
+        return container;
+    }
+
+    renderTaskResultElement(container, task, AgentID) {
+        container.replaceChildren();
+
+        const taskID = task.id || task.task_id || 'unknown';
+        const status = task.status || 'unknown';
+        const result = task.result || {};
+        const outcome = result.outcome || task.outcome || '';
+        const command = task.arguments && typeof task.arguments.command === 'string'
+            ? task.arguments.command
+            : '';
+
+        const heading = document.createElement('div');
+        heading.className = 'command';
+        heading.textContent = command || `${task.type || 'task'} ${taskID}`;
+        container.appendChild(heading);
+
+        const metadata = document.createElement('div');
+        metadata.className = 'timestamp';
+        const metadataParts = [`Task ${taskID}`, `status: ${status}`];
+        if (outcome) {
+            metadataParts.push(`outcome: ${outcome}`);
+        }
+        if (Number.isInteger(result.exit_code)) {
+            metadataParts.push(`exit: ${result.exit_code}`);
+        }
+        metadata.textContent = metadataParts.join(' · ');
+        container.appendChild(metadata);
+
+        const timestampParts = [
+            ['created', task.created_at],
+            ['queued', task.queued_at],
+            ['dispatched', task.dispatched_at],
+            ['started', task.started_at || result.started_at],
+            ['completed', task.completed_at || result.completed_at],
+            ['expires', task.expires_at]
+        ]
+            .filter(([, value]) => value)
+            .map(([label, value]) => `${label} ${value}`);
+        if (timestampParts.length > 0) {
+            const timestampLine = document.createElement('div');
+            timestampLine.className = 'timestamp';
+            timestampLine.textContent = timestampParts.join(' · ');
+            container.appendChild(timestampLine);
+        }
+
+        const output = result.output || {};
+        const stdout = typeof output === 'string' ? output : output.stdout;
+        const stderr = typeof output === 'object' && output !== null ? output.stderr : '';
+        this.appendTaskStream(container, 'stdout', stdout);
+        this.appendTaskStream(container, 'stderr', stderr);
+        this.appendTaskStream(container, 'error', result.error);
+
+        const isOutputBearingTerminal = status === 'completed' || status === 'failed';
+        const hasDetailedOutput = this.hasDetailedTaskOutput(task);
+        if (isOutputBearingTerminal && !hasDetailedOutput) {
+            const loadButton = this.createActionButton(
+                'action-button',
+                'Load output',
+                () => void this.loadTaskDetails(AgentID, taskID, loadButton)
+            );
+            container.appendChild(loadButton);
+        }
+    }
+
+    async loadTaskDetails(AgentID, taskID, loadButton) {
+        const cacheKey = this.taskCacheKey(AgentID, taskID);
+        const cached = this.taskDetailCache.get(cacheKey);
+        if (cached) {
+            const currentContainer = this.currentTaskContainer(cacheKey, AgentID);
+            if (currentContainer) {
+                this.renderTaskResultElement(currentContainer, cached, AgentID);
+            }
+            return;
+        }
+
+        const existingRequest = this.taskDetailRequests.get(cacheKey);
+        if (existingRequest) {
+            return existingRequest.promise;
+        }
+
+        const requestController = new AbortController();
+        loadButton.disabled = true;
+        loadButton.textContent = 'Loading output...';
+        const detailPromise = this.fetchTaskDetail(
+            AgentID,
+            taskID,
+            cacheKey,
+            requestController,
+            loadButton
+        );
+        this.taskDetailRequests.set(cacheKey, {
+            controller: requestController,
+            promise: detailPromise
+        });
+        try {
+            await detailPromise;
+        } finally {
+            const currentRequest = this.taskDetailRequests.get(cacheKey);
+            if (currentRequest && currentRequest.controller === requestController) {
+                this.taskDetailRequests.delete(cacheKey);
+            }
+        }
+    }
+
+    async fetchTaskDetail(
+        AgentID,
+        taskID,
+        cacheKey,
+        requestController,
+        loadButton
+    ) {
+        try {
+            const response = await fetch(
+                `/api/agents/${encodeURIComponent(AgentID)}/tasks/${encodeURIComponent(taskID)}`,
+                {signal: requestController.signal}
+            );
+            if (!response.ok) {
+                const statusText = response.statusText ? ` ${response.statusText}` : '';
+                throw new Error(
+                    `Task detail request failed with HTTP ${response.status}${statusText}`
+                );
+            }
+            const payload = await response.json();
+            const task = payload && payload.task ? payload.task : payload;
+            if (!task || (task.id || task.task_id) !== taskID) {
+                throw new Error('Task detail response did not match the requested task');
+            }
+            if (task.agent_id && task.agent_id !== AgentID) {
+                throw new Error('Task detail response did not match the selected agent');
+            }
+            if (!this.hasDetailedTaskOutput(task)) {
+                throw new Error('Task detail response did not include full output');
+            }
+            if (requestController.signal.aborted || this.selectedAgentID !== AgentID) {
+                return;
+            }
+
+            this.cacheTaskDetail(cacheKey, task);
+            const currentContainer = this.currentTaskContainer(cacheKey, AgentID);
+            if (currentContainer) {
+                this.renderTaskResultElement(currentContainer, task, AgentID);
+            }
+        } catch (error) {
+            if (error.name === 'AbortError') {
+                return;
+            }
+            const currentContainer = this.currentTaskContainer(cacheKey, AgentID);
+            if (!currentContainer) {
+                return;
+            }
+            loadButton.disabled = false;
+            loadButton.textContent = 'Retry output';
+            this.appendTextElement(
+                currentContainer,
+                'div',
+                'error-message',
+                `Error loading output: ${error.message}`
+            );
+        }
+    }
+
+    currentTaskContainer(cacheKey, AgentID) {
+        if (this.selectedAgentID !== AgentID) {
+            return null;
+        }
+        return this.taskElements.get(cacheKey) || null;
+    }
+
+    taskCacheKey(AgentID, taskID) {
+        return `${AgentID}\u0000${taskID}`;
+    }
+
+    hasDetailedTaskOutput(task) {
+        const output = task && task.result && task.result.output;
+        return Boolean(
+            output &&
+            typeof output === 'object' &&
+            Object.prototype.hasOwnProperty.call(output, 'stdout') &&
+            Object.prototype.hasOwnProperty.call(output, 'stderr')
+        );
+    }
+
+    cacheTaskDetail(cacheKey, task) {
+        this.taskDetailCache.delete(cacheKey);
+        this.taskDetailCache.set(cacheKey, task);
+        while (this.taskDetailCache.size > this.MAX_TASK_DETAIL_CACHE) {
+            const oldestKey = this.taskDetailCache.keys().next().value;
+            this.taskDetailCache.delete(oldestKey);
+        }
+    }
+
+    abortTaskDetailRequests() {
+        for (const request of this.taskDetailRequests.values()) {
+            request.controller.abort();
+        }
+        this.taskDetailRequests.clear();
+        this.taskElements.clear();
+    }
+
+    appendTaskStream(container, label, value) {
+        if (typeof value !== 'string' || value.length === 0) {
+            return;
+        }
+
+        const streamLabel = document.createElement('div');
+        streamLabel.className = 'timestamp';
+        streamLabel.textContent = label;
+        container.appendChild(streamLabel);
+
+        const stream = document.createElement('pre');
+        stream.className = 'output';
+        stream.textContent = value;
+        container.appendChild(stream);
     }
 }
 
-// Initialize the dashboard manager when the page loads
 let dashboardManager;
-document.addEventListener('DOMContentLoaded', () => {
-    dashboardManager = new DashboardManager();
-});
+
+// Initialize the dashboard manager when the page loads.
+if (typeof document !== 'undefined') {
+    document.addEventListener('DOMContentLoaded', () => {
+        dashboardManager = new DashboardManager();
+    });
+}
+
+// Expose the class to the lightweight Node contract tests without changing the
+// browser-facing global script behavior.
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {DashboardManager};
+}

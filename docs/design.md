@@ -29,23 +29,76 @@ MicroC2 has three primary roles:
 | Role | Responsibility |
 | --- | --- |
 | Operator UI | Browser interface for listeners, agents, payload generation, files, logs, and terminal access. |
-| Server | Coordination point for operator APIs, listeners, payload builds, file storage, command queues, and results. |
-| Agent | Rust runtime that reports status, polls for commands, executes allowed work, and submits results under OPSEC control. |
+| Server | Coordination point for operator APIs, listeners, payload builds, file storage, task queues, and results. |
+| Agent | Rust runtime that reports status, polls for tasks, executes allowed work, and submits results under OPSEC control. |
 
-The current command path is intentionally simple:
+The primary command path now uses a versioned typed contract:
 
-1. The operator selects an agent in the UI and submits a raw command string.
-2. The server finds the listener that knows that agent ID.
-3. The command is appended to an in-memory queue for that agent.
-4. The agent polls `/api/agent/{agent_id}/command`.
-5. The agent executes or queues the command depending on OPSEC mode.
-6. The agent posts the result to `/api/agent/{agent_id}/result`.
-7. The UI reads result history through `/api/agents/{agent_id}/results`.
+1. The operator selects an agent and creates a shell task with
+   `POST /api/agents/{agent_id}/tasks`.
+2. The server validates the request, assigns the task ID and v1 envelope, and
+   queues it with an expiry and execution timeout.
+3. The agent polls `GET /api/agent/{agent_id}/tasks`; the server dispatches the
+   next task or returns `204 No Content`.
+4. The agent acknowledges execution through
+   `POST /api/agent/{agent_id}/tasks/{task_id}/status`.
+5. The agent submits a correlated terminal result to
+   `POST /api/agent/{agent_id}/results`.
+6. The UI reads a bounded page of lifecycle summaries through
+   `GET /api/agents/{agent_id}/tasks?limit=50&offset=0` and retrieves a full
+   Task v1 resource, including output, only when the operator opens
+   `GET /api/agents/{agent_id}/tasks/{task_id}`.
 
-This proves the end-to-end thesis workflow, but it is not the final tasking
-model. The next design step is typed tasks and typed results, so shell, file
-transfer, pivot control, heartbeat, and future module tasks can share schemas,
-status transitions, timeouts, and audit metadata.
+Shell is the first task type. File transfer, pivot control, and future modules
+should extend this envelope with explicit argument and result schemas rather
+than add new string grammars.
+
+### Typed Task Contract v1
+
+The normative contracts are:
+
+- [Create Task Request v1](schemas/task-create-request-v1.schema.json)
+- [Task v1](schemas/task-v1.schema.json)
+- [Task summary v1](schemas/task-summary-v1.schema.json)
+- [Task page v1](schemas/task-page-v1.schema.json)
+- [Task status update v1](schemas/task-status-update-v1.schema.json)
+- [Task result v1](schemas/task-result-v1.schema.json)
+- [Task result summary v1](schemas/task-result-summary-v1.schema.json)
+
+An operator creates a shell task with:
+
+```json
+{
+  "schema_version": 1,
+  "type": "shell",
+  "arguments": {
+    "command": "whoami"
+  },
+  "timeout_seconds": 30,
+  "expires_in_seconds": 300
+}
+```
+
+The server responds with `202 Accepted` and the complete Task v1 resource,
+including `schema_version`, `id`, `agent_id`, status, and server timestamps.
+The terminal Task Result v1 is nested under `result` when present and separates
+`stdout` from `stderr`. Operator list responses are newest-first Task Page v1
+resources with a maximum of 100 Task Summary v1 items. Summaries retain result
+metadata but omit the potentially large output streams; the individual task
+resource is the canonical output retrieval path.
+
+The lifecycle is `queued → dispatched → running → completed|failed`. A queued
+task may instead become `cancelled`; a queued or dispatched task becomes
+`expired` when it has not started by `expires_at`. Delivery uses an internal
+lease: a lost poll response causes the same task ID to be offered again, while
+exact repeated acknowledgements and results are accepted idempotently. Task
+lifecycle timestamps use server receipt time; the nested result preserves the
+agent's execution timestamps without making clock synchronization a transition
+precondition.
+
+`POST /api/agents/command` and `POST /api/agents/{agent_id}/command` remain
+temporary compatibility adapters. They translate legacy raw commands into v1
+shell tasks and are deprecated: new UI and API clients must use `/tasks`.
 
 ## Server Design
 
@@ -65,13 +118,15 @@ Current strengths:
 
 Current constraints:
 
-- Operator and agent routes still share one server process and route namespace.
-- Agent registry, command queues, result history, and generated payload registry
+- Agent registry, task queues, result history, and generated payload registry
   are in memory.
-- Operator APIs and WebSockets do not yet have complete auth/origin safety.
-- File handling still needs stricter basename and path validation.
-- The server terminal is powerful and should remain local-lab only until safety
-  controls exist.
+- Operator access uses a lab-oriented shared-token or loopback guard, not
+  production multi-user authentication and authorization.
+- Agent listener requests are correlated by runtime ID but are not yet bound to
+  an authenticated enrollment session (#104).
+- Structured audit events and durable task/result history are not implemented.
+- The server terminal remains a powerful lab-only capability even with the
+  operator guard and origin checks.
 
 The server now keeps the route surfaces explicit so they can be hardened
 independently:
@@ -98,19 +153,24 @@ The active implementation supports:
 - Fallback config loading from `.config/config.json`.
 - Direct or SOCKS5-proxied HTTP client creation.
 - Heartbeats with host, OS, local IP, and egress metadata.
-- Raw shell command polling and result submission.
-- Basic command timeout handling.
-- Result obfuscation before submission.
+- Versioned shell task polling, running acknowledgement, and correlated result
+  submission.
+- Lease-safe task redelivery and an in-memory delivery outbox that retries exact
+  acknowledgements/results without re-executing completed work.
+- Server-defined task expiry and agent-enforced command timeout handling.
+- Process-group (Unix) or job-object (Windows) timeouts and bounded
+  stdout/stderr capture.
+- Explicit UTF-8 stdout/stderr in typed results; XOR output remains limited to
+  deprecated legacy result compatibility.
 - Adaptive OPSEC scoring and mode transitions.
 - In-memory encryption helper for OPSEC state.
 
 Partially wired or prototype areas:
 
 - File upload/download helpers exist but are not reachable through a stable
-  operator command grammar yet.
+  typed task yet.
 - Pivot frame/server code exists, but command dispatch does not fully expose
   pivot start/stop.
-- Payload, listener, and runtime agent identity are currently coupled.
 - OPSEC is runtime-configurable in several places, but not fully feature-gated.
 - Cross-platform behavior is uneven: Windows has richer user/window checks,
   while non-Windows checks are simpler.
@@ -148,15 +208,7 @@ Payload generation is listener-driven today. The operator selects a listener,
 the server derives the agent connection settings, writes a config file, invokes
 the Rust build script, and stores the artifact for download.
 
-The current design is convenient for a prototype but has one important flaw:
-the listener ID is reused as the payload ID and agent ID. That makes it hard to
-reason about one listener serving many payload builds or many runtime agents.
-Several payload UI options are also aspirational today: indirect syscalls, custom
-sleep techniques, DLL sideloading metadata, shellcode output, and an OPSEC
-checkbox are passed through parts of the UI/config/build path but are not a
-complete implemented payload feature set.
-
-The intended identity split is:
+Listener, payload/build, and runtime agent identities are now distinct:
 
 | Identity | Meaning |
 | --- | --- |
@@ -164,8 +216,12 @@ The intended identity split is:
 | Payload/build ID | Reproducible build artifact and embedded config. |
 | Agent runtime ID | One live or historical runtime agent instance. |
 
-Issue #64 should establish that split before larger workflow features depend on
-agent identity.
+Several payload UI options remain aspirational: indirect syscalls, custom sleep
+techniques, DLL sideloading metadata, shellcode output, and an OPSEC checkbox
+are passed through parts of the UI/config/build path but are not a complete
+implemented payload feature set. Issue #99 is therefore only partially complete:
+seed provenance exists, while supported-profile validation, canonical outputs,
+and a complete inspectable build manifest remain.
 
 ## Transport Design
 
@@ -196,23 +252,23 @@ The desired boundary is:
 
 ## Safety Design
 
-The current project must be operated as a lab-only prototype. Safe defaults are
-not complete yet. Near-term safety work should focus on the operator surface,
-because it contains listener management, payload generation, file operations,
-log access, and a server terminal.
+The project must still be operated as a lab-only prototype. The Phase 0 safety
+baseline now guards operator routes with loopback-or-token access, restricts
+operator WebSocket origins, makes listener CORS explicit, keeps insecure agent
+TLS opt-in, and validates file-store basenames. The remaining design direction
+is:
 
-Design direction:
-
-- Bind operator UI/API to localhost by default where practical.
-- Add authentication before remote operator access.
-- Restrict WebSocket origins.
-- Make CORS origins explicit instead of wildcarded.
-- Keep insecure TLS behavior opt-in and visible.
-- Validate file names as basenames and avoid path traversal through joins.
+- Evolve the shared-token guard into actor-aware authentication and roles before
+  multi-user operation.
+- Bind every agent task/status/result request to an authenticated enrollment
+  credential or enforced mTLS identity (#104).
 - Add audit events for listener, payload, file, terminal, and agent tasking.
+- Add target scoping and explicit confirmation metadata for risky future task
+  types.
 - Add clear docs for isolated lab deployment.
 
-This safety work is tracked primarily by #75 and #78.
+The Phase 0 route split and lab-safety work are complete in #75 and #78;
+structured governance continues in #100.
 
 ## Documentation And Testing Expectations
 
@@ -228,13 +284,17 @@ paths.
 
 ## Near-Term Design Priorities
 
-1. Finish this documentation pass (#87).
-2. Split operator and agent-facing route surfaces (#75).
-3. Add lab-safety hardening for auth, origins, file paths, and safe defaults
-   (#78).
-4. Fix listener/payload/runtime identity separation (#64).
-5. Define typed tasks and wire file transfer/pivot commands through that model
-   (#88).
+1. Finish the retry-safe typed shell task/result path and retire primary UI use
+   of raw command adapters (#98).
+2. Bind agent-facing lifecycle requests to authenticated enrollment sessions
+   before any promotion beyond an isolated lab (#104).
+3. Persist agents, task state, results, payload metadata, and listener events
+   across restart (#97).
+4. Add causal structured audit events on top of the durable model (#100).
+5. Extend the typed task registry with file transfer and pivot operations after
+   the v1 shell contract is stable (#88).
+6. Complete payload profile validation and full build manifests; current #99
+   provenance is partial P1 work.
 
-Those steps create the foundation for richer transports, durable evidence,
-automation APIs, and reporting without compounding prototype debt.
+The data path is #98 → #97 → #100; #104 is a parallel P0 security gate before
+promotion beyond the isolated-lab boundary.
