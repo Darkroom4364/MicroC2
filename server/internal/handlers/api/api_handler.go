@@ -596,7 +596,7 @@ func (h *APIHandler) handleGetAgentResults(
 	}
 	page, knownAgent, err := h.legacyResultPage(agentID, options)
 	if err != nil {
-		log.Printf("[ERROR] Failed to page legacy results for agent %s: %v", agentID, err)
+		log.Print("[ERROR] Failed to page legacy results")
 		http.Error(w, "Result pagination failed", http.StatusInternalServerError)
 		return
 	}
@@ -615,7 +615,7 @@ func (h *APIHandler) handleGetAgentResults(
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	if _, err := w.Write(page.body); err != nil {
-		log.Printf("[ERROR] Failed to write legacy results response: %v", err)
+		log.Print("[ERROR] Failed to write legacy results response")
 	}
 }
 

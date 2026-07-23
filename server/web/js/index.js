@@ -212,6 +212,8 @@ class DashboardManager {
         if (command) {
             const agentID = this.selectedAgentID;
             try {
+                // The root-relative API path and encoded ID cannot select another origin.
+                // foxguard: ignore[js/no-ssrf]
                 const response = await fetch(`/api/agents/${encodeURIComponent(agentID)}/tasks`, {
                     method: 'POST',
                     headers: {
@@ -409,6 +411,8 @@ class DashboardManager {
 
     async startListener(id) {
         try {
+            // The root-relative API path and encoded ID cannot select another origin.
+            // foxguard: ignore[js/no-ssrf]
             const response = await fetch(`/api/listeners/${encodeURIComponent(id)}/start`, {
                 method: 'POST',
                 headers: {
@@ -445,6 +449,8 @@ class DashboardManager {
 
     async stopListener(id) {
         try {
+            // The root-relative API path and encoded ID cannot select another origin.
+            // foxguard: ignore[js/no-ssrf]
             const response = await fetch(`/api/listeners/${encodeURIComponent(id)}/stop`, {
                 method: 'POST',
                 headers: {
@@ -480,6 +486,8 @@ class DashboardManager {
         if (!confirm(`Are you sure you want to delete ${name}?`)) return;
         
         try {
+            // The root-relative API path and encoded ID cannot select another origin.
+            // foxguard: ignore[js/no-ssrf]
             const response = await fetch(`/api/listeners/${encodeURIComponent(id)}`, {
                 method: 'DELETE',
                 headers: {
@@ -513,6 +521,8 @@ class DashboardManager {
 
     async handleStartListenerFallback(id) {
         try {
+            // The root-relative API path and encoded ID cannot select another origin.
+            // foxguard: ignore[js/no-ssrf]
             const response = await fetch(`/api/listeners/${encodeURIComponent(id)}`);
             if (!response.ok) {
                 throw new Error(`Failed to get listener details (${response.status})`);
@@ -524,6 +534,8 @@ class DashboardManager {
             delete newConfig.id;
             
             // Delete the old listener
+            // The root-relative API path and encoded ID cannot select another origin.
+            // foxguard: ignore[js/no-ssrf]
             const deleteResponse = await fetch(`/api/listeners/${encodeURIComponent(id)}`, {
                 method: 'DELETE'
             });
@@ -724,6 +736,8 @@ class DashboardManager {
         if (!confirm(`Are you sure you want to remove agent ${AgentID}?`)) return;
 
         try {
+            // The root-relative API path and encoded ID cannot select another origin.
+            // foxguard: ignore[js/no-ssrf]
             const response = await fetch(`/api/agents/${encodeURIComponent(AgentID)}`, {
                 method: 'DELETE'
             });
@@ -806,6 +820,8 @@ class DashboardManager {
         requestedOffset
     ) {
         try {
+            // The root-relative API path uses an encoded ID and bounded numeric query values.
+            // foxguard: ignore[js/no-ssrf]
             const response = await fetch(
                 `/api/agents/${encodeURIComponent(AgentID)}/tasks` +
                     `?limit=${this.TASK_PAGE_LIMIT}&offset=${requestedOffset}`,
@@ -1076,6 +1092,8 @@ class DashboardManager {
         loadButton
     ) {
         try {
+            // The root-relative API path uses encoded identifiers only.
+            // foxguard: ignore[js/no-ssrf]
             const response = await fetch(
                 `/api/agents/${encodeURIComponent(AgentID)}/tasks/${encodeURIComponent(taskID)}`,
                 {signal: requestController.signal}
