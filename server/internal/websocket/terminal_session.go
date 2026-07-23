@@ -42,16 +42,18 @@ type TerminalHandler struct {
 // NewTerminalHandler creates a new terminal handler with configured websocket settings
 //
 // Pre-conditions:
-//   - None
+//   - checkOrigin validates the Origin header of upgrade requests; if nil,
+//     a same-host/loopback-only check is used
 //
 // Post-conditions:
-//   - Returns a properly initialized TerminalHandler with CORS support
-func NewTerminalHandler() *TerminalHandler {
+//   - Returns a properly initialized TerminalHandler with origin checking
+func NewTerminalHandler(checkOrigin func(*http.Request) bool) *TerminalHandler {
+	if checkOrigin == nil {
+		checkOrigin = DefaultOriginCheck
+	}
 	return &TerminalHandler{
 		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool {
-				return true
-			},
+			CheckOrigin: checkOrigin,
 		},
 	}
 }

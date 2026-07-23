@@ -51,6 +51,10 @@ type SOCKS5ListenerConfig struct {
 type BaseProtocolConfig struct {
 	UploadDir string
 	Port      string
+	// AllowedOrigins lists browser origins permitted by CORS on polling
+	// routes. Empty means no cross-origin access; "*" is an explicit,
+	// documented escape hatch that restores wildcard behavior.
+	AllowedOrigins []string
 }
 
 // Protocol defines the interface that all communication protocols must implement

@@ -46,13 +46,20 @@ func NewLogStreamer(logfile *os.File) *LogStreamer {
 		clients: make(map[*websocket.Conn]bool),
 		logfile: logfile,
 		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool {
-				return true // Allow connections from any origin
-			},
+			CheckOrigin: DefaultOriginCheck,
 		},
 		logBuffer:     make([]LogEntry, 100), // Retain last 100 log entries
 		logBufferSize: 100,
 	}
+}
+
+// SetCheckOrigin replaces the WebSocket origin policy used for upgrades.
+// Passing nil restores the default same-host/loopback-only policy.
+func (ls *LogStreamer) SetCheckOrigin(checkOrigin func(*http.Request) bool) {
+	if checkOrigin == nil {
+		checkOrigin = DefaultOriginCheck
+	}
+	ls.upgrader.CheckOrigin = checkOrigin
 }
 
 // Write implements io.Writer to capture log output and distribute to clients

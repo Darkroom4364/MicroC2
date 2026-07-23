@@ -67,5 +67,11 @@ func validateConfig(config *Config) error {
 		config.Logging.Level = "info"
 	}
 
+	// The operator token can also come from the environment so it does not
+	// have to be stored in the config file.
+	if config.Security.OperatorToken == "" {
+		config.Security.OperatorToken = os.Getenv("MICROC2_OPERATOR_TOKEN")
+	}
+
 	return nil
 }

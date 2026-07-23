@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"microc2/server/internal/common"
+	"microc2/server/internal/filestore"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -87,7 +88,7 @@ func (p *HTTPPollingProtocol) GetHTTPHandler() http.Handler {
 }
 
 func (p *HTTPPollingProtocol) handleAgentRequests(w http.ResponseWriter, r *http.Request) {
-	enableCors(&w)
+	p.enableCors(w, r)
 
 	// log.Printf("[DEBUG] HandleAgentRequests called: %s %s", r.Method, r.URL.Path)
 
@@ -142,7 +143,7 @@ func (p *HTTPPollingProtocol) HandleAgentRequests(w http.ResponseWriter, r *http
 }
 
 func (p *HTTPPollingProtocol) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request, AgentID string) {
-	enableCors(&w)
+	p.enableCors(w, r)
 
 	// Handle preflight OPTIONS request
 	if r.Method == http.MethodOptions {
@@ -263,6 +264,9 @@ func (p *HTTPPollingProtocol) Initialize() error {
 }
 
 func (p *HTTPPollingProtocol) HandleFileUpload(filename string, fileData io.Reader) error {
+	if err := filestore.ValidateFileName(filename); err != nil {
+		return err
+	}
 	filepath := filepath.Join(p.config.UploadDir, filename)
 	file, err := os.Create(filepath)
 	if err != nil {
@@ -274,6 +278,9 @@ func (p *HTTPPollingProtocol) HandleFileUpload(filename string, fileData io.Read
 }
 
 func (p *HTTPPollingProtocol) HandleFileDownload(filename string) (io.Reader, error) {
+	if err := filestore.ValidateFileName(filename); err != nil {
+		return nil, err
+	}
 	return os.Open(filepath.Join(p.config.UploadDir, filename))
 }
 
@@ -315,11 +322,52 @@ func (p *HTTPPollingProtocol) GetRoutes() map[string]http.HandlerFunc {
 	}
 }
 
-func enableCors(w *http.ResponseWriter) {
-	(*w).Header().Set("Access-Control-Allow-Origin", "*")
-	(*w).Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
-	(*w).Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Filename, X-Command")
-	(*w).Header().Set("Access-Control-Max-Age", "86400")
+// defaultAllowedOrigins applies to polling protocols created without an
+// explicit CORS configuration (e.g. dynamically created listeners).
+var defaultAllowedOrigins []string
+
+// SetDefaultAllowedOrigins configures the fallback CORS allow list for
+// polling protocols that were created without explicit origins.
+func SetDefaultAllowedOrigins(origins []string) {
+	defaultAllowedOrigins = origins
+}
+
+func (p *HTTPPollingProtocol) allowedOrigins() []string {
+	if p.config.AllowedOrigins != nil {
+		return p.config.AllowedOrigins
+	}
+	return defaultAllowedOrigins
+}
+
+// enableCors reflects the request Origin only when it is allowed by the
+// configured origins. The wildcard "*" is only emitted when it is explicitly
+// configured as an escape hatch; otherwise disallowed origins get no CORS
+// headers at all.
+func (p *HTTPPollingProtocol) enableCors(w http.ResponseWriter, r *http.Request) {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return
+	}
+	allowed := p.allowedOrigins()
+	wildcard := false
+	for _, entry := range allowed {
+		if entry == "*" {
+			wildcard = true
+			break
+		}
+	}
+	switch {
+	case wildcard:
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+	case common.IsOriginAllowed(origin, r.Host, allowed):
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Add("Vary", "Origin")
+	default:
+		return
+	}
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Filename, X-Command")
+	w.Header().Set("Access-Control-Max-Age", "86400")
 }
 
 // HTTP Handlers
@@ -331,7 +379,7 @@ func (p *HTTPPollingProtocol) HandleCommand(cmd string) error {
 
 // Update handleQueueCommand to do nothing or return an error (since it's not used for agent commands)
 func (p *HTTPPollingProtocol) handleQueueCommand(w http.ResponseWriter, r *http.Request) {
-	enableCors(&w)
+	p.enableCors(w, r)
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -341,7 +389,7 @@ func (p *HTTPPollingProtocol) handleQueueCommand(w http.ResponseWriter, r *http.
 }
 
 func (p *HTTPPollingProtocol) handleGetCommand(w http.ResponseWriter, r *http.Request) {
-	enableCors(&w)
+	p.enableCors(w, r)
 	// Extract AgentID from URL: /api/agent/{AgentID}/command
 	parts := strings.Split(r.URL.Path, "/")
 	if len(parts) < 5 {
@@ -368,7 +416,7 @@ func (p *HTTPPollingProtocol) handleGetCommand(w http.ResponseWriter, r *http.Re
 }
 
 func (p *HTTPPollingProtocol) handleGetResults(w http.ResponseWriter, r *http.Request) {
-	enableCors(&w)
+	p.enableCors(w, r)
 	w.Header().Set("Content-Type", "application/json")
 
 	// Extract AgentID from URL: /api/agent/{AgentID}/results
@@ -399,7 +447,7 @@ func (p *HTTPPollingProtocol) handleGetResults(w http.ResponseWriter, r *http.Re
 }
 
 func (p *HTTPPollingProtocol) handleFileUpload(w http.ResponseWriter, r *http.Request) {
-	enableCors(&w)
+	p.enableCors(w, r)
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -408,6 +456,10 @@ func (p *HTTPPollingProtocol) handleFileUpload(w http.ResponseWriter, r *http.Re
 	filename := r.Header.Get("X-Filename")
 	if filename == "" {
 		http.Error(w, "Missing X-Filename header", http.StatusBadRequest)
+		return
+	}
+	if err := filestore.ValidateFileName(filename); err != nil {
+		http.Error(w, "Invalid X-Filename header", http.StatusBadRequest)
 		return
 	}
 
@@ -419,7 +471,7 @@ func (p *HTTPPollingProtocol) handleFileUpload(w http.ResponseWriter, r *http.Re
 }
 
 func (p *HTTPPollingProtocol) handleListFiles(w http.ResponseWriter, r *http.Request) {
-	enableCors(&w)
+	p.enableCors(w, r)
 	files, err := os.ReadDir(p.config.UploadDir)
 	if err != nil {
 		http.Error(w, "Failed to list files", http.StatusInternalServerError)
@@ -450,7 +502,7 @@ func (p *HTTPPollingProtocol) handleListFiles(w http.ResponseWriter, r *http.Req
 }
 
 func (p *HTTPPollingProtocol) handleListAgents(w http.ResponseWriter, r *http.Request) {
-	enableCors(&w)
+	p.enableCors(w, r)
 	p.agents.Lock()
 	defer p.agents.Unlock()
 

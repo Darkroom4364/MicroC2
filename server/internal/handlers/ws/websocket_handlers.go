@@ -10,14 +10,16 @@ import (
 //
 // Pre-conditions:
 //   - logStreamer is a properly initialized LogStreamer instance
+//   - checkOrigin validates WebSocket upgrade origins; if nil, the default
+//     same-host/loopback-only policy is used
 //
 // Post-conditions:
 //   - Returns a configured websocket Handler instance
 //   - Terminal handler is initialized
-func New(logStreamer *websocket.LogStreamer) *Handler {
+func New(logStreamer *websocket.LogStreamer, checkOrigin func(*http.Request) bool) *Handler {
 	return &Handler{
 		logStreamer:     logStreamer,
-		terminalHandler: websocket.NewTerminalHandler(),
+		terminalHandler: websocket.NewTerminalHandler(checkOrigin),
 	}
 }
 

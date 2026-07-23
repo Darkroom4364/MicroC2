@@ -25,6 +25,8 @@ type ServerConfig struct {
 	Port         string
 	StaticDir    string
 	ProtocolType string
+	// CORSOrigins configures the CORS allow list for agent polling routes.
+	CORSOrigins []string
 }
 
 func NewServerManager(config *ServerConfig) (*ServerManager, error) {
@@ -33,8 +35,9 @@ func NewServerManager(config *ServerConfig) (*ServerManager, error) {
 	}
 
 	baseConfig := common.BaseProtocolConfig{
-		UploadDir: config.UploadDir,
-		Port:      config.Port,
+		UploadDir:      config.UploadDir,
+		Port:           config.Port,
+		AllowedOrigins: config.CORSOrigins,
 	}
 
 	var protocol common.Protocol
