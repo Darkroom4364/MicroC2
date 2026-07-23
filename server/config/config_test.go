@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -123,6 +124,24 @@ func TestPathWithinDirectoryRejectsCaseAliasOnInsensitiveFilesystems(t *testing.
 			candidate,
 			staticDir,
 		)
+	}
+}
+
+func TestPathWithinDirectoryTreatsDifferentWindowsVolumesAsOutside(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows volume semantics")
+	}
+
+	within, err := pathWithinDirectoryWithCaseFolding(
+		`C:\microc2\static`,
+		`D:\microc2\data\microc2.db`,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("compare paths on different Windows volumes: %v", err)
+	}
+	if within {
+		t.Fatal("path on a different Windows volume was treated as contained")
 	}
 }
 
