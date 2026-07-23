@@ -140,7 +140,7 @@ func (p *HTTPPollingProtocol) handleAgentRequests(w http.ResponseWriter, r *http
 		}
 		p.handleLegacyAgentResult(w, r, agentID)
 	default:
-		log.Printf("[ERROR] Unknown action %s from agent %s", action, agentID)
+		log.Print("[ERROR] Unknown agent action")
 		http.Error(w, "Unknown action", http.StatusNotFound)
 	}
 }
@@ -312,8 +312,8 @@ func (p *HTTPPollingProtocol) HandleFileUpload(filename string, fileData io.Read
 	if err := filestore.ValidateFileName(filename); err != nil {
 		return err
 	}
-	filepath := filepath.Join(p.config.UploadDir, filename)
-	file, err := os.Create(filepath)
+	filePath := filepath.Join(p.config.UploadDir, filename)
+	file, err := os.Create(filePath)
 	if err != nil {
 		return err
 	}
@@ -593,8 +593,8 @@ func (p *HTTPPollingProtocol) QueueLegacyShellTask(agentID, command string) (tas
 	return p.taskStore.CreateLegacyShell(agentID, command)
 }
 
-func (p *HTTPPollingProtocol) CreateTask(agentID string, request tasks.CreateRequest) (tasks.Task, error) {
-	return p.taskStore.Create(agentID, request)
+func (p *HTTPPollingProtocol) CreateTask(agentID string, createRequest tasks.CreateRequest) (tasks.Task, error) {
+	return p.taskStore.Create(agentID, createRequest)
 }
 
 func (p *HTTPPollingProtocol) ListTasks(agentID string) ([]tasks.Task, error) {

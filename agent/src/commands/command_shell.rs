@@ -20,7 +20,6 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::io::{self, Read};
-use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
@@ -168,18 +167,10 @@ async fn execute_shell(command: &str, timeout_seconds: u64) -> ShellExecution {
 
     if cmd_parts[0] == "cd" {
         let result = if cmd_parts.len() > 1 {
-            let path = Path::new(cmd_parts[1]);
-            if path.exists() {
-                env::set_current_dir(path).and_then(|_| {
-                    env::current_dir()
-                        .map(|current| format!("Changed directory to {}", current.display()))
-                })
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "Directory not found",
-                ))
-            }
+            env::set_current_dir(cmd_parts[1]).and_then(|_| {
+                env::current_dir()
+                    .map(|current| format!("Changed directory to {}", current.display()))
+            })
         } else {
             env::current_dir().map(|current| format!("Current directory: {}", current.display()))
         };
@@ -473,8 +464,32 @@ impl ProcessTreeGuard {
     }
 
     #[cfg(unix)]
+    fn process_group_id(&self) -> io::Result<libc::pid_t> {
+        let pid = libc::pid_t::try_from(self.pid)
+            .map_err(|_| io::Error::other("child PID does not fit in pid_t"))?;
+        pid.checked_neg()
+            .ok_or_else(|| io::Error::other("child PID cannot identify a process group"))
+    }
+
+    #[cfg(unix)]
     fn terminate(&self, child: &mut std::process::Child) -> Option<String> {
-        let result = unsafe { libc::kill(-(self.pid as i32), libc::SIGKILL) };
+        let process_group = match self.process_group_id() {
+            Ok(process_group) => process_group,
+            Err(group_error) => {
+                return match child.kill() {
+                    Ok(()) => Some(format!(
+                        "failed to identify command process group: {group_error}; terminated direct child"
+                    )),
+                    Err(child_error) => Some(format!(
+                        "failed to identify command process group: {group_error}; direct termination also failed: {child_error}"
+                    )),
+                };
+            }
+        };
+        // SAFETY: process_group is a checked negative child PID. kill(2)
+        // accepts this integer selector and does not dereference memory.
+        // foxguard: ignore[rs/unsafe-block]
+        let result = unsafe { libc::kill(process_group, libc::SIGKILL) };
         if result == 0 {
             return None;
         }
@@ -496,7 +511,14 @@ impl ProcessTreeGuard {
 
     #[cfg(unix)]
     fn cleanup_descendants(&self) -> Option<String> {
-        let result = unsafe { libc::kill(-(self.pid as i32), libc::SIGKILL) };
+        let process_group = match self.process_group_id() {
+            Ok(process_group) => process_group,
+            Err(error) => return Some(error.to_string()),
+        };
+        // SAFETY: process_group is a checked negative child PID. kill(2)
+        // accepts this integer selector and does not dereference memory.
+        // foxguard: ignore[rs/unsafe-block]
+        let result = unsafe { libc::kill(process_group, libc::SIGKILL) };
         if result == 0 {
             return None;
         }
@@ -566,12 +588,21 @@ impl WindowsJob {
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         };
 
+        // SAFETY: null security-attribute and name pointers request Windows
+        // defaults. The returned handle is checked before use and owned here.
+        // foxguard: ignore[rs/unsafe-block]
         let handle: HANDLE = unsafe { CreateJobObjectW(ptr::null_mut(), ptr::null()) };
         if handle.is_null() {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: this Win32 information structure is plain data and Windows
+        // requires every field to start at zero before selected flags are set.
+        // foxguard: ignore[rs/unsafe-block]
         let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { mem::zeroed() };
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: handle is non-null and owned, limits is initialized, and the
+        // pointer and byte count describe exactly one limits structure.
+        // foxguard: ignore[rs/unsafe-block]
         let configured = unsafe {
             SetInformationJobObject(
                 handle,
@@ -582,17 +613,27 @@ impl WindowsJob {
         };
         if configured == FALSE {
             let error = io::Error::last_os_error();
+            // SAFETY: handle is the non-null owned handle created above and is
+            // closed exactly once on this error path.
+            // foxguard: ignore[rs/unsafe-block]
             unsafe {
                 winapi::um::handleapi::CloseHandle(handle);
             }
             return Err(error);
         }
+        // SAFETY: handle remains valid and child.as_raw_handle() is borrowed
+        // only for the duration of this synchronous Win32 call.
+        // foxguard: ignore[rs/unsafe-block]
         let assigned = unsafe { AssignProcessToJobObject(handle, child.as_raw_handle() as HANDLE) };
         if assigned == FALSE {
+            let error = io::Error::last_os_error();
+            // SAFETY: handle is the non-null owned handle created above and is
+            // closed exactly once on this error path.
+            // foxguard: ignore[rs/unsafe-block]
             unsafe {
                 winapi::um::handleapi::CloseHandle(handle);
             }
-            return Err(io::Error::last_os_error());
+            return Err(error);
         }
         Ok(Self { handle })
     }
@@ -601,6 +642,9 @@ impl WindowsJob {
         use winapi::shared::minwindef::FALSE;
         use winapi::um::jobapi2::TerminateJobObject;
 
+        // SAFETY: self.handle is a live job handle owned by self for the
+        // duration of this call.
+        // foxguard: ignore[rs/unsafe-block]
         if unsafe { TerminateJobObject(self.handle, 1) } == FALSE {
             return Err(io::Error::last_os_error());
         }
@@ -611,6 +655,8 @@ impl WindowsJob {
 #[cfg(windows)]
 impl Drop for WindowsJob {
     fn drop(&mut self) {
+        // SAFETY: self owns the non-null job handle and Drop runs once.
+        // foxguard: ignore[rs/unsafe-block]
         unsafe {
             winapi::um::handleapi::CloseHandle(self.handle);
         }
