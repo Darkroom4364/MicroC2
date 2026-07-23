@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "type": "shell",
+  "arguments": {
+    "command": "whoami"
+  },
+  "timeout_seconds": 30,
+  "expires_in_seconds": 300
+}

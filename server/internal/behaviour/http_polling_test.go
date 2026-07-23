@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"microc2/server/internal/common"
+	"microc2/server/internal/tasks"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestHTTPPollingProtocolAgentLifecycle(t *testing.T) {
@@ -92,6 +96,422 @@ func TestHTTPPollingProtocolAgentLifecycle(t *testing.T) {
 	}
 }
 
+func TestHTTPPollingProtocolTypedTaskLifecycle(t *testing.T) {
+	proto := NewHTTPPollingProtocol(common.BaseProtocolConfig{UploadDir: t.TempDir(), Port: "0"})
+	handler := proto.GetHTTPHandler()
+	agentID := "agent-one"
+	expiresIn := 300
+
+	queued, err := proto.CreateTask(agentID, tasks.CreateRequest{
+		SchemaVersion:    tasks.SchemaVersion,
+		Type:             tasks.TypeShell,
+		Arguments:        tasks.ShellArguments{Command: "whoami"},
+		TimeoutSeconds:   30,
+		ExpiresInSeconds: &expiresIn,
+	})
+	if err != nil {
+		t.Fatalf("queue typed task: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/agent/"+agentID+"/tasks", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected task dispatch 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var dispatched tasks.Task
+	if err := json.Unmarshal(rec.Body.Bytes(), &dispatched); err != nil {
+		t.Fatalf("decode dispatched task: %v", err)
+	}
+	if dispatched.ID != queued.ID || dispatched.Status != tasks.StatusDispatched {
+		t.Fatalf("unexpected dispatched task: %#v", dispatched)
+	}
+
+	startedAt := dispatched.DispatchedAt.Add(time.Second)
+	statusBody, err := json.Marshal(tasks.StatusUpdate{
+		SchemaVersion: tasks.SchemaVersion,
+		TaskID:        dispatched.ID,
+		AgentID:       agentID,
+		Status:        tasks.StatusRunning,
+		Timestamp:     startedAt,
+	})
+	if err != nil {
+		t.Fatalf("marshal status update: %v", err)
+	}
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(
+		http.MethodPost,
+		"/api/agent/"+agentID+"/tasks/"+dispatched.ID+"/status",
+		bytes.NewReader(statusBody),
+	)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected running update 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	exitCode := 0
+	resultBody, err := json.Marshal(tasks.Result{
+		SchemaVersion: tasks.SchemaVersion,
+		TaskID:        dispatched.ID,
+		AgentID:       agentID,
+		Outcome:       tasks.OutcomeCompleted,
+		StartedAt:     startedAt,
+		CompletedAt:   startedAt.Add(time.Second),
+		ExitCode:      &exitCode,
+		Output:        tasks.Output{Stdout: "operator\n", Stderr: ""},
+	})
+	if err != nil {
+		t.Fatalf("marshal task result: %v", err)
+	}
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/agent/"+agentID+"/results", bytes.NewReader(resultBody))
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected task result 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var completed tasks.Task
+	if err := json.Unmarshal(rec.Body.Bytes(), &completed); err != nil {
+		t.Fatalf("decode completed task: %v", err)
+	}
+	if completed.Status != tasks.StatusCompleted || completed.Result == nil ||
+		completed.Result.Output.Stdout != "operator\n" {
+		t.Fatalf("unexpected completed task: %#v", completed)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/agent/"+agentID+"/tasks", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected empty typed queue 204, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHTTPPollingProtocolTypedTaskRejectsInvalidUpdates(t *testing.T) {
+	proto := NewHTTPPollingProtocol(common.BaseProtocolConfig{UploadDir: t.TempDir(), Port: "0"})
+	handler := proto.GetHTTPHandler()
+	expiresIn := 300
+	task, err := proto.CreateTask("agent-one", tasks.CreateRequest{
+		SchemaVersion:    tasks.SchemaVersion,
+		Type:             tasks.TypeShell,
+		Arguments:        tasks.ShellArguments{Command: "whoami"},
+		TimeoutSeconds:   30,
+		ExpiresInSeconds: &expiresIn,
+	})
+	if err != nil {
+		t.Fatalf("queue typed task: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/agent/agent-one/tasks", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dispatch typed task: %d: %s", rec.Code, rec.Body.String())
+	}
+	var dispatched tasks.Task
+	if err := json.Unmarshal(rec.Body.Bytes(), &dispatched); err != nil {
+		t.Fatalf("decode dispatched task: %v", err)
+	}
+
+	mismatch := `{"schema_version":1,"task_id":"` + task.ID +
+		`","agent_id":"agent-two","status":"running","timestamp":"` +
+		dispatched.DispatchedAt.Add(time.Second).Format(time.RFC3339Nano) + `"}`
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(
+		http.MethodPost,
+		"/api/agent/agent-one/tasks/"+task.ID+"/status",
+		bytes.NewBufferString(mismatch),
+	)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected mismatched agent 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	withUnknownField := `{"schema_version":1,"task_id":"` + task.ID +
+		`","agent_id":"agent-one","status":"running","timestamp":"` +
+		dispatched.DispatchedAt.Add(time.Second).Format(time.RFC3339Nano) + `","extra":true}`
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(
+		http.MethodPost,
+		"/api/agent/agent-one/tasks/"+task.ID+"/status",
+		bytes.NewBufferString(withUnknownField),
+	)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected unknown field 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	resultBeforeRunning := `{"schema_version":1,"task_id":"` + task.ID +
+		`","agent_id":"agent-one","outcome":"completed","started_at":"` +
+		dispatched.DispatchedAt.Add(time.Second).Format(time.RFC3339Nano) +
+		`","completed_at":"` + dispatched.DispatchedAt.Add(2*time.Second).Format(time.RFC3339Nano) +
+		`","exit_code":0,"output":{"stdout":"","stderr":""}}`
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/agent/agent-one/results", bytes.NewBufferString(resultBeforeRunning))
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected dispatched result transition 409, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHTTPPollingProtocolLegacyPollSkipsTypedOriginTasks(t *testing.T) {
+	proto := NewHTTPPollingProtocol(common.BaseProtocolConfig{UploadDir: t.TempDir(), Port: "0"})
+	handler := proto.GetHTTPHandler()
+	expiresIn := 300
+	typed, err := proto.CreateTask("agent-one", tasks.CreateRequest{
+		SchemaVersion:    tasks.SchemaVersion,
+		Type:             tasks.TypeShell,
+		Arguments:        tasks.ShellArguments{Command: "typed-only"},
+		TimeoutSeconds:   30,
+		ExpiresInSeconds: &expiresIn,
+	})
+	if err != nil {
+		t.Fatalf("create typed task: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/agent/agent-one/command", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("legacy poll consumed typed-origin task: %d: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/agent/agent-one/tasks", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("typed poll did not receive typed task: %d: %s", rec.Code, rec.Body.String())
+	}
+	var dispatched tasks.Task
+	if err := json.Unmarshal(rec.Body.Bytes(), &dispatched); err != nil {
+		t.Fatalf("decode typed task: %v", err)
+	}
+	if dispatched.ID != typed.ID {
+		t.Fatalf("typed poll received task %q, want %q", dispatched.ID, typed.ID)
+	}
+}
+
+func TestHTTPPollingProtocolTypedCompletionProjectsLegacyHistoryOnce(t *testing.T) {
+	proto := NewHTTPPollingProtocol(common.BaseProtocolConfig{UploadDir: t.TempDir(), Port: "0"})
+	handler := proto.GetHTTPHandler()
+	legacy, err := proto.QueueLegacyShellTask("agent-one", "whoami")
+	if err != nil {
+		t.Fatalf("queue legacy task: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/agent/agent-one/tasks", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dispatch legacy-origin task through typed API: %d: %s", rec.Code, rec.Body.String())
+	}
+	var dispatched tasks.Task
+	if err := json.Unmarshal(rec.Body.Bytes(), &dispatched); err != nil {
+		t.Fatalf("decode dispatched task: %v", err)
+	}
+	if dispatched.ID != legacy.ID {
+		t.Fatalf("dispatched task %q, want %q", dispatched.ID, legacy.ID)
+	}
+
+	agentStartedAt := dispatched.DispatchedAt.Add(time.Second)
+	statusBody, err := json.Marshal(tasks.StatusUpdate{
+		SchemaVersion: tasks.SchemaVersion,
+		TaskID:        legacy.ID,
+		AgentID:       "agent-one",
+		Status:        tasks.StatusRunning,
+		Timestamp:     agentStartedAt,
+	})
+	if err != nil {
+		t.Fatalf("marshal running update: %v", err)
+	}
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(
+		http.MethodPost,
+		"/api/agent/agent-one/tasks/"+legacy.ID+"/status",
+		bytes.NewReader(statusBody),
+	)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("mark legacy-origin task running: %d: %s", rec.Code, rec.Body.String())
+	}
+
+	exitCode := 0
+	resultBody, err := json.Marshal(tasks.Result{
+		SchemaVersion: tasks.SchemaVersion,
+		TaskID:        legacy.ID,
+		AgentID:       "agent-one",
+		Outcome:       tasks.OutcomeCompleted,
+		StartedAt:     agentStartedAt,
+		CompletedAt:   agentStartedAt.Add(time.Second),
+		ExitCode:      &exitCode,
+		Output:        tasks.Output{Stdout: "operator\n", Stderr: ""},
+	})
+	if err != nil {
+		t.Fatalf("marshal typed result: %v", err)
+	}
+	for attempt := 1; attempt <= 2; attempt++ {
+		rec = httptest.NewRecorder()
+		req = httptest.NewRequest(
+			http.MethodPost,
+			"/api/agent/agent-one/results",
+			bytes.NewReader(resultBody),
+		)
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("typed result attempt %d: %d: %s", attempt, rec.Code, rec.Body.String())
+		}
+	}
+
+	results := proto.GetResults("agent-one")
+	if len(results) != 1 {
+		t.Fatalf("idempotent typed completion projected %d legacy results, want 1", len(results))
+	}
+	if results[0]["command"] != "whoami" || results[0]["output"] != "operator\n" {
+		t.Fatalf("unexpected projected legacy result: %#v", results[0])
+	}
+}
+
+func TestHTTPPollingProtocolLegacyErrorIsFailedTypedHistory(t *testing.T) {
+	proto := NewHTTPPollingProtocol(common.BaseProtocolConfig{UploadDir: t.TempDir(), Port: "0"})
+	handler := proto.GetHTTPHandler()
+	proto.QueueCommand("agent-one", "whoami")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/agent/agent-one/command", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dispatch legacy command: %d: %s", rec.Code, rec.Body.String())
+	}
+
+	postListenerResult(t, handler, "agent-one", "whoami", xorHex("Error: timed out", "agent-one"))
+	history, err := proto.ListTasks("agent-one")
+	if err != nil {
+		t.Fatalf("list typed history: %v", err)
+	}
+	if len(history) != 1 ||
+		history[0].Status != tasks.StatusFailed ||
+		history[0].Result == nil ||
+		history[0].Result.Outcome != tasks.OutcomeFailed ||
+		history[0].Result.ExitCode != nil ||
+		history[0].Result.Error != "Error: timed out" {
+		t.Fatalf("legacy error was not preserved as a failed typed task: %#v", history)
+	}
+}
+
+func TestHTTPPollingProtocolRejectsOversizedTaskUpdateBody(t *testing.T) {
+	proto := NewHTTPPollingProtocol(common.BaseProtocolConfig{UploadDir: t.TempDir(), Port: "0"})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/agent/agent-one/tasks/task-one/status",
+		bytes.NewBufferString(
+			`{"schema_version":1,"task_id":"task-one","agent_id":"agent-one",`+
+				`"status":"running","timestamp":"`+
+				strings.Repeat("x", int(tasks.MaxStatusUpdateBodyBytes)+1)+`"}`,
+		),
+	)
+	proto.GetHTTPHandler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected oversized status update 413, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHTTPPollingProtocolAcceptsWorstCaseValidResultBody(t *testing.T) {
+	proto := NewHTTPPollingProtocol(common.BaseProtocolConfig{UploadDir: t.TempDir(), Port: "0"})
+	handler := proto.GetHTTPHandler()
+	expiresIn := 300
+	task, err := proto.CreateTask("agent-one", tasks.CreateRequest{
+		SchemaVersion:    tasks.SchemaVersion,
+		Type:             tasks.TypeShell,
+		Arguments:        tasks.ShellArguments{Command: "emit-astral-characters"},
+		TimeoutSeconds:   30,
+		ExpiresInSeconds: &expiresIn,
+	})
+	if err != nil {
+		t.Fatalf("create typed task: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/agent/agent-one/tasks", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dispatch typed task: %d: %s", rec.Code, rec.Body.String())
+	}
+	var dispatched tasks.Task
+	if err := json.Unmarshal(rec.Body.Bytes(), &dispatched); err != nil {
+		t.Fatalf("decode dispatched task: %v", err)
+	}
+	startedAt := dispatched.DispatchedAt.Add(time.Second)
+	statusBody, err := json.Marshal(tasks.StatusUpdate{
+		SchemaVersion: tasks.SchemaVersion,
+		TaskID:        task.ID,
+		AgentID:       task.AgentID,
+		Status:        tasks.StatusRunning,
+		Timestamp:     startedAt,
+	})
+	if err != nil {
+		t.Fatalf("marshal running update: %v", err)
+	}
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(
+		http.MethodPost,
+		"/api/agent/agent-one/tasks/"+task.ID+"/status",
+		bytes.NewReader(statusBody),
+	)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("mark task running: %d: %s", rec.Code, rec.Body.String())
+	}
+
+	exitCode := 0
+	const astralSentinel = "😀"
+	resultBody, err := json.Marshal(tasks.Result{
+		SchemaVersion: tasks.SchemaVersion,
+		TaskID:        task.ID,
+		AgentID:       task.AgentID,
+		Outcome:       tasks.OutcomeCompleted,
+		StartedAt:     startedAt,
+		CompletedAt:   startedAt.Add(time.Second),
+		ExitCode:      &exitCode,
+		Output: tasks.Output{
+			Stdout: astralSentinel,
+			Stderr: astralSentinel,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal astral result template: %v", err)
+	}
+	surrogateEscapedStream := strings.Repeat(`\ud83d\ude00`, tasks.MaxResultStreamCharacters)
+	resultBody = bytes.ReplaceAll(
+		resultBody,
+		[]byte(astralSentinel),
+		[]byte(surrogateEscapedStream),
+	)
+	if len(resultBody) <= 16<<20 {
+		t.Fatalf(
+			"regression body is %d bytes; must exceed the old 16 MiB cap",
+			len(resultBody),
+		)
+	}
+	if len(resultBody) > int(tasks.MaxTaskResultBodyBytes) {
+		t.Fatalf(
+			"schema-valid result is %d bytes; exceeds current %d-byte cap",
+			len(resultBody),
+			tasks.MaxTaskResultBodyBytes,
+		)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(
+		http.MethodPost,
+		"/api/agent/agent-one/results",
+		bytes.NewReader(resultBody),
+	)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("schema-valid result body rejected: %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestHTTPPollingProtocolIsolatesMultipleAgentsPerListener(t *testing.T) {
 	proto := NewHTTPPollingProtocol(common.BaseProtocolConfig{
 		UploadDir: t.TempDir(),
@@ -140,6 +560,35 @@ func TestHTTPPollingProtocolIsolatesMultipleAgentsPerListener(t *testing.T) {
 	}
 	if len(agentTwoResults) != 1 || agentTwoResults[0]["output"] != "two\n" {
 		t.Fatalf("unexpected agent-two results: %#v", agentTwoResults)
+	}
+}
+
+func TestHTTPPollingProtocolPagesLegacyResultsAndReportsTotal(t *testing.T) {
+	proto := NewHTTPPollingProtocol(common.BaseProtocolConfig{
+		UploadDir: t.TempDir(),
+		Port:      "0",
+	})
+	for i := 0; i < 125; i++ {
+		proto.recordLegacyResultForAgent("agent-one", CommandResult{
+			Command:   fmt.Sprintf("command-%03d", i),
+			Output:    fmt.Sprintf("output-%03d", i),
+			Timestamp: "2026-07-23T16:30:00Z",
+		})
+	}
+
+	page, total := proto.GetResultsPage("agent-one", 50, 25)
+	if total != 125 {
+		t.Fatalf("legacy result total = %d, want 125", total)
+	}
+	if len(page) != 25 ||
+		page[0]["command"] != "command-050" ||
+		page[24]["command"] != "command-074" {
+		t.Fatalf("unexpected legacy result page: %#v", page)
+	}
+
+	page, total = proto.GetResultsPage("agent-one", 200, 25)
+	if total != 125 || page == nil || len(page) != 0 {
+		t.Fatalf("beyond-end legacy result page = %#v, total %d; want [] and 125", page, total)
 	}
 }
 

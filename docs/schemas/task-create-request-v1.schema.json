@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://microc2.local/schemas/task-create-request-v1.schema.json",
+  "title": "MicroC2 Task Create Request v1",
+  "description": "Canonical operator request for creating a versioned shell task.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "type",
+    "arguments",
+    "timeout_seconds",
+    "expires_in_seconds"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "type": {
+      "const": "shell"
+    },
+    "arguments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command"
+      ],
+      "properties": {
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192,
+          "pattern": "\\S"
+        }
+      }
+    },
+    "timeout_seconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 3600
+    },
+    "expires_in_seconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 604800,
+      "description": "Seconds from server acceptance until the latest authorized start time."
+    }
+  }
+}

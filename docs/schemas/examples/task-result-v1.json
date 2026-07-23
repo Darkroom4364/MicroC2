@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "task_id": "task-018f8dab",
+  "agent_id": "agent-01",
+  "outcome": "completed",
+  "started_at": "2026-07-23T16:30:05Z",
+  "completed_at": "2026-07-23T16:30:06Z",
+  "exit_code": 0,
+  "output": {
+    "stdout": "lab-user\n",
+    "stderr": ""
+  }
+}
