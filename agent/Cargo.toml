@@ -32,7 +32,7 @@ default = []
 dll = []  # Feature flag for DLL exports
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3.9", features = ["winuser", "libloaderapi"] }
+winapi = { version = "0.3.9", features = ["winuser", "libloaderapi", "jobapi2", "handleapi"] }
 
 [profile.release]
 opt-level = "z"  # Optimize for size

