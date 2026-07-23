@@ -82,6 +82,28 @@ func (h *ListenerHandlers) HandleGetListener(w http.ResponseWriter, r *http.Requ
 	json.NewEncoder(w).Encode(listener)
 }
 
+// HandleListListenerEvents returns the durable, append-only lifecycle history
+// for a listener. History remains queryable after the runtime listener is
+// deleted.
+func (h *ListenerHandlers) HandleListListenerEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/api/listeners/")
+	id = strings.TrimSuffix(id, "/events")
+	if id == "" || strings.Contains(id, "/") {
+		sendJSONError(w, "Listener ID is required", http.StatusBadRequest)
+		return
+	}
+	events, err := h.manager.ListListenerEvents(id)
+	if err != nil {
+		sendJSONError(w, "Failed to load listener events", http.StatusInternalServerError)
+		return
+	}
+	sendJSONResponse(w, events)
+}
+
 // HandleStopListener handles requests to stop a listener
 func (h *ListenerHandlers) HandleStopListener(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -183,6 +205,10 @@ func (h *ListenerHandlers) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/listeners/list", h.HandleListListeners)
 	mux.HandleFunc("/api/listeners/", func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/api/listeners/")
+		if strings.HasSuffix(path, "/events") {
+			h.HandleListListenerEvents(w, r)
+			return
+		}
 		if strings.HasSuffix(path, "/stop") {
 			h.HandleStopListener(w, r)
 			return

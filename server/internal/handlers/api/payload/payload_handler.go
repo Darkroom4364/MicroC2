@@ -3,11 +3,14 @@ package payload
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
 	"os"
 	"os/exec"
@@ -17,31 +20,138 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"microc2/server/internal/listeners"
+	"microc2/server/internal/persistence"
 )
 
-// NewPayloadHandler creates a new payload handler
-//
-// Pre-conditions:
-//   - payloadsDir is a valid directory path with write permissions
-//   - agentSourceDir points to a valid agent source code directory
-//
-// Post-conditions:
-//   - Returns an initialized PayloadHandler
-//   - Directory structure for payloads is created if it doesn't exist
-//   - Tracking map for generated payloads is initialized
-func NewPayloadHandler(payloadsDir, agentSourceDir string) *PayloadHandler {
-	// Ensure directories exist
-	for _, dir := range []string{payloadsDir, filepath.Join(payloadsDir, "debug"), filepath.Join(payloadsDir, "release")} {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			log.Printf("[ERROR] Failed to create directory %s: %v", dir, err)
-		}
-	}
+const (
+	payloadStateBuilding    = "building"
+	payloadStateCompleted   = "completed"
+	payloadStateFailed      = "failed"
+	payloadStateInterrupted = "interrupted"
+	payloadStateMissing     = "missing"
+	payloadStateCorrupt     = "corrupt"
 
+	payloadFailedDetail      = "payload build failed before completion"
+	payloadInterruptedDetail = "server restarted before payload build completed"
+)
+
+type payloadBuildRecord struct {
+	ID             string
+	PayloadID      string
+	ListenerID     string
+	MutationSeed   string
+	Filename       string
+	RelativePath   string
+	Size           int64
+	SHA256         string
+	CreatedAt      string
+	State          string
+	StateDetail    string
+	ProvenanceJSON []byte
+}
+
+// NewPayloadHandler is the compatibility constructor for callers that do not
+// yet provide durable storage. It derives the legacy listeners directory from
+// payloadsDir instead of relying on the process working directory.
+func NewPayloadHandler(payloadsDir, agentSourceDir string) *PayloadHandler {
+	lookup := filesystemListenerLookup{
+		listenersDir: filepath.Join(filepath.Dir(payloadsDir), "listeners"),
+	}
+	handler, err := newPayloadHandler(payloadsDir, agentSourceDir, lookup, nil)
+	if err == nil {
+		return handler
+	}
+	log.Printf("[ERROR] Failed to initialize payload handler: %v", err)
 	return &PayloadHandler{
 		payloadsDir:    payloadsDir,
 		agentSourceDir: agentSourceDir,
+		listenerLookup: lookup,
+		initErr:        err,
 		payloads:       make(map[string]PayloadResult),
 	}
+}
+
+// NewPayloadHandlerWithPersistence constructs a payload handler backed by the
+// shared server database and reconciles every stored artifact before serving.
+func NewPayloadHandlerWithPersistence(
+	payloadsDir string,
+	agentSourceDir string,
+	lookup ListenerLookup,
+	database *persistence.Database,
+) (*PayloadHandler, error) {
+	if database == nil {
+		return nil, errors.New("payload persistence database is required")
+	}
+	handler, err := newPayloadHandler(payloadsDir, agentSourceDir, lookup, database)
+	if err != nil {
+		return nil, err
+	}
+	if err := handler.reconcilePayloads(); err != nil {
+		return nil, fmt.Errorf("reconcile payload metadata: %w", err)
+	}
+	return handler, nil
+}
+
+func newPayloadHandler(
+	payloadsDir string,
+	agentSourceDir string,
+	lookup ListenerLookup,
+	database *persistence.Database,
+) (*PayloadHandler, error) {
+	if lookup == nil {
+		return nil, errors.New("listener lookup is required")
+	}
+	absolutePayloadsDir, err := filepath.Abs(payloadsDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve payload directory: %w", err)
+	}
+	for _, dir := range []string{
+		absolutePayloadsDir,
+		filepath.Join(absolutePayloadsDir, "debug"),
+		filepath.Join(absolutePayloadsDir, "release"),
+	} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, fmt.Errorf("create payload directory %s: %w", dir, err)
+		}
+	}
+	return &PayloadHandler{
+		payloadsDir:    absolutePayloadsDir,
+		agentSourceDir: agentSourceDir,
+		listenerLookup: lookup,
+		database:       database,
+		payloads:       make(map[string]PayloadResult),
+	}, nil
+}
+
+type filesystemListenerLookup struct {
+	listenersDir string
+}
+
+func (lookup filesystemListenerLookup) LookupListener(listenerID string) (listeners.ListenerConfig, error) {
+	entries, err := os.ReadDir(lookup.listenersDir)
+	if err != nil {
+		return listeners.ListenerConfig{}, fmt.Errorf("read listeners directory: %w", err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		configPath := filepath.Join(lookup.listenersDir, entry.Name(), "config.json")
+		configData, err := os.ReadFile(configPath)
+		if err != nil {
+			continue
+		}
+		var config listeners.ListenerConfig
+		if err := json.Unmarshal(configData, &config); err != nil {
+			continue
+		}
+		if config.ID == listenerID {
+			return config, nil
+		}
+	}
+	return listeners.ListenerConfig{}, fmt.Errorf("listener %s not found", listenerID)
 }
 
 // resolveMutationSeed returns the caller-supplied seed or generates a random
@@ -101,6 +211,10 @@ func (h *PayloadHandler) HandleGeneratePayload(w http.ResponseWriter, r *http.Re
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if h.initErr != nil {
+		http.Error(w, "Payload handler is unavailable", http.StatusInternalServerError)
+		return
+	}
 
 	var config PayloadConfig
 	if err := json.NewDecoder(r.Body).Decode(&config); err != nil {
@@ -122,13 +236,20 @@ func (h *PayloadHandler) HandleGeneratePayload(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Store result for later retrieval
-	h.mutex.Lock()
-	h.payloads[result.ID] = result
-	h.mutex.Unlock()
+	if h.database == nil {
+		// Compatibility mode remains process-local. Production construction
+		// always supplies the durable database.
+		h.mutex.Lock()
+		h.payloads[result.ID] = result
+		h.mutex.Unlock()
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+	response := result
+	// The operator only needs the artifact path relative to the configured
+	// payload root. Never disclose the server host's absolute filesystem path.
+	response.Path = result.relativePath
+	json.NewEncoder(w).Encode(response)
 }
 
 // HandleDownloadPayload serves a generated payload for download
@@ -146,6 +267,10 @@ func (h *PayloadHandler) HandleDownloadPayload(w http.ResponseWriter, r *http.Re
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if h.initErr != nil {
+		http.Error(w, "Payload handler is unavailable", http.StatusInternalServerError)
+		return
+	}
 
 	// Extract payload ID from URL path
 	id := strings.TrimPrefix(r.URL.Path, "/api/payload/download/")
@@ -153,34 +278,60 @@ func (h *PayloadHandler) HandleDownloadPayload(w http.ResponseWriter, r *http.Re
 		http.Error(w, "Payload ID is required", http.StatusBadRequest)
 		return
 	}
-
-	// Look up payload result
-	h.mutex.Lock()
-	result, exists := h.payloads[id]
-	h.mutex.Unlock()
-
-	if !exists {
-		http.Error(w, "Payload not found", http.StatusNotFound)
+	if !validPayloadID(id) {
+		http.Error(w, "Invalid payload ID", http.StatusBadRequest)
 		return
 	}
 
-	// Open file
-	file, err := os.Open(result.Path)
+	record, err := h.lookupPayload(id)
 	if err != nil {
-		http.Error(w, "Failed to read payload file", http.StatusInternalServerError)
-		log.Printf("[ERROR] Failed to open payload file %s: %v", result.Path, err)
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "Payload not found", http.StatusNotFound)
+			return
+		}
+		log.Print("[ERROR] Failed to load payload metadata")
+		http.Error(w, "Failed to load payload metadata", http.StatusInternalServerError)
 		return
 	}
-	defer file.Close()
+
+	switch record.State {
+	case payloadStateBuilding, payloadStateFailed, payloadStateInterrupted:
+		http.Error(w, "Payload artifact is unavailable", http.StatusGone)
+		return
+	}
+
+	file, state, detail, actualHash := h.openVerifiedPayload(record)
+	if file != nil {
+		defer file.Close()
+	}
+	if h.database != nil {
+		if err := h.updatePayloadState(record, state, detail, actualHash); err != nil {
+			log.Print("[ERROR] Failed to update payload state")
+			http.Error(w, "Failed to update payload metadata", http.StatusInternalServerError)
+			return
+		}
+	}
+	if state != payloadStateCompleted {
+		http.Error(w, "Payload artifact is unavailable", http.StatusGone)
+		return
+	}
+	if h.afterVerified != nil {
+		h.afterVerified()
+	}
 
 	// Set appropriate headers
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", result.Filename))
+	disposition := mime.FormatMediaType("attachment", map[string]string{"filename": record.Filename})
+	if disposition == "" {
+		http.Error(w, "Payload metadata is corrupt", http.StatusGone)
+		return
+	}
+	w.Header().Set("Content-Disposition", disposition)
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", result.Size))
+	w.Header().Set("Content-Length", strconv.FormatInt(record.Size, 10))
 
 	// Stream file to response
 	if _, err := io.Copy(w, file); err != nil {
-		log.Printf("[ERROR] Failed to stream payload file %s: %v", result.Path, err)
+		log.Print("[ERROR] Failed to stream payload file")
 	}
 }
 
@@ -195,7 +346,30 @@ func (h *PayloadHandler) HandleDownloadPayload(w http.ResponseWriter, r *http.Re
 //   - Agent payload is built and stored in the payloads directory
 //   - Returns PayloadResult with details about the generated payload
 //   - Returns error if payload generation fails at any step
-func (h *PayloadHandler) GeneratePayload(config PayloadConfig) (PayloadResult, error) {
+func (h *PayloadHandler) GeneratePayload(
+	config PayloadConfig,
+) (result PayloadResult, returnErr error) {
+	var durableBuildID string
+	durableBuildStarted := false
+	durableBuildCompleted := false
+	defer func() {
+		if h.database == nil ||
+			!durableBuildStarted ||
+			durableBuildCompleted ||
+			returnErr == nil {
+			return
+		}
+		if err := h.failPayloadBuild(durableBuildID); err != nil {
+			returnErr = errors.Join(
+				returnErr,
+				fmt.Errorf("persist failed payload state: %w", err),
+			)
+		}
+	}()
+
+	if h.initErr != nil {
+		return PayloadResult{}, h.initErr
+	}
 	log.Printf("[INFO] Generating payload with config: %+v", config)
 
 	// Get listener details
@@ -210,6 +384,7 @@ func (h *PayloadHandler) GeneratePayload(config PayloadConfig) (PayloadResult, e
 	log.Printf("[INFO] Using listener: %s (%s) at %s:%d", listener.Name, listener.Protocol, listener.BindHost, listener.Port)
 
 	payloadID := uuid.NewString()
+	buildStartedAt := time.Now().UTC()
 	log.Printf("[INFO] Generated payload build ID %s for listener %s", payloadID, listener.ID)
 
 	// Resolve the mutation seed: use the caller-supplied one for reproduction
@@ -228,6 +403,9 @@ func (h *PayloadHandler) GeneratePayload(config PayloadConfig) (PayloadResult, e
 	}
 	log.Printf("[INFO] Build type: %s", buildType)
 
+	payloadFileName := payloadFilename(config.Format)
+	log.Printf("[INFO] Payload filename: %s", payloadFileName)
+
 	// Create a directory for build artifacts
 	outputDir := filepath.Join(h.payloadsDir, buildType, payloadID)
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
@@ -235,6 +413,7 @@ func (h *PayloadHandler) GeneratePayload(config PayloadConfig) (PayloadResult, e
 		return PayloadResult{}, fmt.Errorf("failed to create output directory: %w", err)
 	}
 	log.Printf("[INFO] Created output directory: %s", outputDir)
+	payloadPath := filepath.Join(outputDir, payloadFileName)
 
 	// Create agent config file
 	configPath := filepath.Join(outputDir, "config.json")
@@ -411,9 +590,39 @@ func (h *PayloadHandler) GeneratePayload(config PayloadConfig) (PayloadResult, e
 	log.Printf("[INFO] Environment variables set: TARGET=%s, OUTPUT_DIR=%s, BUILD_TYPE=%s, SLEEP_INTERVAL=%d, SOCKS5_ENABLED=%t, SOCKS5_PORT=%d",
 		buildTarget, outputDir, buildType, config.Sleep, config.Socks5Enabled, config.Socks5Port)
 
+	plannedRelativePath, err := h.plannedRelativeArtifactPath(payloadPath)
+	if err != nil {
+		return PayloadResult{}, err
+	}
+	if h.database != nil {
+		if err := h.beginPayloadBuild(payloadBuildRecord{
+			ID:             payloadID,
+			PayloadID:      payloadID,
+			ListenerID:     listener.ID,
+			MutationSeed:   mutationSeed,
+			Filename:       payloadFileName,
+			RelativePath:   plannedRelativePath,
+			Size:           0,
+			SHA256:         "",
+			CreatedAt:      buildStartedAt.Format(time.RFC3339Nano),
+			State:          payloadStateBuilding,
+			StateDetail:    "",
+			ProvenanceJSON: []byte("{}"),
+		}); err != nil {
+			return PayloadResult{}, fmt.Errorf("persist building payload state: %w", err)
+		}
+		durableBuildID = payloadID
+		durableBuildStarted = true
+	}
+
 	log.Printf("[INFO] Starting build process...")
 	// Execute build command
-	output, err := cmd.CombinedOutput()
+	var output []byte
+	if h.runBuild != nil {
+		output, err = h.runBuild(cmd)
+	} else {
+		output, err = cmd.CombinedOutput()
+	}
 	if err != nil {
 		log.Printf("[ERROR] Build command failed: %v\nOutput: %s", err, output)
 
@@ -437,24 +646,7 @@ func (h *PayloadHandler) GeneratePayload(config PayloadConfig) (PayloadResult, e
 		}
 	}
 
-	// Determine payload filename
-	var payloadFileName string
-	switch {
-	case config.Format == "windows_exe":
-		payloadFileName = "agent.exe"
-	case config.Format == "windows_dll":
-		payloadFileName = "agent.dll"
-	case config.Format == "windows_service":
-		payloadFileName = "agent_service.exe"
-	case config.Format == "windows_shellcode":
-		payloadFileName = "shellcode.bin"
-	default:
-		payloadFileName = "agent"
-	}
-	log.Printf("[INFO] Payload filename: %s", payloadFileName)
-
 	// Find the generated payload
-	payloadPath := filepath.Join(outputDir, payloadFileName)
 	log.Printf("[INFO] Checking for payload at: %s", payloadPath)
 
 	// Check if file exists
@@ -510,6 +702,8 @@ func (h *PayloadHandler) GeneratePayload(config PayloadConfig) (PayloadResult, e
 		}
 	}
 
+	completedAt := time.Now().UTC()
+
 	// Persist build provenance next to the artifact so any payload is
 	// reproducible from (git revision, seed) (issue #99).
 	provenance := map[string]interface{}{
@@ -517,16 +711,28 @@ func (h *PayloadHandler) GeneratePayload(config PayloadConfig) (PayloadResult, e
 		"seed_generated_by_server": seedGenerated,
 		"git_revision":             gitRevision(h.agentSourceDir),
 		"target":                   buildTarget,
-		"built_at":                 time.Now().UTC().Format(time.RFC3339),
+		"built_at":                 completedAt.Format(time.RFC3339Nano),
 		"config_sha256":            fmt.Sprintf("%x", sha256.Sum256(configJSON)),
 		"mutation_flags":           []string{"config-xor-key", "junk-code", "surface-strings"},
 	}
 	if err := writeProvenance(filepath.Dir(payloadPath), provenance); err != nil {
 		log.Printf("[WARNING] Failed to write build provenance: %v", err)
 	}
+	provenanceJSON, err := json.Marshal(provenance)
+	if err != nil {
+		return PayloadResult{}, fmt.Errorf("marshal payload provenance: %w", err)
+	}
+	relativePath, err := h.relativeArtifactPath(payloadPath)
+	if err != nil {
+		return PayloadResult{}, err
+	}
+	artifactHash, err := hashArtifact(payloadPath)
+	if err != nil {
+		return PayloadResult{}, fmt.Errorf("hash payload artifact: %w", err)
+	}
 
 	// Create the result
-	result := PayloadResult{
+	result = PayloadResult{
 		ID:           payloadID,
 		PayloadID:    payloadID,
 		ListenerID:   listener.ID,
@@ -534,7 +740,19 @@ func (h *PayloadHandler) GeneratePayload(config PayloadConfig) (PayloadResult, e
 		Filename:     payloadFileName,
 		Path:         payloadPath,
 		Size:         fileInfo.Size(),
-		Created:      time.Now().Format(time.RFC3339),
+		Created:      completedAt.Format(time.RFC3339Nano),
+		relativePath: relativePath,
+		sha256:       artifactHash,
+		provenanceJSON: append(
+			json.RawMessage(nil),
+			provenanceJSON...,
+		),
+	}
+	if durableBuildStarted {
+		if err := h.completePayloadBuild(result); err != nil {
+			return PayloadResult{}, fmt.Errorf("persist completed payload state: %w", err)
+		}
+		durableBuildCompleted = true
 	}
 
 	log.Printf("[INFO] Successfully generated payload: %s (%s, %d bytes)",
@@ -543,42 +761,525 @@ func (h *PayloadHandler) GeneratePayload(config PayloadConfig) (PayloadResult, e
 	return result, nil
 }
 
-// loadListenerConfig loads a listener's configuration from its JSON file
-func (h *PayloadHandler) loadListenerConfig(listenerID string) (ListenerConfig, error) {
-	// Search through all listener directories to find one with a config matching our ID
-	entries, err := os.ReadDir(filepath.Join("static", "listeners"))
+// loadListenerConfig resolves a listener through the injected authoritative
+// lookup. Production uses ListenerManager; only the compatibility constructor
+// uses a filesystem adapter.
+func (h *PayloadHandler) loadListenerConfig(listenerID string) (listeners.ListenerConfig, error) {
+	return h.listenerLookup.LookupListener(listenerID)
+}
+
+func (h *PayloadHandler) beginPayloadBuild(record payloadBuildRecord) error {
+	if h.database == nil {
+		return errors.New("payload persistence database is unavailable")
+	}
+	if record.State != payloadStateBuilding {
+		return fmt.Errorf("initial payload state must be %q", payloadStateBuilding)
+	}
+	if len(record.ProvenanceJSON) == 0 || !json.Valid(record.ProvenanceJSON) {
+		return errors.New("initial payload provenance is invalid")
+	}
+
+	_, err := h.database.SQL().Exec(
+		`INSERT INTO payload_builds (
+			id, payload_id, listener_id, mutation_seed, filename,
+			relative_path, size, sha256, created_at, state,
+			state_detail, provenance_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		record.ID,
+		record.PayloadID,
+		record.ListenerID,
+		record.MutationSeed,
+		record.Filename,
+		record.RelativePath,
+		record.Size,
+		record.SHA256,
+		record.CreatedAt,
+		record.State,
+		record.StateDetail,
+		record.ProvenanceJSON,
+	)
 	if err != nil {
-		return ListenerConfig{}, fmt.Errorf("failed to read listeners directory: %w", err)
+		return fmt.Errorf("insert building payload metadata: %w", err)
+	}
+	return nil
+}
+
+func (h *PayloadHandler) completePayloadBuild(result PayloadResult) error {
+	if h.database == nil {
+		return errors.New("payload persistence database is unavailable")
+	}
+	if result.relativePath == "" ||
+		result.sha256 == "" ||
+		len(result.provenanceJSON) == 0 ||
+		!json.Valid(result.provenanceJSON) {
+		return errors.New("completed payload metadata is incomplete")
+	}
+	sqlResult, err := h.database.SQL().Exec(
+		`UPDATE payload_builds
+		 SET relative_path = ?,
+		     size = ?,
+		     sha256 = ?,
+		     created_at = ?,
+		     state = ?,
+		     state_detail = '',
+		     provenance_json = ?
+		 WHERE id = ? AND state = ?`,
+		result.relativePath,
+		result.Size,
+		result.sha256,
+		result.Created,
+		payloadStateCompleted,
+		result.provenanceJSON,
+		result.ID,
+		payloadStateBuilding,
+	)
+	if err != nil {
+		return fmt.Errorf("transition payload to completed: %w", err)
+	}
+	affected, err := sqlResult.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read completed payload transition result: %w", err)
+	}
+	if affected != 1 {
+		return fmt.Errorf("completed payload transition affected %d rows, want 1", affected)
+	}
+	return nil
+}
+
+func (h *PayloadHandler) failPayloadBuild(payloadID string) error {
+	if h.database == nil {
+		return nil
+	}
+	sqlResult, err := h.database.SQL().Exec(
+		`UPDATE payload_builds
+		 SET state = ?, state_detail = ?
+		 WHERE id = ? AND state = ?`,
+		payloadStateFailed,
+		payloadFailedDetail,
+		payloadID,
+		payloadStateBuilding,
+	)
+	if err != nil {
+		return fmt.Errorf("transition payload to failed: %w", err)
+	}
+	affected, err := sqlResult.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read failed payload transition result: %w", err)
+	}
+	if affected != 1 {
+		return fmt.Errorf("failed payload transition affected %d rows, want 1", affected)
+	}
+	return nil
+}
+
+func (h *PayloadHandler) interruptPayloadBuild(payloadID string) error {
+	if h.database == nil {
+		return nil
+	}
+	sqlResult, err := h.database.SQL().Exec(
+		`UPDATE payload_builds
+		 SET state = ?, state_detail = ?
+		 WHERE id = ? AND state = ?`,
+		payloadStateInterrupted,
+		payloadInterruptedDetail,
+		payloadID,
+		payloadStateBuilding,
+	)
+	if err != nil {
+		return fmt.Errorf("transition payload to interrupted: %w", err)
+	}
+	affected, err := sqlResult.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read interrupted payload transition result: %w", err)
+	}
+	if affected != 1 {
+		return fmt.Errorf("interrupted payload transition affected %d rows, want 1", affected)
+	}
+	return nil
+}
+
+func (h *PayloadHandler) lookupPayload(id string) (payloadBuildRecord, error) {
+	if h.database == nil {
+		h.mutex.Lock()
+		result, exists := h.payloads[id]
+		h.mutex.Unlock()
+		if !exists {
+			return payloadBuildRecord{}, sql.ErrNoRows
+		}
+		record := payloadBuildRecord{
+			ID:             result.ID,
+			PayloadID:      result.PayloadID,
+			ListenerID:     result.ListenerID,
+			MutationSeed:   result.MutationSeed,
+			Filename:       result.Filename,
+			RelativePath:   result.relativePath,
+			Size:           result.Size,
+			SHA256:         result.sha256,
+			CreatedAt:      result.Created,
+			State:          payloadStateCompleted,
+			ProvenanceJSON: append([]byte(nil), result.provenanceJSON...),
+		}
+		if record.RelativePath == "" {
+			relativePath, err := h.relativeArtifactPath(result.Path)
+			if err != nil {
+				return payloadBuildRecord{}, err
+			}
+			record.RelativePath = relativePath
+		}
+		if record.SHA256 == "" {
+			hash, err := hashArtifact(result.Path)
+			if err != nil {
+				return payloadBuildRecord{}, err
+			}
+			record.SHA256 = hash
+		}
+		return record, nil
 	}
 
-	// Look through each listener directory (named by listener name)
-	for _, entry := range entries {
-		if !entry.IsDir() {
+	record := payloadBuildRecord{}
+	err := h.database.SQL().QueryRow(
+		`SELECT
+			id, payload_id, listener_id, mutation_seed, filename,
+			relative_path, size, sha256, created_at, state,
+			state_detail, provenance_json
+		FROM payload_builds
+		WHERE id = ?`,
+		id,
+	).Scan(
+		&record.ID,
+		&record.PayloadID,
+		&record.ListenerID,
+		&record.MutationSeed,
+		&record.Filename,
+		&record.RelativePath,
+		&record.Size,
+		&record.SHA256,
+		&record.CreatedAt,
+		&record.State,
+		&record.StateDetail,
+		&record.ProvenanceJSON,
+	)
+	if err != nil {
+		return payloadBuildRecord{}, err
+	}
+	return record, nil
+}
+
+func (h *PayloadHandler) reconcilePayloads() error {
+	records, err := h.listPayloadRecords()
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		switch record.State {
+		case payloadStateBuilding:
+			if err := h.interruptPayloadBuild(record.ID); err != nil {
+				return fmt.Errorf("interrupt payload %s after restart: %w", record.ID, err)
+			}
+			continue
+		case payloadStateFailed, payloadStateInterrupted:
 			continue
 		}
-
-		configPath := filepath.Join("static", "listeners", entry.Name(), "config.json")
-		configData, err := os.ReadFile(configPath)
-		if err != nil {
-			log.Printf("[INFO] Skipping directory %s: %v", entry.Name(), err)
-			continue
-		}
-
-		// Try to parse the config
-		var config ListenerConfig
-		if err := json.Unmarshal(configData, &config); err != nil {
-			log.Printf("[WARNING] Failed to parse config in %s: %v", entry.Name(), err)
-			continue
-		}
-
-		// Verify this config has the ID we're looking for
-		if config.ID == listenerID {
-			log.Printf("[INFO] Found matching listener config in directory %s with ID %s", entry.Name(), listenerID)
-			return config, nil
+		_, state, detail, actualHash := h.revalidatePayload(record)
+		if err := h.updatePayloadState(record, state, detail, actualHash); err != nil {
+			return fmt.Errorf("reconcile payload %s: %w", record.ID, err)
 		}
 	}
+	return nil
+}
 
-	return ListenerConfig{}, fmt.Errorf("no listener found with ID %s", listenerID)
+func (h *PayloadHandler) listPayloadRecords() ([]payloadBuildRecord, error) {
+	rows, err := h.database.SQL().Query(
+		`SELECT
+			id, payload_id, listener_id, mutation_seed, filename,
+			relative_path, size, sha256, created_at, state,
+			state_detail, provenance_json
+		FROM payload_builds
+		ORDER BY id`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list payload metadata: %w", err)
+	}
+	defer rows.Close()
+
+	records := make([]payloadBuildRecord, 0)
+	for rows.Next() {
+		record := payloadBuildRecord{}
+		if err := rows.Scan(
+			&record.ID,
+			&record.PayloadID,
+			&record.ListenerID,
+			&record.MutationSeed,
+			&record.Filename,
+			&record.RelativePath,
+			&record.Size,
+			&record.SHA256,
+			&record.CreatedAt,
+			&record.State,
+			&record.StateDetail,
+			&record.ProvenanceJSON,
+		); err != nil {
+			return nil, fmt.Errorf("scan payload metadata: %w", err)
+		}
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate payload metadata: %w", err)
+	}
+	return records, nil
+}
+
+func (h *PayloadHandler) updatePayloadState(
+	record payloadBuildRecord,
+	state string,
+	detail string,
+	actualHash string,
+) error {
+	if h.database == nil {
+		return nil
+	}
+	if state != payloadStateCompleted &&
+		state != payloadStateMissing &&
+		state != payloadStateCorrupt {
+		return fmt.Errorf("unsupported reconciled payload state %q", state)
+	}
+	hash := record.SHA256
+	if state == payloadStateCompleted && hash == "" {
+		hash = actualHash
+	}
+	_, err := h.database.SQL().Exec(
+		`UPDATE payload_builds
+		 SET state = ?, state_detail = ?, sha256 = ?
+		 WHERE id = ?`,
+		state,
+		detail,
+		hash,
+		record.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("update payload state: %w", err)
+	}
+	return nil
+}
+
+func (h *PayloadHandler) revalidatePayload(
+	record payloadBuildRecord,
+) (artifactPath string, state string, detail string, actualHash string) {
+	file, state, detail, actualHash := h.openVerifiedPayload(record)
+	if file == nil {
+		return "", state, detail, actualHash
+	}
+	artifactPath = file.Name()
+	if err := file.Close(); err != nil {
+		return "", payloadStateCorrupt, "artifact cannot be closed after verification", ""
+	}
+	return artifactPath, state, detail, actualHash
+}
+
+func (h *PayloadHandler) openVerifiedPayload(
+	record payloadBuildRecord,
+) (file *os.File, state string, detail string, actualHash string) {
+	if len(record.ProvenanceJSON) == 0 || !json.Valid(record.ProvenanceJSON) {
+		return nil, payloadStateCorrupt, "payload provenance is invalid", ""
+	}
+	if !validPayloadFilename(record.Filename) {
+		return nil, payloadStateCorrupt, "payload filename is invalid", ""
+	}
+	artifactPath, err := h.resolveArtifactPath(record.RelativePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, payloadStateMissing, "artifact is missing", ""
+		}
+		return nil, payloadStateCorrupt, err.Error(), ""
+	}
+	if filepath.Base(artifactPath) != record.Filename {
+		return nil, payloadStateCorrupt, "artifact filename does not match metadata", ""
+	}
+
+	file, err = openPayloadArtifact(artifactPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, payloadStateMissing, "artifact is missing", ""
+		}
+		return nil, payloadStateCorrupt, "artifact cannot be opened", ""
+	}
+	closeAsCorrupt := func(detail string) (*os.File, string, string, string) {
+		_ = file.Close()
+		return nil, payloadStateCorrupt, detail, ""
+	}
+
+	info, err := file.Stat()
+	if err != nil {
+		return closeAsCorrupt("artifact cannot be inspected")
+	}
+	if !info.Mode().IsRegular() {
+		return closeAsCorrupt("artifact is not a regular file")
+	}
+	if info.Size() != record.Size {
+		return closeAsCorrupt("artifact size does not match metadata")
+	}
+	actualHash, err = hashOpenArtifact(file)
+	if err != nil {
+		return closeAsCorrupt("artifact cannot be hashed")
+	}
+	if record.SHA256 != "" && actualHash != record.SHA256 {
+		_ = file.Close()
+		return nil, payloadStateCorrupt, "artifact SHA-256 does not match metadata", actualHash
+	}
+	infoAfterHash, err := file.Stat()
+	if err != nil ||
+		!infoAfterHash.Mode().IsRegular() ||
+		infoAfterHash.Size() != record.Size {
+		return closeAsCorrupt("artifact changed during verification")
+	}
+	return file, payloadStateCompleted, "", actualHash
+}
+
+func payloadFilename(format string) string {
+	switch format {
+	case "windows_exe":
+		return "agent.exe"
+	case "windows_dll":
+		return "agent.dll"
+	case "windows_service":
+		return "agent_service.exe"
+	case "windows_shellcode":
+		return "shellcode.bin"
+	default:
+		return "agent"
+	}
+}
+
+func (h *PayloadHandler) plannedRelativeArtifactPath(artifactPath string) (string, error) {
+	absoluteArtifactPath, err := filepath.Abs(artifactPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve planned artifact path: %w", err)
+	}
+	relativePath, err := filepath.Rel(h.payloadsDir, absoluteArtifactPath)
+	if err != nil || !isContainedRelativePath(relativePath) {
+		return "", errors.New("planned payload artifact is outside the configured payload root")
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(h.payloadsDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve payload root: %w", err)
+	}
+	resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(absoluteArtifactPath))
+	if err != nil {
+		return "", fmt.Errorf("resolve planned artifact directory: %w", err)
+	}
+	resolvedRelative, err := filepath.Rel(resolvedRoot, resolvedParent)
+	if err != nil || (resolvedRelative != "." && !isContainedRelativePath(resolvedRelative)) {
+		return "", errors.New("planned payload artifact resolves outside the configured payload root")
+	}
+	return filepath.ToSlash(relativePath), nil
+}
+
+func (h *PayloadHandler) relativeArtifactPath(artifactPath string) (string, error) {
+	absoluteArtifactPath, err := filepath.Abs(artifactPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve artifact path: %w", err)
+	}
+	relativePath, err := filepath.Rel(h.payloadsDir, absoluteArtifactPath)
+	if err != nil || !isContainedRelativePath(relativePath) {
+		return "", errors.New("payload artifact is outside the configured payload root")
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(h.payloadsDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve payload root: %w", err)
+	}
+	resolvedArtifact, err := filepath.EvalSymlinks(absoluteArtifactPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve payload artifact: %w", err)
+	}
+	resolvedRelative, err := filepath.Rel(resolvedRoot, resolvedArtifact)
+	if err != nil || !isContainedRelativePath(resolvedRelative) {
+		return "", errors.New("payload artifact resolves outside the configured payload root")
+	}
+	return filepath.ToSlash(relativePath), nil
+}
+
+func (h *PayloadHandler) resolveArtifactPath(relativePath string) (string, error) {
+	if relativePath == "" || filepath.IsAbs(relativePath) {
+		return "", errors.New("artifact path is not a contained relative path")
+	}
+	nativeRelativePath := filepath.FromSlash(relativePath)
+	if !isContainedRelativePath(nativeRelativePath) {
+		return "", errors.New("artifact path is not a contained relative path")
+	}
+	artifactPath := filepath.Join(h.payloadsDir, nativeRelativePath)
+	lexicalRelative, err := filepath.Rel(h.payloadsDir, artifactPath)
+	if err != nil || !isContainedRelativePath(lexicalRelative) {
+		return "", errors.New("artifact path escapes the configured payload root")
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(h.payloadsDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve payload root: %w", err)
+	}
+	resolvedArtifact, err := filepath.EvalSymlinks(artifactPath)
+	if err != nil {
+		return "", err
+	}
+	resolvedRelative, err := filepath.Rel(resolvedRoot, resolvedArtifact)
+	if err != nil || !isContainedRelativePath(resolvedRelative) {
+		return "", errors.New("artifact path resolves outside the configured payload root")
+	}
+	return resolvedArtifact, nil
+}
+
+func isContainedRelativePath(path string) bool {
+	if path == "" || path == "." || filepath.IsAbs(path) || path == ".." {
+		return false
+	}
+	return !strings.HasPrefix(path, ".."+string(filepath.Separator))
+}
+
+func validPayloadFilename(filename string) bool {
+	return filename != "" &&
+		filename == filepath.Base(filename) &&
+		!strings.ContainsAny(filename, "\r\n\x00")
+}
+
+func validPayloadID(id string) bool {
+	if id == "" || len(id) > 128 || id != strings.TrimSpace(id) {
+		return false
+	}
+	for _, character := range id {
+		if character >= 'a' && character <= 'z' ||
+			character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' ||
+			character == '-' || character == '_' || character == '.' || character == ':' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func hashArtifact(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	return hashOpenArtifact(file)
+}
+
+func hashOpenArtifact(file *os.File) (string, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
+func openPayloadArtifact(path string) (*os.File, error) {
+	return os.Open(filepath.Clean(path))
 }
 
 // RegisterRoutes registers all payload-related routes on the provided mux.

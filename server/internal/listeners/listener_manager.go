@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"log"
 	"microc2/server/internal/common"
+	"microc2/server/internal/persistence"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -14,30 +16,127 @@ import (
 	"github.com/google/uuid"
 )
 
+const scopedAgentKeyDelimiter = "/"
+
 // ListenerManager handles the creation, management, and tracking of protocol listeners.
 // It maintains a thread-safe registry of all active and stopped listeners.
 type ListenerManager struct {
-	listeners map[string]*Listener
-	protocol  common.Protocol
-	mu        sync.RWMutex
+	listeners    map[string]*Listener
+	protocol     common.Protocol
+	listenersDir string
+	database     *persistence.Database
+	now          func() time.Time
+	mu           sync.RWMutex
 }
 
 // NewListenerManager creates a new listener manager instance
 func NewListenerManager(proto common.Protocol) *ListenerManager {
+	manager, err := newListenerManager(
+		proto,
+		filepath.Join("static", "listeners"),
+		nil,
+		time.Now,
+	)
+	if err != nil {
+		log.Printf("[WARNING] Failed to load listener configurations: %v", err)
+		return &ListenerManager{
+			listeners:    make(map[string]*Listener),
+			protocol:     proto,
+			listenersDir: filepath.Join("static", "listeners"),
+			now:          time.Now,
+		}
+	}
+	return manager
+}
+
+// NewListenerManagerWithPersistence constructs a manager backed by the shared
+// durable database. Startup fails if durable listener state cannot be
+// reconciled with the saved configuration directory.
+func NewListenerManagerWithPersistence(
+	proto common.Protocol,
+	listenersDir string,
+	database *persistence.Database,
+) (*ListenerManager, error) {
+	return newListenerManager(proto, listenersDir, database, time.Now)
+}
+
+func newListenerManager(
+	proto common.Protocol,
+	listenersDir string,
+	database *persistence.Database,
+	now func() time.Time,
+) (*ListenerManager, error) {
+	if listenersDir == "" {
+		listenersDir = filepath.Join("static", "listeners")
+	}
+	if now == nil {
+		now = time.Now
+	}
 	manager := &ListenerManager{
-		listeners: make(map[string]*Listener),
-		protocol:  proto,
+		listeners:    make(map[string]*Listener),
+		protocol:     proto,
+		listenersDir: listenersDir,
+		database:     database,
+		now:          now,
 	}
 
-	// Load saved listener configurations
-	listenersDir := filepath.Join("static", "listeners")
+	if err := ensurePrivateDirectory(listenersDir); err != nil {
+		return nil, fmt.Errorf("prepare listeners directory: %w", err)
+	}
+
+	durableConfigs, tombstonedIDs, tombstonedNames, err :=
+		manager.loadAndRecoverDurableListeners()
+	if err != nil {
+		return nil, fmt.Errorf("load durable listeners: %w", err)
+	}
+	for _, config := range durableConfigs {
+		if _, duplicate := manager.listeners[config.ID]; duplicate {
+			return nil, fmt.Errorf("duplicate durable listener ID %q", config.ID)
+		}
+		if manager.hasNameConflict(config) {
+			return nil, fmt.Errorf(
+				"durable listener name %q is registered more than once",
+				config.Name,
+			)
+		}
+
+		listener, err := newListener(config, listenersDir, database, false)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"create durable listener runtime %s: %w",
+				config.ID,
+				err,
+			)
+		}
+		if err := writeListenerConfigProjection(
+			listenersDir,
+			config,
+			true,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"write durable listener projection %s: %w",
+				config.ID,
+				err,
+			)
+		}
+		manager.attachListenerCallbacks(listener)
+		manager.listeners[config.ID] = listener
+		log.Printf(
+			"[INFO] Loaded durable listener: %s (ID: %s)",
+			config.Name,
+			config.ID,
+		)
+	}
+
+	// Import only valid configurations that are not already represented by an
+	// authoritative durable row.
 	entries, err := os.ReadDir(listenersDir)
 	if err != nil {
-		if !os.IsNotExist(err) {
-			log.Printf("[WARNING] Failed to read listeners directory: %v", err)
-		}
-		return manager
+		return nil, fmt.Errorf("read listeners directory: %w", err)
 	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name() < entries[j].Name()
+	})
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -46,7 +145,7 @@ func NewListenerManager(proto common.Protocol) *ListenerManager {
 
 		// Check for config file
 		configPath := filepath.Join(listenersDir, entry.Name(), "config.json")
-		configData, err := os.ReadFile(configPath)
+		configData, err := readListenerConfigProjection(configPath)
 		if err != nil {
 			log.Printf("[WARNING] Failed to read config for listener %s: %v", entry.Name(), err)
 			continue
@@ -57,19 +156,79 @@ func NewListenerManager(proto common.Protocol) *ListenerManager {
 			log.Printf("[WARNING] Failed to parse config for listener %s: %v", entry.Name(), err)
 			continue
 		}
+		config.Protocol = strings.ToLower(config.Protocol)
+		if err := validateListenerIdentity(config); err != nil {
+			if database != nil {
+				return nil, fmt.Errorf(
+					"saved listener identity in %s is unsafe: %w",
+					configPath,
+					err,
+				)
+			}
+			log.Printf("[WARNING] Saved listener %s has an unsafe identity; skipping", entry.Name())
+			continue
+		}
+		if err := manager.validateListenerConfig(config); err != nil {
+			log.Print("[WARNING] Saved listener configuration is invalid; skipping")
+			continue
+		}
+		if entry.Name() != config.Name {
+			if database != nil {
+				return nil, fmt.Errorf(
+					"saved listener directory %q does not match config name %q",
+					entry.Name(),
+					config.Name,
+				)
+			}
+			log.Print("[WARNING] Saved listener directory does not match its config name; skipping")
+			continue
+		}
+		if _, tombstoned := tombstonedIDs[config.ID]; tombstoned {
+			log.Print("[INFO] Ignoring tombstoned listener configuration")
+			continue
+		}
+		if _, tombstoned := tombstonedNames[strings.ToLower(config.Name)]; tombstoned {
+			log.Print("[INFO] Ignoring listener configuration with a tombstoned name")
+			continue
+		}
+		if _, duplicate := manager.listeners[config.ID]; duplicate {
+			log.Print("[INFO] Ignoring compatibility projection for a durable listener")
+			continue
+		}
+		if manager.hasNameConflict(config) {
+			log.Print("[WARNING] Duplicate saved listener name; skipping")
+			continue
+		}
 
-		listener, err := NewListener(config)
+		listener, err := newListener(config, listenersDir, database, false)
 		if err != nil {
 			log.Printf("[WARNING] Failed to create listener instance for %s: %v", config.Name, err)
 			continue
 		}
+		if database != nil {
+			if err := manager.recordListenerImported(config); err != nil {
+				return nil, fmt.Errorf("import listener %s: %w", config.ID, err)
+			}
+			if err := writeListenerConfigProjection(
+				listenersDir,
+				config,
+				true,
+			); err != nil {
+				return nil, fmt.Errorf(
+					"write imported listener projection %s: %w",
+					config.ID,
+					err,
+				)
+			}
+		}
+		manager.attachListenerCallbacks(listener)
 
 		// Add to manager without starting
 		manager.listeners[config.ID] = listener
 		log.Printf("[INFO] Loaded saved configuration for listener: %s (ID: %s)", config.Name, config.ID)
 	}
 
-	return manager
+	return manager, nil
 }
 
 // GetProtocol returns the protocol instance associated with the manager
@@ -104,19 +263,89 @@ func (m *ListenerManager) CreateListener(config ListenerConfig) (*Listener, erro
 		return nil, fmt.Errorf("port %d is already used by an active listener", config.Port)
 	}
 
-	listener, err := NewListener(config)
+	listener, err := newListener(
+		config,
+		m.listenersDir,
+		m.database,
+		m.database == nil,
+	)
 	if err != nil {
 		return nil, err
 	}
-	if err := listener.Start(); err != nil {
-		listenerDir := filepath.Join("static", "listeners", config.Name)
-		if cleanupErr := os.RemoveAll(listenerDir); cleanupErr != nil {
-			log.Printf("[WARNING] Failed to cleanup listener directory %s after start failure: %v", listenerDir, cleanupErr)
-		}
-		return nil, err
+	m.attachListenerCallbacks(listener)
+	if err := m.recordListenerCreated(config); err != nil {
+		m.cleanupListenerConfig(config.Name)
+		return nil, fmt.Errorf("persist listener creation: %w", err)
 	}
+	// Once the durable row commits, keep the runtime registered until the
+	// listener either starts successfully or that row is tombstoned. This
+	// prevents any cleanup failure from leaving a hidden nondeleted listener
+	// that a same-name retry could duplicate.
 	m.listeners[config.ID] = listener
+	if m.database != nil {
+		if err := writeListenerConfigProjection(
+			m.listenersDir,
+			config,
+			true,
+		); err != nil {
+			return nil, m.failCreatedListener(
+				listener,
+				fmt.Errorf("write listener compatibility projection: %w", err),
+			)
+		}
+	}
+	if err := listener.Start(); err != nil {
+		return nil, m.failCreatedListener(listener, err)
+	}
+	if err := m.recordListenerState(config.ID, StatusActive, "started", "", false); err != nil {
+		if stopErr := listener.Stop(); stopErr != nil {
+			log.Printf("[WARNING] Failed to stop listener after persistence error: %v", stopErr)
+		}
+		return nil, m.failCreatedListener(
+			listener,
+			fmt.Errorf("persist listener start: %w", err),
+		)
+	}
 	return listener, nil
+}
+
+// failCreatedListener compensates for a failure after the initial durable
+// creation record committed. If the tombstone cannot be committed, the
+// runtime deliberately remains registered so another create cannot hide or
+// duplicate the durable row.
+//
+// The caller must hold m.mu.
+func (m *ListenerManager) failCreatedListener(
+	listener *Listener,
+	cause error,
+) error {
+	if listener == nil {
+		return cause
+	}
+
+	if m.database != nil {
+		if err := m.recordListenerState(
+			listener.Config.ID,
+			StatusError,
+			"creation_failed",
+			cause.Error(),
+			true,
+		); err != nil {
+			listener.mu.Lock()
+			listener.Status = StatusError
+			listener.Error = cause.Error()
+			listener.mu.Unlock()
+			return fmt.Errorf(
+				"%w; failed to tombstone durable listener: %v",
+				cause,
+				err,
+			)
+		}
+	}
+
+	delete(m.listeners, listener.Config.ID)
+	m.cleanupListenerConfig(listener.Config.Name)
+	return cause
 }
 
 // AddListener adds a new listener to the manager
@@ -175,6 +404,9 @@ func (m *ListenerManager) ListListeners() []*Listener {
 	for _, listener := range m.listeners {
 		list = append(list, listener)
 	}
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].Config.ID < list[j].Config.ID
+	})
 	return list
 }
 
@@ -201,6 +433,8 @@ func (m *ListenerManager) RemoveListener(id string) error {
 	if listener.GetStatus() == StatusActive || listener.GetStatus() == StatusError {
 		if err := listener.Stop(); err != nil {
 			log.Printf("[WARNING] Failed to stop listener %s: %v", id, err)
+		} else if err := m.recordListenerState(id, StatusStopped, "stopped", "", false); err != nil {
+			return fmt.Errorf("persist stopped listener: %w", err)
 		}
 	}
 
@@ -234,6 +468,9 @@ func (m *ListenerManager) StopListener(id string) error {
 
 	if err := listener.Stop(); err != nil {
 		return fmt.Errorf("failed to stop listener: %w", err)
+	}
+	if err := m.recordListenerState(id, StatusStopped, "stopped", "", false); err != nil {
+		return fmt.Errorf("persist stopped listener: %w", err)
 	}
 
 	return nil
@@ -275,7 +512,22 @@ func (m *ListenerManager) StartListener(id string) error {
 
 	// Start the listener
 	if err := listener.Start(); err != nil {
+		if persistErr := m.recordListenerState(
+			id,
+			StatusError,
+			"error",
+			err.Error(),
+			false,
+		); persistErr != nil {
+			log.Printf("[WARNING] Failed to persist listener start error: %v", persistErr)
+		}
 		return fmt.Errorf("failed to start listener: %w", err)
+	}
+	if err := m.recordListenerState(id, StatusActive, "started", "", false); err != nil {
+		if stopErr := listener.Stop(); stopErr != nil {
+			log.Printf("[WARNING] Failed to stop listener after persistence error: %v", stopErr)
+		}
+		return fmt.Errorf("persist started listener: %w", err)
 	}
 
 	return nil
@@ -305,10 +557,17 @@ func (m *ListenerManager) DeleteListener(id string) error {
 		if err := listener.Stop(); err != nil {
 			return fmt.Errorf("failed to stop listener before deletion: %v", err)
 		}
+		if err := m.recordListenerState(id, StatusStopped, "stopped", "", false); err != nil {
+			return fmt.Errorf("persist stopped listener before deletion: %w", err)
+		}
 	}
 
-	// Clean up listener directory
-	listenerDir := filepath.Join("static", "listeners", listener.Config.Name)
+	if err := m.recordListenerState(id, StatusStopped, "deleted", "", true); err != nil {
+		return fmt.Errorf("persist deleted listener: %w", err)
+	}
+	// Clean up listener directory after the tombstone commits. If filesystem
+	// cleanup fails, startup reconciliation still refuses to resurrect it.
+	listenerDir := filepath.Join(m.listenersDir, listener.Config.Name)
 	if err := os.RemoveAll(listenerDir); err != nil {
 		log.Printf("[WARNING] Failed to cleanup listener directory %s: %v", listenerDir, err)
 	}
@@ -336,6 +595,8 @@ func (m *ListenerManager) StopAll() []error {
 		if listener.GetStatus() == StatusActive || listener.GetStatus() == StatusError {
 			if err := listener.Stop(); err != nil {
 				errors = append(errors, fmt.Errorf("failed to stop listener %s: %v", id, err))
+			} else if err := m.recordListenerState(id, StatusStopped, "stopped", "", false); err != nil {
+				errors = append(errors, fmt.Errorf("persist stopped listener %s: %v", id, err))
 			}
 		}
 	}
@@ -362,6 +623,14 @@ func (m *ListenerManager) DeleteAll() []error {
 				errors = append(errors, fmt.Errorf("failed to stop listener %s: %v", id, err))
 				continue // Skip deletion if stopping fails
 			}
+			if err := m.recordListenerState(id, StatusStopped, "stopped", "", false); err != nil {
+				errors = append(errors, fmt.Errorf("persist stopped listener %s: %v", id, err))
+				continue
+			}
+		}
+		if err := m.recordListenerState(id, StatusStopped, "deleted", "", true); err != nil {
+			errors = append(errors, fmt.Errorf("persist deleted listener %s: %v", id, err))
+			continue
 		}
 		delete(m.listeners, id)
 	}
@@ -376,9 +645,9 @@ func (m *ListenerManager) DeleteAll() []error {
 // Post-conditions:
 //   - Returns error if the configuration is invalid
 func (m *ListenerManager) validateListenerConfig(config ListenerConfig) error {
-	if config.Name == "" {
-		log.Printf("[ERROR] Listener validation failed: name is required")
-		return fmt.Errorf("listener name is required")
+	if err := validateListenerIdentity(config); err != nil {
+		log.Printf("[ERROR] Listener identity validation failed")
+		return err
 	}
 
 	if config.Protocol == "" {
@@ -407,7 +676,7 @@ func (m *ListenerManager) validateListenerConfig(config ListenerConfig) error {
 		}
 	}
 
-	log.Printf("[INFO] Listener configuration validated successfully: %+v", config)
+	log.Print("[INFO] Listener configuration validated successfully")
 	return nil
 }
 
@@ -432,7 +701,7 @@ func (m *ListenerManager) hasPortConflict(config ListenerConfig) bool {
 
 func (m *ListenerManager) hasNameConflict(config ListenerConfig) bool {
 	for id, l := range m.listeners {
-		if l.Config.Name == config.Name && id != config.ID {
+		if strings.EqualFold(l.Config.Name, config.Name) && id != config.ID {
 			log.Printf("[WARN] Name conflict detected: listener %q is already registered as %s", config.Name, id)
 			return true
 		}
@@ -450,6 +719,11 @@ func (m *ListenerManager) hasNameConflict(config ListenerConfig) bool {
 func (m *ListenerManager) CleanupInactive(threshold time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.database != nil {
+		// Keep stopped durable listeners available for operator lifecycle
+		// actions and authoritative payload-build configuration lookup.
+		return
+	}
 
 	now := time.Now()
 	for id, listener := range m.listeners {
@@ -467,7 +741,7 @@ func (m *ListenerManager) CleanupInactive(threshold time.Duration) {
 
 // LoadSavedListener loads a saved listener configuration from disk
 func (m *ListenerManager) LoadSavedListener(configPath string) (*Listener, error) {
-	configData, err := os.ReadFile(configPath)
+	configData, err := readListenerConfigProjection(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file: %v", err)
 	}
@@ -478,27 +752,82 @@ func (m *ListenerManager) LoadSavedListener(configPath string) (*Listener, error
 	}
 
 	config.Protocol = strings.ToLower(config.Protocol)
-	listener, err := NewListener(config)
+	listener, err := newListener(config, m.listenersDir, m.database, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create listener: %v", err)
 	}
+	m.attachListenerCallbacks(listener)
 
 	return listener, nil
+}
+
+func (m *ListenerManager) attachListenerCallbacks(listener *Listener) {
+	if listener == nil || m.database == nil {
+		return
+	}
+	listenerID := listener.Config.ID
+	listener.mu.Lock()
+	listener.onError = func(listenerErr error) {
+		message := "unknown listener error"
+		if listenerErr != nil {
+			message = listenerErr.Error()
+		}
+		if err := m.recordListenerState(
+			listenerID,
+			StatusError,
+			"error",
+			message,
+			false,
+		); err != nil {
+			log.Printf(
+				"[WARNING] Failed to persist listener %s error: %v",
+				listenerID,
+				err,
+			)
+		}
+	}
+	listener.mu.Unlock()
 }
 
 // AllAgents returns a combined map of all agents from all listeners
 func (m *ListenerManager) AllAgents() map[string]interface{} {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	allAgents := make(map[string]interface{})
-	for _, listener := range m.listeners {
+
+	type scopedAgent struct {
+		listenerID string
+		agentID    string
+		value      interface{}
+	}
+	listenerIDs := make([]string, 0, len(m.listeners))
+	for listenerID := range m.listeners {
+		listenerIDs = append(listenerIDs, listenerID)
+	}
+	sort.Strings(listenerIDs)
+	var collected []scopedAgent
+	counts := make(map[string]int)
+	for _, listenerID := range listenerIDs {
+		listener := m.listeners[listenerID]
 		if listener.Protocol != nil {
 			if agenter, ok := listener.Protocol.(interface{ GetAllAgents() map[string]interface{} }); ok {
 				for id, agent := range agenter.GetAllAgents() {
-					allAgents[id] = agent
+					counts[id]++
+					collected = append(collected, scopedAgent{
+						listenerID: listenerID,
+						agentID:    id,
+						value:      agent,
+					})
 				}
 			}
 		}
+	}
+	allAgents := make(map[string]interface{}, len(collected))
+	for _, agent := range collected {
+		key := agent.agentID
+		if counts[key] > 1 {
+			key = agent.listenerID + scopedAgentKeyDelimiter + agent.agentID
+		}
+		allAgents[key] = agent.value
 	}
 	return allAgents
 }

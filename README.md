@@ -81,6 +81,7 @@ This framework can be used to:
 
 - [Architecture](docs/architecture.md)
 - [Design notes](docs/design.md)
+- [Durable storage, recovery, and backup](docs/storage.md)
 - [Roadmap](docs/roadmap.md)
 - [Development workflow and CI](docs/development-workflow.md)
 
@@ -189,6 +190,10 @@ This framework was built by someone running on way too much caffeine. If you enc
 
 ### Configuration
 - Edit `server/config/settings.yaml` for server settings.
+- Durable server state defaults to `server/data/microc2.db` when the server is
+  launched from `server/`. Keep `storage.path` outside `server.staticDir`; use
+  `MICROC2_STORAGE_PATH` for an environment-specific override. See
+  [Durable storage, recovery, and backup](docs/storage.md).
 - Edit `agent/src/config.rs` or use environment variables for agent configuration.
 
 ### Safe lab defaults

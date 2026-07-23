@@ -120,8 +120,10 @@ Focus areas:
 - Define a typed task model for shell, file transfer, pivot control, heartbeat,
   and future module tasks.
 - Replace raw string-only tasking as the primary API.
-- Store agents, tasks, results, files, listener events, and audit records
-  durably.
+- Store agents, tasks, results, payload metadata, and listener events durably;
+  keep filesystem artifacts covered by coordinated backup and restore.
+- Add actor-aware audit records as a distinct layer on top of durable
+  operational state.
 - Build a consistent UI flow for agents, tasking, results, files, listeners,
   payloads, and logs.
 - Add task status transitions: queued, dispatched, running, completed, failed,
@@ -141,11 +143,12 @@ Candidate issues:
 
 - #98 `[Server/Agent] Replace raw string command dispatch with typed task and
   result schemas` — shell task contract v1, bounded summary pages, and
-  on-demand full results are the Phase 1 foundation.
+  on-demand full results are the completed Phase 1 foundation.
 - #104 `[Security] Bind agent tasking to authenticated enrollment sessions` —
   P0 gate before task listeners are exposed beyond an isolated lab.
 - #97 `[Server] Add durable storage for agents, tasks, results, payloads, and
-  listener events`
+  listener events` — implementation is in progress on the development branch;
+  review and CI are still required before merging it into `dev`.
 - #100 `[Server] Add structured audit events for operator actions and agent
   tasking`
 - #88 `[Agent] Wire file transfer and pivot controls into command dispatch` —
@@ -370,17 +373,18 @@ detection, Internet-scale botnet market measurement.
 
 Recommended next sequence:
 
-1. Finish #98 so shell tasking uses the versioned, retry-safe typed task/result
-   contract end to end.
-2. Complete #104 before any promotion beyond an isolated lab, binding agent
-   tasking to authenticated enrollment sessions.
-3. Build #97 on the typed contract so agents, task lifecycles, results, payload
-   metadata, and listener events survive restart.
-4. Add #100 on the durable model so operator and agent actions have causal,
+1. Review, validate, and merge #97 into `dev` so agents, task lifecycles,
+   results, payload metadata, and listener events survive restart. This follows
+   the completed #98 typed task/result foundation.
+2. Complete #104 so agent lifecycle and tasking are bound to authenticated
+   enrollment sessions before listener exposure expands or any stable
+   promotion is considered.
+3. Add #100 on the durable model so operator and agent actions have causal,
    reviewable audit events.
-5. Tackle #88 after #98, adding file transfer and pivot operations as explicit
+4. Tackle #88 after #98, adding file transfer and pivot operations as explicit
    task types instead of new string commands.
 
-The data path is **#98 → #97 → #100**. Issue #104 is a parallel P0 security
-gate before promotion, and #99 remains a bounded P1 payload-quality track that
-can proceed alongside it.
+The data path is **#98 → #97 → #100**, but the operational priority after #97
+is the #104 P0 security gate. It must be completed before considering any
+`dev` to `main` promotion; no such promotion is part of this sequence. Issue
+#99 remains a bounded P1 payload-quality track that can proceed alongside it.

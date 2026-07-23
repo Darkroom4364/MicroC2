@@ -36,6 +36,10 @@ const (
 	// result envelope without stranding an agent's outbox.
 	MaxTaskResultBodyBytes   = 32 << 20
 	MaxLegacyResultBodyBytes = 10 << 20
+	// MaxLegacyResultPageBytes bounds the deprecated operator result page.
+	// Durable paging applies this budget while rows are read so a legal page
+	// cannot first materialize hundreds of multi-megabyte result strings.
+	MaxLegacyResultPageBytes = 16 << 20
 )
 
 type Type string

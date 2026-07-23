@@ -2,6 +2,7 @@
 /agent/target/*
 /agent/static/payloads/*
 /server/server
+/server/data/
 /server/target/*
 /server/Cargo.lock
 /server/server.log

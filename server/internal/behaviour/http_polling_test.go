@@ -96,6 +96,30 @@ func TestHTTPPollingProtocolAgentLifecycle(t *testing.T) {
 	}
 }
 
+func TestHTTPPollingProtocolRejectsOversizedHeartbeat(t *testing.T) {
+	proto := NewHTTPPollingProtocol(common.BaseProtocolConfig{
+		UploadDir: t.TempDir(),
+		Port:      "0",
+	})
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/agent/agent-one/heartbeat",
+		strings.NewReader(strings.Repeat("x", maxAgentHeartbeatBodyBytes+1)),
+	)
+	response := httptest.NewRecorder()
+
+	proto.GetHTTPHandler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf(
+			"oversized heartbeat status = %d, want %d: %s",
+			response.Code,
+			http.StatusRequestEntityTooLarge,
+			response.Body.String(),
+		)
+	}
+}
+
 func TestHTTPPollingProtocolTypedTaskLifecycle(t *testing.T) {
 	proto := NewHTTPPollingProtocol(common.BaseProtocolConfig{UploadDir: t.TempDir(), Port: "0"})
 	handler := proto.GetHTTPHandler()

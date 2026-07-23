@@ -1,6 +1,13 @@
 package payload
 
-import "sync"
+import (
+	"encoding/json"
+	"os/exec"
+	"sync"
+
+	"microc2/server/internal/listeners"
+	"microc2/server/internal/persistence"
+)
 
 // PayloadConfig defines the structure for payload generation configuration
 type PayloadConfig struct {
@@ -49,33 +56,28 @@ type PayloadResult struct {
 	Path         string `json:"path"`
 	Size         int64  `json:"size"`
 	Created      string `json:"created"`
+
+	relativePath   string
+	sha256         string
+	provenanceJSON json.RawMessage
 }
 
-// TLSConfig holds TLS configuration for secure listeners
-type TLSConfig struct {
-	CertFile          string `json:"cert_file"`
-	KeyFile           string `json:"key_file"`
-	RequireClientCert bool   `json:"requireClientCert"`
+// ListenerLookup resolves the authoritative listener configuration used for a
+// build. Production wiring supplies the listener manager through a small
+// adapter; payload generation never scans listener files itself.
+type ListenerLookup interface {
+	LookupListener(listenerID string) (listeners.ListenerConfig, error)
 }
 
 // PayloadHandler manages payload generation operations
 type PayloadHandler struct {
 	payloadsDir    string
 	agentSourceDir string
+	listenerLookup ListenerLookup
+	database       *persistence.Database
+	initErr        error
+	runBuild       func(*exec.Cmd) ([]byte, error)
+	afterVerified  func()
 	mutex          sync.Mutex
 	payloads       map[string]PayloadResult
-}
-
-// ListenerConfig represents the configuration of a listener
-type ListenerConfig struct {
-	ID           string            `json:"id"`
-	Name         string            `json:"name"`
-	Protocol     string            `json:"protocol"`
-	BindHost     string            `json:"host"`
-	Port         int               `json:"port"`
-	Headers      map[string]string `json:"headers,omitempty"`
-	UserAgent    string            `json:"user_agent,omitempty"`
-	HostRotation string            `json:"host_rotation,omitempty"`
-	Hosts        []string          `json:"hosts,omitempty"`
-	TLSConfig    *TLSConfig        `json:"tls_config,omitempty"`
 }

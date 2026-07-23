@@ -3,7 +3,7 @@
 MicroC2 is an academic C2 research testbed for controlled, authorized lab
 environments. The current implementation is a Go management server, a Rust
 agent, and a static browser UI. It is useful as a prototype and research base,
-but several security, persistence, tasking, and transport boundaries are still
+but several security, audit, task-family, and transport boundaries are still
 being stabilized.
 
 This document describes the repository as it exists today. It deliberately marks
@@ -17,15 +17,15 @@ Operator browser
   |  HTTPS + WebSocket
   v
 Go server / operator API
-  |  creates listeners, queues typed tasks, stores files and payload builds
+  |-- SQLite: listeners/events, agents, tasks/results, payload metadata
+  |-- filesystem: listener configs, payload artifacts, uploads, logs
+  |  creates listeners and queues typed tasks
   v
 HTTP(S) listener instances
   |  polling endpoints
   v
 Rust agents
   |  heartbeat, task poll, status update, result submission
-  v
-In-memory task/result state on the server
 ```
 
 The server process now keeps an explicit operator mux for the browser UI,
@@ -40,6 +40,8 @@ multi-user authorization system.
 | --- | --- |
 | `server/cmd/server.go` | Server entry point, config loading, route registration, TLS startup. |
 | `server/config/` | YAML config types and defaults for the Go server. |
+| `server/internal/persistence/` | Process-wide SQLite bootstrap, durability settings, and embedded migrations. |
+| `server/internal/tasks/` | Typed in-memory test store and listener-scoped durable task/result store. |
 | `server/internal/listeners/` | Listener lifecycle, configuration persistence, start/stop/delete logic. |
 | `server/internal/behaviour/` | HTTP polling protocol used by active agents. |
 | `server/internal/handlers/api/` | Operator APIs for agents, listeners, payloads, file drop, and SOCKS5 management. |
@@ -59,10 +61,11 @@ multi-user authorization system.
 ## Server
 
 The server starts from `server/cmd/server.go`. Startup loads
-`server/config/settings.yaml`, opens `server.log`, initializes the file store,
-creates a communication manager, registers HTTP routes, and starts an HTTPS
-server using the configured certificate and key. When redirect support is
-enabled, a separate HTTP listener redirects to the configured HTTPS port.
+`server/config/settings.yaml`, opens the process-wide SQLite database and
+`server.log`, initializes the file store, creates a communication manager,
+reconciles listeners and payload records, registers HTTP routes, and starts an
+HTTPS server using the configured certificate and key. When redirect support
+is enabled, a separate HTTP listener redirects to the configured HTTPS port.
 Current implementation note: `server.tls.enabled` exists in configuration, but
 the entry point always starts the main server with `ListenAndServeTLS`.
 
@@ -84,12 +87,13 @@ are visible during development.
 | Route | Current owner | Purpose |
 | --- | --- | --- |
 | `/home/` | `internal/handlers/web` | Static UI pages and assets. |
-| `/static/` | `internal/handlers/web` | Static files and generated artifacts. |
+| `/static/` | `internal/handlers/web` | Compatibility static files, excluding the private `listeners` and `payloads` trees. |
 | `/api/listeners/create` | `internal/handlers/api` | Create and start a listener. |
 | `/api/listeners/list` | `internal/handlers/api` | List listeners. |
 | `/api/listeners/{id}` | `internal/handlers/api` | Get or delete a listener. |
 | `/api/listeners/{id}/start` | `internal/handlers/api` | Start a stopped listener. |
 | `/api/listeners/{id}/stop` | `internal/handlers/api` | Stop a running listener. |
+| `/api/listeners/{id}/events` | `internal/handlers/api` | List the listener's durable lifecycle events in sequence order. |
 | `/api/agents/list` | `internal/handlers/api` | Aggregate agents across listeners. |
 | `/api/agents/{id}/tasks` | `internal/handlers/api` | `POST` a typed task or `GET` a bounded, paginated page of newest-first task summaries. |
 | `/api/agents/{id}/tasks/{task_id}` | `internal/handlers/api` | Get one full Task v1 resource, including terminal stdout/stderr. |
@@ -102,7 +106,7 @@ are visible during development.
 | `/api/file_drop/download/{name}` | `internal/handlers/api` | Download a file-drop item. |
 | `/api/file_drop/delete/{name}` | `internal/handlers/api` | Delete a file-drop item. |
 | `/api/payload/generate` | `internal/handlers/api/payload` | Build an agent payload from a listener and payload config. |
-| `/api/payload/download/{id}` | `internal/handlers/api/payload` | Download a generated payload tracked in memory. |
+| `/api/payload/download/{id}` | `internal/handlers/api/payload` | Revalidate and download a generated payload tracked by durable metadata. |
 | `/ws/logs` | `internal/handlers/ws` | Stream recent and live server logs. |
 | `/ws/terminal` | `internal/handlers/ws` | Browser-accessible shell on the server host. |
 
@@ -177,15 +181,26 @@ protects transport confidentiality but does not by itself bind a request to an
 enrolled runtime identity.
 
 The active protocol stores agents, task queues, lifecycle state, and results in
-memory.
-Server restart loses this state. Durable storage is a Phase 1 roadmap item.
+listener-scoped SQLite records. Server restart preserves this history. A
+persisted agent is historical and inactive until a fresh post-start heartbeat;
+durable presence is not treated as proof that a runtime is currently connected.
+Queued and dispatched task recovery respects expiry and the persisted delivery
+lease. Running work is never automatically re-executed, exact retries remain
+idempotent, and terminal state is immutable. See [storage.md](storage.md) for
+the complete restart contract.
 
 ### Listener Lifecycle
 
 `ListenerManager` owns listener creation, listing, start, stop, delete, and
-port-conflict checks. Listener configs are written as JSON under
-`static/listeners/{listener_name}/config.json` and loaded at startup without
-auto-starting the listeners.
+port-conflict checks. SQLite holds the authoritative checksummed listener
+config. Redacted compatibility projections are written with restrictive
+permissions under
+`{server.staticDir}/listeners/{listener_name}/config.json`; missing or stale
+projections are rebuilt from SQLite. Valid disk-only configs are imported once
+in deterministic order, but cannot overwrite durable state. Startup does not
+auto-start listener sockets. A listener last recorded as `ACTIVE` or `ERROR` is
+reconciled to `STOPPED` with one `recovered_stopped` event, while a deleted
+listener tombstone prevents a stale config file from resurrecting it.
 
 HTTP and HTTPS listener protocols are implemented. DNS and DNS-over-HTTPS are
 explicitly rejected as not implemented. SOCKS5 code exists under
@@ -197,26 +212,44 @@ HTTP(S) today.
 The payload generator is a server-side wrapper around the Rust agent build
 script. It requires a selected listener, derives the connection URL from that
 listener, writes an agent `config.json`, invokes `agent/build.sh`, and tracks the
-generated payload in memory for download.
+generated payload's metadata, size, SHA-256 digest, relative artifact path, and
+provenance in SQLite. The artifact itself remains under the configured payload
+root.
 
 Listener, payload/build, and runtime agent IDs are distinct. A selected listener
 provides connection configuration, each build receives its own payload ID, and
 each execution enrolls with a runtime agent ID. Build provenance is present but
 still partial; issue #99 tracks supported-profile validation, canonical output
-paths, and the complete inspectable manifest.
+paths, and the complete inspectable manifest. The build row begins in
+`building`, then transitions to `completed` or `failed`; startup turns a
+leftover build into `interrupted` without resuming it. Startup and download-time
+revalidation keep a completed indexed artifact in `completed`, `missing`, or
+`corrupt` state. Missing, corrupt, failed, or interrupted records remain
+available for diagnosis, but their download endpoint returns `410 Gone`.
+Direct static access to payload artifacts is denied.
 
 ### Storage
 
-Current storage is intentionally simple:
+The development implementation uses one process-wide SQLite database alongside
+filesystem artifacts:
 
-- Listener configs: JSON files under `static/listeners/`.
+- Durable database: configured by `storage.path`, default
+  `data/microc2.db`, with `MICROC2_STORAGE_PATH` as the environment override.
+- SQLite records: listeners and lifecycle events, historical agents, typed
+  tasks and results, legacy result projections, and payload-build metadata.
+- Listener compatibility configs: redacted, regenerable JSON projections under
+  `{server.staticDir}/listeners/`.
 - Operator uploads: configured server upload directory, default `uploads`.
-- Payload artifacts: `static/payloads/{debug,release}/{payload_id}`.
+- Payload artifacts:
+  `{server.staticDir}/payloads/{debug,release}/{payload_id}`.
 - Server logs: `server.log`, streamed to `/ws/logs`.
-- Agent registry, task queues, lifecycle state, results, and generated payload registry:
-  in-memory Go maps.
 
-There is no database or migration layer yet.
+The database must be outside the web-served static root. Embedded, checksummed
+migrations are applied transactionally and startup refuses a modified or future
+migration ledger. MicroC2 uses a full-synchronous SQLite rollback journal, not
+WAL, with a single database connection and a single-server-process ownership
+model. See [storage.md](storage.md) for restart semantics, permissions, backup,
+restore, and upgrade guidance.
 
 ## Agent
 
@@ -295,8 +328,12 @@ separate frontend build system. A few UI paths are ahead of the backend:
 
 The main remaining gaps are tracked as issues:
 
-- #98: complete and stabilize the typed task/result transition.
-- #97: persist agents, task lifecycles, results, payloads, and listener events.
+- #98: typed shell task/result v1 is complete; deprecated raw-command adapters
+  remain only for compatibility.
+- #97: durable storage is implemented on the current development branch and
+  remains subject to review, CI, and merge into `dev`.
+- #104: bind tasking to authenticated agent enrollment before any promotion
+  beyond an isolated lab.
 - #100: add structured, durable audit events.
 - #88: add file transfer and pivot controls as typed task families after #98.
 - #99: finish payload validation and manifests; current provenance is partial.

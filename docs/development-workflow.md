@@ -24,8 +24,8 @@ the relevant suites for the files changed by the branch.
 ## Stable Promotion Flow
 
 When `dev` reaches a coherent milestone, open a pull request from `dev` into
-`main`. Promotion pull requests run the full server, agent, static, formatting
-advisory, and release package checks.
+`main`. Promotion pull requests run the full Linux and Windows server/agent,
+static, formatting, and release-package checks.
 
 After the promotion merges, create or update any release notes from the merged
 changes. Direct feature work should not target `main`.
@@ -51,10 +51,10 @@ It also enforces that pull requests into `main` come from `dev`.
 ## Context-Aware Suites
 
 - Server changes run `Go Server`: `go test ./...`, `go vet ./...`, and a server
-  build in `server/`.
+  build on Linux, plus `Go Server (Windows)` tests and a native Windows build.
 - Agent changes run `Rust Agent`: `cargo test --locked`,
-  `cargo clippy --locked --all-targets`, and `cargo build --locked` in
-  `agent/`.
+  `cargo clippy --locked --all-targets`, and `cargo build --locked` on Linux,
+  plus tests and a build in `Rust Agent (Windows)`.
 - Static UI or script changes run `Static Assets And Scripts`: shell syntax
   checks and JavaScript syntax checks.
 - Server or agent changes run `Format`: `gofmt` validation for `server/` and

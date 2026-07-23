@@ -3,12 +3,14 @@ package api
 import (
 	"encoding/json"
 	"errors"
-	"microc2/server/internal/filestore"
-	"microc2/server/internal/handlers/api/payload"
-	"microc2/server/internal/listeners" // Updated from `networking`
 	"net/http"
 	"os"
 	"strings"
+
+	"microc2/server/internal/filestore"
+	"microc2/server/internal/handlers/api/payload"
+	"microc2/server/internal/listeners" // Updated from `networking`
+	"microc2/server/internal/persistence"
 )
 
 // NewFileHandlers creates a new file handlers instance
@@ -151,6 +153,33 @@ func (h *FileHandlers) HandleFileDelete(w http.ResponseWriter, r *http.Request) 
 }
 
 // PayloadHandlerSetup creates and initializes a new payload handler
-func PayloadHandlerSetup(payloadsDir, agentSourceDir string, _ *listeners.ListenerManager) *payload.PayloadHandler {
-	return payload.NewPayloadHandler(payloadsDir, agentSourceDir)
+func PayloadHandlerSetup(
+	payloadsDir string,
+	agentSourceDir string,
+	manager *listeners.ListenerManager,
+	database *persistence.Database,
+) (*payload.PayloadHandler, error) {
+	return payload.NewPayloadHandlerWithPersistence(
+		payloadsDir,
+		agentSourceDir,
+		managerListenerLookup{manager: manager},
+		database,
+	)
+}
+
+type managerListenerLookup struct {
+	manager *listeners.ListenerManager
+}
+
+func (lookup managerListenerLookup) LookupListener(
+	listenerID string,
+) (listeners.ListenerConfig, error) {
+	if lookup.manager == nil {
+		return listeners.ListenerConfig{}, errors.New("listener manager is unavailable")
+	}
+	listener, err := lookup.manager.GetListener(listenerID)
+	if err != nil {
+		return listeners.ListenerConfig{}, err
+	}
+	return listener.Snapshot().Config, nil
 }

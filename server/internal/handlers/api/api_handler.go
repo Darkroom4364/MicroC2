@@ -15,10 +15,13 @@ import (
 
 	// Updated from `networking`
 
+	"microc2/server/internal/behaviour"
 	"microc2/server/internal/listeners"
 	"microc2/server/internal/tasks"
 	"microc2/server/pkg/communication"
 )
+
+const scopedAgentKeyDelimiter = "/"
 
 func NewAPIHandler(manager *communication.ServerManager) *APIHandler {
 	return &APIHandler{
@@ -129,10 +132,23 @@ type taskProtocol interface {
 	AgentLastSeen(agentID string) (time.Time, bool)
 }
 
+type taskSummaryProtocol interface {
+	ListTaskSummariesPage(
+		agentID string,
+		offset, limit int,
+	) ([]tasks.TaskSummary, int, error)
+}
+
+type boundedLegacyResultProtocol interface {
+	ListLegacyResultsPage(
+		agentID string,
+		offset, limit, maxEncodedBytes int,
+	) ([]tasks.LegacyResult, int, bool, error)
+}
+
 const (
-	defaultTaskListLimit          = 50
-	maxTaskListLimit              = 100
-	maxLegacyResultsPageBodyBytes = 16 << 20
+	defaultTaskListLimit = 50
+	maxTaskListLimit     = 100
 )
 
 type taskListOptions struct {
@@ -178,7 +194,7 @@ func (h *APIHandler) handleTasks(w http.ResponseWriter, r *http.Request, agentID
 			writeTaskQueryError(w, err)
 			return
 		}
-		agentTasks, err := h.listAgentTasks(agentID)
+		page, err := h.listAgentTaskPage(agentID, options)
 		if err != nil {
 			if errors.Is(err, errAgentNotFound) {
 				writeAgentResolutionError(w, err)
@@ -187,7 +203,7 @@ func (h *APIHandler) handleTasks(w http.ResponseWriter, r *http.Request, agentID
 			}
 			return
 		}
-		writeJSON(w, http.StatusOK, summarizeTaskPage(agentTasks, options))
+		writeJSON(w, http.StatusOK, page)
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -373,39 +389,181 @@ type agentTaskProtocolRef struct {
 	knownAgent bool
 }
 
-func (h *APIHandler) agentTaskProtocolRefs(agentID string) []agentTaskProtocolRef {
+// durableHistoryTaskProtocol exposes one persisted listener scope for
+// historical reads and cancellation. Its zero last-seen value and stopped
+// status ensure it can never be selected for new task dispatch.
+type durableHistoryTaskProtocol struct {
+	agentID string
+	store   *tasks.DurableStore
+}
+
+func (p *durableHistoryTaskProtocol) CreateTask(
+	agentID string,
+	request tasks.CreateRequest,
+) (tasks.Task, error) {
+	// DurableStore.Create validates task fields and inserts them into SQLite;
+	// it does not create a filesystem path.
+	// foxguard: ignore[go/taint-path-traversal]
+	return p.store.Create(agentID, request)
+}
+
+func (p *durableHistoryTaskProtocol) ListTasks(agentID string) ([]tasks.Task, error) {
+	return p.store.List(agentID)
+}
+
+func (p *durableHistoryTaskProtocol) CancelTask(agentID, taskID string) (tasks.Task, error) {
+	return p.store.Cancel(agentID, taskID)
+}
+
+func (p *durableHistoryTaskProtocol) GetTask(agentID, taskID string) (tasks.Task, error) {
+	return p.store.Get(agentID, taskID)
+}
+
+func (p *durableHistoryTaskProtocol) GetResultsPage(
+	agentID string,
+	offset, limit int,
+) ([]map[string]interface{}, int) {
+	page, total, _, err := p.ListLegacyResultsPage(
+		agentID,
+		offset,
+		limit,
+		tasks.MaxLegacyResultPageBytes,
+	)
+	if err != nil {
+		return []map[string]interface{}{}, 0
+	}
+	results := make([]map[string]interface{}, 0, len(page))
+	for _, result := range page {
+		results = append(results, legacyResultMap(result))
+	}
+	return results, total
+}
+
+func (p *durableHistoryTaskProtocol) QueueLegacyShellTask(
+	agentID, command string,
+) (tasks.Task, error) {
+	return p.store.CreateLegacyShell(agentID, command)
+}
+
+func (p *durableHistoryTaskProtocol) AgentLastSeen(agentID string) (time.Time, bool) {
+	return time.Time{}, agentID == p.agentID
+}
+
+func (p *durableHistoryTaskProtocol) ListTaskSummariesPage(
+	agentID string,
+	offset, limit int,
+) ([]tasks.TaskSummary, int, error) {
+	return p.store.ListTaskSummariesPage(agentID, offset, limit)
+}
+
+func (p *durableHistoryTaskProtocol) ListLegacyResultsPage(
+	agentID string,
+	offset, limit, maxEncodedBytes int,
+) ([]tasks.LegacyResult, int, bool, error) {
+	return p.store.GetLegacyResultsPage(
+		agentID,
+		offset,
+		limit,
+		maxEncodedBytes,
+	)
+}
+
+func (h *APIHandler) agentTaskProtocolRefs(
+	agentID string,
+) ([]agentTaskProtocolRef, error) {
 	if h.serverManager == nil {
-		return nil
+		return nil, nil
 	}
 	refs := make([]agentTaskProtocolRef, 0)
-	for _, listener := range h.serverManager.GetListenerManager().ListListeners() {
-		if listener.Protocol == nil {
-			continue
+	indexByListenerID := make(map[string]int)
+	if manager := h.serverManager.GetListenerManager(); manager != nil {
+		for _, listener := range manager.ListListeners() {
+			if listener.Protocol == nil {
+				continue
+			}
+			protocol, ok := listener.Protocol.(taskProtocol)
+			if !ok {
+				continue
+			}
+			lastSeen, knownAgent := protocol.AgentLastSeen(agentID)
+			listenerID := listener.Snapshot().Config.ID
+			indexByListenerID[listenerID] = len(refs)
+			refs = append(refs, agentTaskProtocolRef{
+				listenerID: listenerID,
+				status:     listener.GetStatus(),
+				protocol:   protocol,
+				lastSeen:   lastSeen,
+				knownAgent: knownAgent,
+			})
 		}
-		protocol, ok := listener.Protocol.(taskProtocol)
-		if !ok {
-			continue
+	}
+
+	database := h.serverManager.GetDatabase()
+	if database != nil {
+		rows, err := database.SQL().Query(
+			`SELECT listener_id FROM agents WHERE agent_id = ?
+			 UNION
+			 SELECT listener_id FROM tasks WHERE agent_id = ?
+			 ORDER BY listener_id`,
+			agentID,
+			agentID,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("enumerate durable agent listener scopes: %w", err)
 		}
-		lastSeen, knownAgent := protocol.AgentLastSeen(agentID)
-		refs = append(refs, agentTaskProtocolRef{
-			listenerID: listener.Snapshot().Config.ID,
-			status:     listener.GetStatus(),
-			protocol:   protocol,
-			lastSeen:   lastSeen,
-			knownAgent: knownAgent,
-		})
+		for rows.Next() {
+			var listenerID string
+			if err := rows.Scan(&listenerID); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("scan durable agent listener scope: %w", err)
+			}
+			if index, exists := indexByListenerID[listenerID]; exists {
+				refs[index].knownAgent = true
+				continue
+			}
+			store, err := tasks.NewDurableStore(database, listenerID, time.Now)
+			if err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf(
+					"open durable agent listener scope %q: %w",
+					listenerID,
+					err,
+				)
+			}
+			indexByListenerID[listenerID] = len(refs)
+			refs = append(refs, agentTaskProtocolRef{
+				listenerID: listenerID,
+				status:     listeners.StatusStopped,
+				protocol: &durableHistoryTaskProtocol{
+					agentID: agentID,
+					store:   store,
+				},
+				knownAgent: true,
+			})
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("iterate durable agent listener scopes: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf("close durable agent listener scopes: %w", err)
+		}
 	}
 	sort.Slice(refs, func(i, j int) bool {
 		return refs[i].listenerID < refs[j].listenerID
 	})
-	return refs
+	return refs, nil
 }
 
 func (h *APIHandler) resolveActiveAgentTaskProtocol(agentID string) (taskProtocol, error) {
 	now := time.Now()
 	var active []taskProtocol
 	knownAgent := false
-	for _, ref := range h.agentTaskProtocolRefs(agentID) {
+	refs, err := h.agentTaskProtocolRefs(agentID)
+	if err != nil {
+		return nil, err
+	}
+	for _, ref := range refs {
 		if !ref.knownAgent {
 			continue
 		}
@@ -428,24 +586,88 @@ func (h *APIHandler) resolveActiveAgentTaskProtocol(agentID string) (taskProtoco
 	}
 }
 
-func (h *APIHandler) listAgentTasks(agentID string) ([]tasks.Task, error) {
-	var combined []tasks.Task
+func (h *APIHandler) listAgentTaskPage(
+	agentID string,
+	options taskListOptions,
+) (taskListEnvelope, error) {
+	refs, err := h.agentTaskProtocolRefs(agentID)
+	if err != nil {
+		return taskListEnvelope{}, err
+	}
+
+	maxInt := int(^uint(0) >> 1)
+	candidateLimit := options.offset
+	if options.limit > maxInt-candidateLimit {
+		candidateLimit = maxInt
+	} else {
+		candidateLimit += options.limit
+	}
+	var combined []tasks.TaskSummary
+	total := 0
 	knownAgent := false
-	for _, ref := range h.agentTaskProtocolRefs(agentID) {
+	for _, ref := range refs {
 		if ref.knownAgent {
 			knownAgent = true
 		}
-		agentTasks, err := ref.protocol.ListTasks(agentID)
-		if err != nil {
-			return nil, err
+
+		var (
+			summaries     []tasks.TaskSummary
+			listenerTotal int
+		)
+		if pager, ok := ref.protocol.(taskSummaryProtocol); ok {
+			summaries, listenerTotal, err = pager.ListTaskSummariesPage(
+				agentID,
+				0,
+				candidateLimit,
+			)
+		} else {
+			var agentTasks []tasks.Task
+			agentTasks, err = ref.protocol.ListTasks(agentID)
+			if err == nil {
+				sort.Slice(agentTasks, func(i, j int) bool {
+					if agentTasks[i].CreatedAt.Equal(agentTasks[j].CreatedAt) {
+						return agentTasks[i].ID > agentTasks[j].ID
+					}
+					return agentTasks[i].CreatedAt.After(agentTasks[j].CreatedAt)
+				})
+				listenerTotal = len(agentTasks)
+				pageLimit := candidateLimit
+				if pageLimit > listenerTotal {
+					pageLimit = listenerTotal
+				}
+				summaries = make([]tasks.TaskSummary, 0, pageLimit)
+				for _, task := range agentTasks[:pageLimit] {
+					summaries = append(summaries, tasks.Summarize(task))
+				}
+			}
 		}
-		if len(agentTasks) > 0 {
+		if err != nil {
+			return taskListEnvelope{}, err
+		}
+		if listenerTotal < 0 || listenerTotal > maxInt-total {
+			return taskListEnvelope{}, errors.New(
+				"listener returned an invalid task count",
+			)
+		}
+		maxSummaries := candidateLimit
+		if maxSummaries > listenerTotal {
+			maxSummaries = listenerTotal
+		}
+		if len(summaries) > maxSummaries {
+			return taskListEnvelope{}, fmt.Errorf(
+				"listener returned %d task summaries, expected at most %d",
+				len(summaries),
+				maxSummaries,
+			)
+		}
+		total += listenerTotal
+		if listenerTotal > 0 {
 			knownAgent = true
-			combined = append(combined, agentTasks...)
+			combined = append(combined, summaries...)
 		}
 	}
 	if !knownAgent {
-		return nil, errAgentNotFound
+		return taskListEnvelope{}, errAgentNotFound
 	}
 	sort.Slice(combined, func(i, j int) bool {
 		if combined[i].CreatedAt.Equal(combined[j].CreatedAt) {
@@ -453,12 +675,39 @@ func (h *APIHandler) listAgentTasks(agentID string) ([]tasks.Task, error) {
 		}
 		return combined[i].CreatedAt.After(combined[j].CreatedAt)
 	})
-	return combined, nil
+
+	start := options.offset
+	if start > len(combined) {
+		start = len(combined)
+	}
+	end := start + options.limit
+	if end > len(combined) {
+		end = len(combined)
+	}
+	page := make([]tasks.TaskSummary, end-start)
+	copy(page, combined[start:end])
+	var nextOffset *int
+	if endOffset := options.offset + len(page); endOffset < total {
+		next := endOffset
+		nextOffset = &next
+	}
+	return taskListEnvelope{
+		SchemaVersion: tasks.SchemaVersion,
+		Tasks:         page,
+		Limit:         options.limit,
+		Offset:        options.offset,
+		Total:         total,
+		NextOffset:    nextOffset,
+	}, nil
 }
 
 func (h *APIHandler) getAgentTask(agentID, taskID string) (tasks.Task, error) {
 	var found []tasks.Task
-	for _, ref := range h.agentTaskProtocolRefs(agentID) {
+	refs, err := h.agentTaskProtocolRefs(agentID)
+	if err != nil {
+		return tasks.Task{}, err
+	}
+	for _, ref := range refs {
 		task, err := ref.protocol.GetTask(agentID, taskID)
 		if err == nil {
 			found = append(found, task)
@@ -480,7 +729,11 @@ func (h *APIHandler) getAgentTask(agentID, taskID string) (tasks.Task, error) {
 
 func (h *APIHandler) cancelAgentTask(agentID, taskID string) (tasks.Task, error) {
 	var owners []taskProtocol
-	for _, ref := range h.agentTaskProtocolRefs(agentID) {
+	refs, err := h.agentTaskProtocolRefs(agentID)
+	if err != nil {
+		return tasks.Task{}, err
+	}
+	for _, ref := range refs {
 		if _, err := ref.protocol.GetTask(agentID, taskID); err == nil {
 			owners = append(owners, ref.protocol)
 		} else if !errors.Is(err, tasks.ErrNotFound) {
@@ -503,10 +756,108 @@ func (h *APIHandler) handleListAgents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Aggregate agents from all listeners
-	agents := h.serverManager.GetListenerManager().AllAgents()
+	agents, err := h.allAgents()
+	if err != nil {
+		log.Printf("[ERROR] Failed to load durable agent history: %v", err)
+		http.Error(w, "Agent history unavailable", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(agents)
+	if err := json.NewEncoder(w).Encode(agents); err != nil {
+		log.Printf("[ERROR] Failed to encode agent history: %v", err)
+	}
+}
+
+func (h *APIHandler) allAgents() (map[string]interface{}, error) {
+	if h.serverManager == nil {
+		return map[string]interface{}{}, nil
+	}
+	database := h.serverManager.GetDatabase()
+	if database == nil {
+		manager := h.serverManager.GetListenerManager()
+		if manager == nil {
+			return map[string]interface{}{}, nil
+		}
+		return manager.AllAgents(), nil
+	}
+
+	rows, err := database.SQL().Query(
+		`SELECT listener_id, agent_id, payload_id, os, hostname, ip,
+		        ip_list_json, last_commands_json, last_seen_at
+		 FROM agents
+		 ORDER BY listener_id, agent_id`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query durable agents: %w", err)
+	}
+	type scopedAgent struct {
+		listenerID string
+		agentID    string
+		agent      *behaviour.Agent
+	}
+	var persisted []scopedAgent
+	counts := make(map[string]int)
+	for rows.Next() {
+		var (
+			agent        behaviour.Agent
+			listenerID   string
+			ipListJSON   []byte
+			commandsJSON []byte
+			lastSeen     string
+		)
+		if err := rows.Scan(
+			&listenerID,
+			&agent.ID,
+			&agent.PayloadID,
+			&agent.OS,
+			&agent.Hostname,
+			&agent.IP,
+			&ipListJSON,
+			&commandsJSON,
+			&lastSeen,
+		); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("scan durable agent: %w", err)
+		}
+		if err := json.Unmarshal(ipListJSON, &agent.IPList); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("decode durable agent IP list: %w", err)
+		}
+		if err := json.Unmarshal(commandsJSON, &agent.Commands); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("decode durable agent command list: %w", err)
+		}
+		agent.LastSeen, err = time.Parse(time.RFC3339Nano, lastSeen)
+		if err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("decode durable agent last_seen: %w", err)
+		}
+		agent.ListenerID = listenerID
+		agentCopy := agent
+		persisted = append(persisted, scopedAgent{
+			listenerID: listenerID,
+			agentID:    agent.ID,
+			agent:      &agentCopy,
+		})
+		counts[agent.ID]++
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("iterate durable agents: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close durable agents: %w", err)
+	}
+
+	agents := make(map[string]interface{}, len(persisted))
+	for _, persistedAgent := range persisted {
+		key := persistedAgent.agentID
+		if counts[persistedAgent.agentID] > 1 {
+			key = persistedAgent.listenerID + scopedAgentKeyDelimiter + persistedAgent.agentID
+		}
+		agents[key] = persistedAgent.agent
+	}
+	return agents, nil
 }
 
 type queueCommandRequest struct {
@@ -623,29 +974,71 @@ func (h *APIHandler) legacyResultPage(
 	agentID string,
 	options taskListOptions,
 ) (legacyResultPage, bool, error) {
+	refs, err := h.agentTaskProtocolRefs(agentID)
+	if err != nil {
+		return legacyResultPage{}, false, err
+	}
 	knownAgent := false
 	total := 0
 	remainingOffset := options.offset
 	remainingLimit := options.limit
 	candidates := make([]map[string]interface{}, 0, options.limit)
+	encodedCandidateSize := len("[]\n")
+	bodyTruncated := false
 	maxInt := int(^uint(0) >> 1)
 
-	for _, ref := range h.agentTaskProtocolRefs(agentID) {
+	for _, ref := range refs {
 		if ref.knownAgent {
 			knownAgent = true
 		}
 
 		localOffset := 0
 		fetchLimit := 0
-		if remainingLimit > 0 {
+		if remainingLimit > 0 && !bodyTruncated {
 			localOffset = remainingOffset
 			fetchLimit = remainingLimit
 		}
-		results, listenerTotal := ref.protocol.GetResultsPage(
-			agentID,
-			localOffset,
-			fetchLimit,
+		var (
+			results           []map[string]interface{}
+			listenerTotal     int
+			listenerTruncated bool
 		)
+		if pager, ok := ref.protocol.(boundedLegacyResultProtocol); ok {
+			pageBudget := tasks.MaxLegacyResultPageBytes
+			if encodedCandidateSize > len("[]\n") {
+				remainingBytes := tasks.MaxLegacyResultPageBytes - encodedCandidateSize
+				if remainingBytes < len("[]\n") {
+					fetchLimit = 0
+					bodyTruncated = remainingLimit > 0
+				} else {
+					// A standalone page has two more framing bytes than the
+					// incremental contribution to an existing non-empty array.
+					// Using the smaller remaining budget is conservative.
+					pageBudget = remainingBytes
+				}
+			}
+			page, durableTotal, truncated, pageErr := pager.ListLegacyResultsPage(
+				agentID,
+				localOffset,
+				fetchLimit,
+				pageBudget,
+			)
+			if pageErr != nil {
+				return legacyResultPage{}, knownAgent, pageErr
+			}
+			listenerTotal = durableTotal
+			listenerTruncated = truncated
+			results = make([]map[string]interface{}, 0, len(page))
+			for _, result := range page {
+				results = append(results, legacyResultMap(result))
+			}
+		} else {
+			results, listenerTotal = ref.protocol.GetResultsPage(
+				agentID,
+				localOffset,
+				fetchLimit,
+			)
+		}
 		if listenerTotal < 0 || listenerTotal > maxInt-total {
 			return legacyResultPage{}, knownAgent, errors.New(
 				"listener returned an invalid result count",
@@ -671,24 +1064,53 @@ func (h *APIHandler) legacyResultPage(
 		if expected > available {
 			expected = available
 		}
-		if len(results) != expected {
+		if len(results) > expected ||
+			(len(results) < expected && !listenerTruncated) {
 			return legacyResultPage{}, knownAgent, fmt.Errorf(
-				"listener returned %d results, expected %d",
+				"listener returned %d results, expected at most %d",
 				len(results),
 				expected,
 			)
 		}
-		candidates = append(candidates, results...)
+		for _, result := range results {
+			encoded, err := json.Marshal(result)
+			if err != nil {
+				return legacyResultPage{}, knownAgent, fmt.Errorf(
+					"measure legacy result candidate: %w",
+					err,
+				)
+			}
+			separatorSize := 0
+			if len(candidates) > 0 {
+				separatorSize = 1
+			}
+			used := encodedCandidateSize + separatorSize
+			if used > tasks.MaxLegacyResultPageBytes ||
+				len(encoded) > tasks.MaxLegacyResultPageBytes-used {
+				bodyTruncated = true
+				break
+			}
+			candidates = append(candidates, result)
+			encodedCandidateSize = used + len(encoded)
+		}
 		remainingOffset = 0
 		remainingLimit -= len(results)
+		if listenerTruncated {
+			bodyTruncated = true
+		}
 	}
 
 	body, count, err := encodeLegacyResultArray(
 		candidates,
-		maxLegacyResultsPageBodyBytes,
+		tasks.MaxLegacyResultPageBytes,
 	)
 	if err != nil {
 		return legacyResultPage{}, knownAgent, err
+	}
+	if count == 0 && bodyTruncated && options.offset < total {
+		return legacyResultPage{}, knownAgent, errors.New(
+			"one legacy result exceeds the response body budget",
+		)
 	}
 
 	end := options.offset
@@ -709,6 +1131,14 @@ func (h *APIHandler) legacyResultPage(
 		total:      total,
 		nextOffset: nextOffset,
 	}, knownAgent, nil
+}
+
+func legacyResultMap(result tasks.LegacyResult) map[string]interface{} {
+	return map[string]interface{}{
+		"command":   result.Command,
+		"output":    result.Output,
+		"timestamp": result.Timestamp,
+	}
 }
 
 func encodeLegacyResultArray(

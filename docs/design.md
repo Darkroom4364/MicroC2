@@ -103,28 +103,33 @@ shell tasks and are deprecated: new UI and API clients must use `/tasks`.
 ## Server Design
 
 The Go server was chosen for its standard-library networking, simple deployment,
-and straightforward concurrency model. The server uses mutex-protected maps for
-prototype state and goroutines for listeners, redirects, and WebSocket
-connections.
+and straightforward concurrency model. The production composition uses one
+process-wide SQLite database for durable coordination state and goroutines for
+listeners, redirects, and WebSocket connections. In-memory stores remain useful
+for focused tests, but are not the production task/result authority.
 
 Current strengths:
 
 - Listener lifecycle is centralized in `ListenerManager`.
 - HTTP(S) listeners have explicit start, stop, delete, port conflict, and config
   persistence behavior.
+- Listener-scoped agents, tasks, results, payload metadata, and listener events
+  survive server restart.
 - Operator APIs and static UI are small and easy to inspect.
 - The payload builder can generate agent builds from selected listener config.
-- CI now runs context-aware Go, Rust, static/script, format, and Foxguard checks.
+- CI runs context-aware Go (including Windows), Rust, static/script, format, and
+  Foxguard checks.
 
 Current constraints:
 
-- Agent registry, task queues, result history, and generated payload registry
-  are in memory.
+- Durable storage is local and single-process; file artifacts still require a
+  coordinated filesystem backup.
 - Operator access uses a lab-oriented shared-token or loopback guard, not
   production multi-user authentication and authorization.
 - Agent listener requests are correlated by runtime ID but are not yet bound to
   an authenticated enrollment session (#104).
-- Structured audit events and durable task/result history are not implemented.
+- Listener lifecycle history is durable operational state, but structured,
+  actor-aware audit events are not implemented (#100).
 - The server terminal remains a powerful lab-only capability even with the
   operator guard and origin checks.
 
@@ -135,7 +140,7 @@ independently:
 Operator UI/API/WebSockets -> auth, origin checks, audit, local-lab defaults
 Agent listener endpoints   -> minimal polling API, stable task/result schemas
 Payload builder            -> reproducible profiles and build provenance
-Storage                    -> durable agents, tasks, results, files, events
+Storage                    -> SQLite metadata plus filesystem artifacts
 ```
 
 Operator routes are served by the web/API port. Agent polling routes are served
@@ -206,7 +211,10 @@ metadata on task types.
 
 Payload generation is listener-driven today. The operator selects a listener,
 the server derives the agent connection settings, writes a config file, invokes
-the Rust build script, and stores the artifact for download.
+the Rust build script, stores the artifact for download, and records its
+listener, path, size, SHA-256 digest, state, and provenance in SQLite. Indexed
+artifacts are revalidated at startup and immediately before download; missing
+or corrupt artifacts retain diagnostic metadata but are not served.
 
 Listener, payload/build, and runtime agent identities are now distinct:
 
@@ -222,6 +230,40 @@ are passed through parts of the UI/config/build path but are not a complete
 implemented payload feature set. Issue #99 is therefore only partially complete:
 seed provenance exists, while supported-profile validation, canonical outputs,
 and a complete inspectable build manifest remain.
+
+## Storage Design
+
+The development implementation for #97 makes SQLite the production authority
+for listener-scoped agents, typed task lifecycles/results, payload-build
+metadata, and listener lifecycle events. The task store writes directly through
+SQL transactions rather than serializing process snapshots.
+
+Restart recovery favors evidence preservation without silently replaying
+side effects:
+
+- queued work remains eligible for dispatch;
+- dispatched work preserves its initial timestamp and delivery lease before
+  redelivery of the same task ID;
+- running work remains running and is not automatically executed again;
+- exact running/result retries remain idempotent and terminal states remain
+  immutable;
+- persisted agents remain historical/inactive until a fresh heartbeat; and
+- loaded listeners previously recorded active or errored recover stopped with
+  one lifecycle event.
+
+SQLite is also authoritative for listener configuration. Restrictive,
+secret-redacted filesystem projections support compatibility and are rebuilt
+when missing; they never overwrite an existing durable config. Payload builds
+record `building` before execution, transition to `completed` or `failed`, and
+become `interrupted` after a process restart instead of being resumed.
+
+SQLite uses a full-synchronous rollback journal rather than WAL and one
+process-wide connection. The database stores metadata and authoritative
+listener configs; payload artifacts, listener uploads, operator uploads, and
+logs remain files that must be backed up with it. Redacted listener config
+projections are regenerable.
+See [storage.md](storage.md) for configuration, migration integrity, permissions,
+reconciliation, and backup/restore guidance.
 
 ## Transport Design
 
@@ -284,17 +326,16 @@ paths.
 
 ## Near-Term Design Priorities
 
-1. Finish the retry-safe typed shell task/result path and retire primary UI use
-   of raw command adapters (#98).
+1. Review, validate, and merge the #97 durable-storage implementation into
+   `dev`; this documentation is not a claim that the issue is already merged.
 2. Bind agent-facing lifecycle requests to authenticated enrollment sessions
-   before any promotion beyond an isolated lab (#104).
-3. Persist agents, task state, results, payload metadata, and listener events
-   across restart (#97).
-4. Add causal structured audit events on top of the durable model (#100).
-5. Extend the typed task registry with file transfer and pivot operations after
-   the v1 shell contract is stable (#88).
-6. Complete payload profile validation and full build manifests; current #99
+   before considering any `dev` to `main` promotion (#104).
+3. Add causal structured audit events on top of the durable model (#100).
+4. Extend the typed task registry with file transfer and pivot operations now
+   that the v1 shell contract in #98 is stable (#88).
+5. Complete payload profile validation and full build manifests; current #99
    provenance is partial P1 work.
 
-The data path is #98 → #97 → #100; #104 is a parallel P0 security gate before
-promotion beyond the isolated-lab boundary.
+The data path remains #98 → #97 → #100; #98 is complete and #97 is development
+work in review. Issue #104 is the next operational P0 and the promotion gate.
+Durable storage does not authorize promotion beyond the isolated-lab boundary.
