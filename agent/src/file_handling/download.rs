@@ -20,6 +20,7 @@ pub async fn download_file(url: &str, dest_path: &Path) -> Result<(), Box<dyn Er
     while let Some(chunk) = resp.chunk().await? {
         file.write_all(&chunk).await?;
     }
+    file.flush().await?;
 
     Ok(())
 }

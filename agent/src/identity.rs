@@ -1,19 +1,20 @@
 use crate::config::AgentConfig;
+use crate::tasks::{validate_identifier, TaskValidationError};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 const AGENT_ID_FILE: &str = "agent_id";
 
-pub fn resolve_runtime_agent_id(config: &AgentConfig) -> String {
-    if let Some(agent_id) = configured_agent_id(&config.agent_id) {
-        return agent_id;
+pub fn resolve_runtime_agent_id(config: &AgentConfig) -> Result<String, TaskValidationError> {
+    if let Some(agent_id) = configured_agent_id(&config.agent_id)? {
+        return Ok(agent_id);
     }
 
-    match runtime_identity_dir() {
+    Ok(match runtime_identity_dir() {
         Some(config_dir) => load_or_create_runtime_agent_id(&config_dir, &config.payload_id),
         None => generate_runtime_agent_id(&config.payload_id),
-    }
+    })
 }
 
 pub fn generate_runtime_agent_id(payload_id: &str) -> String {
@@ -25,13 +26,12 @@ pub fn generate_runtime_agent_id(payload_id: &str) -> String {
     )
 }
 
-fn configured_agent_id(agent_id: &str) -> Option<String> {
-    let trimmed = agent_id.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
+fn configured_agent_id(agent_id: &str) -> Result<Option<String>, TaskValidationError> {
+    if agent_id.is_empty() {
+        return Ok(None);
     }
+    validate_identifier("agent_id", agent_id)?;
+    Ok(Some(agent_id.to_string()))
 }
 
 fn runtime_identity_dir() -> Option<PathBuf> {
@@ -56,7 +56,7 @@ fn load_or_create_runtime_agent_id(config_dir: &Path, payload_id: &str) -> Strin
 
 fn read_runtime_agent_id(id_path: &Path) -> Option<String> {
     match fs::read_to_string(id_path) {
-        Ok(content) => configured_agent_id(&content),
+        Ok(content) => configured_agent_id(&content).ok().flatten(),
         Err(_) => None,
     }
 }
@@ -95,11 +95,37 @@ mod tests {
     fn explicit_agent_id_wins() {
         let config = AgentConfig {
             payload_id: "payload-one".to_string(),
+            agent_id: "configured-agent".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_runtime_agent_id(&config).expect("valid configured identity"),
+            "configured-agent"
+        );
+    }
+
+    #[test]
+    fn invalid_explicit_agent_id_fails_fast() {
+        let config = AgentConfig {
+            payload_id: "payload-one".to_string(),
+            agent_id: "invalid agent/id".to_string(),
+            ..Default::default()
+        };
+
+        let error = resolve_runtime_agent_id(&config).expect_err("invalid configured identity");
+        assert!(error.to_string().contains("unsupported characters"));
+    }
+
+    #[test]
+    fn explicit_agent_id_is_not_silently_trimmed() {
+        let config = AgentConfig {
+            payload_id: "payload-one".to_string(),
             agent_id: " configured-agent ".to_string(),
             ..Default::default()
         };
 
-        assert_eq!(resolve_runtime_agent_id(&config), "configured-agent");
+        assert!(resolve_runtime_agent_id(&config).is_err());
     }
 
     #[test]
@@ -113,6 +139,25 @@ mod tests {
 
         let id_path = config_dir.join(AGENT_ID_FILE);
         assert!(id_path.exists());
+        let _ = fs::remove_file(id_path);
+        let _ = fs::remove_dir_all(config_dir);
+    }
+
+    #[test]
+    fn invalid_persisted_agent_id_is_replaced() {
+        let config_dir = unique_temp_dir("invalid-identity");
+        fs::create_dir_all(&config_dir).expect("create identity dir");
+        let id_path = config_dir.join(AGENT_ID_FILE);
+        fs::write(&id_path, "invalid agent/id").expect("write invalid identity");
+
+        let resolved = load_or_create_runtime_agent_id(&config_dir, "payload-one");
+        assert_ne!(resolved, "invalid agent/id");
+        validate_identifier("agent_id", &resolved).expect("replacement identifier");
+        assert_eq!(
+            fs::read_to_string(&id_path).expect("read replacement identity"),
+            resolved
+        );
+
         let _ = fs::remove_file(id_path);
         let _ = fs::remove_dir_all(config_dir);
     }

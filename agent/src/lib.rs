@@ -7,6 +7,7 @@ pub mod identity;
 pub mod networking;
 pub mod opsec;
 pub mod state;
+pub mod tasks;
 pub mod util;
 #[cfg(target_os = "windows")]
 pub mod win_api_hiding;
