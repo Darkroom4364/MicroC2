@@ -92,11 +92,41 @@ For route-boundary changes, also use this smoke path in a controlled local lab:
    `https://localhost:8443/api/agent/test/heartbeat` returns `404`.
 3. Create or start an HTTP listener on a separate port.
 4. POST a heartbeat to the listener at `/api/agent/test/heartbeat`.
-5. Queue a command through the operator API at `/api/agents/command` with
-   `agent_id` in the JSON body.
-6. Poll the command from the listener at `/api/agent/test/command`.
-7. POST a result to the listener at `/api/agent/test/result`.
-8. Read results through the operator API at `/api/agents/test/results`.
+5. Create a shell task through `POST /api/agents/test/tasks` with typed
+   `schema_version: 1`, `arguments`, `timeout_seconds`, and
+   `expires_in_seconds`; record the returned task ID and confirm the response is
+   `202 Accepted`.
+6. Poll the task from the listener at `/api/agent/test/tasks` and confirm the
+   returned Task v1 resource becomes `dispatched`.
+7. POST a `running` Task Status Update v1 to
+   `/api/agent/test/tasks/{task_id}/status`.
+8. POST the terminal Task Result v1 to `/api/agent/test/results`.
+9. Read the correlated lifecycle metadata through the bounded
+   `GET /api/agents/test/tasks?limit=50&offset=0` Task Page v1 response, then
+   read the nested stdout/stderr from
+   `GET /api/agents/test/tasks/{task_id}`.
+
+For delivery-failure coverage, also confirm that a task poll whose response is
+lost redelivers the same ID only after its lease, that a dispatched task cannot
+start at or after `expires_at`, and that exact repeated running/result payloads
+return success without executing shell work twice. Keep a completed result in
+the agent outbox until the server acknowledges it.
+
+Agent IDs are not credentials in the current listener protocol. Run this smoke
+path only on an isolated authorized network until #104 binds the lifecycle
+routes to authenticated enrollment sessions.
+
+The normative fixtures for this smoke path are
+[`task-create-request-v1.schema.json`](schemas/task-create-request-v1.schema.json),
+[`task-v1.schema.json`](schemas/task-v1.schema.json),
+[`task-summary-v1.schema.json`](schemas/task-summary-v1.schema.json),
+[`task-page-v1.schema.json`](schemas/task-page-v1.schema.json),
+[`task-status-update-v1.schema.json`](schemas/task-status-update-v1.schema.json),
+[`task-result-v1.schema.json`](schemas/task-result-v1.schema.json), and
+[`task-result-summary-v1.schema.json`](schemas/task-result-summary-v1.schema.json).
+Legacy
+operator `/command` routes are compatibility adapters only and should not be
+used for new smoke tests.
 
 ```sh
 cd agent

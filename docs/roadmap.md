@@ -107,9 +107,9 @@ Candidate issues:
 - #86 `[Server] Fix listener lifecycle and remove placeholder protocol code` (complete)
 - #85 `[CI] Add baseline Go/Rust build and test checks` (complete)
 - #89 `[CI] Make format and Foxguard baseline checks blocking` (complete)
-- #87 `[Docs] Populate architecture, design, and roadmap docs from thesis/current code`
-- #75 `[Server] Separate UI and agent API endpoints`
-- #78 `[Security] Fix lab-safety and hardening bugs`
+- #87 `[Docs] Populate architecture, design, and roadmap docs from thesis/current code` (complete)
+- #75 `[Server] Separate UI and agent API endpoints` (complete)
+- #78 `[Security] Fix lab-safety and hardening bugs` (complete)
 
 ## Phase 1: Make Operations Coherent
 
@@ -139,9 +139,19 @@ Exit criteria:
 
 Candidate issues:
 
-- #88 `[Agent] Wire file transfer and pivot controls into command dispatch`
+- #98 `[Server/Agent] Replace raw string command dispatch with typed task and
+  result schemas` — shell task contract v1, bounded summary pages, and
+  on-demand full results are the Phase 1 foundation.
+- #104 `[Security] Bind agent tasking to authenticated enrollment sessions` —
+  P0 gate before task listeners are exposed beyond an isolated lab.
+- #97 `[Server] Add durable storage for agents, tasks, results, payloads, and
+  listener events`
+- #100 `[Server] Add structured audit events for operator actions and agent
+  tasking`
+- #88 `[Agent] Wire file transfer and pivot controls into command dispatch` —
+  extend the typed contract only after #98.
 - #65 `[Agent] Configuration System extension`
-- #64 `[ID Parsing and Agent Generation]`
+- #64 `[ID Parsing and Agent Generation]` (complete)
 
 ## Phase 2: Transport And Pivot Maturity
 
@@ -193,6 +203,9 @@ Exit criteria:
 
 Candidate issues:
 
+- #99 `[Payload] Validate build options and record build provenance` — partial,
+  P1. Seed provenance landed, but the supported build matrix, fail-fast option
+  validation, canonical artifact path, and complete inspectable manifest remain.
 - #79 `[Agent] Reduce dependencies as much as possible`
 - #67 `[Agent] - Source-Level Mutation Engine (Phase 1)` — v0 landed: seeded
   mutation (`MUTATION_SEED`) covering the config XOR key, a junk-code module,
@@ -357,12 +370,17 @@ detection, Internet-scale botnet market measurement.
 
 Recommended next sequence:
 
-1. Finish #87 docs so the current architecture and constraints are explicit.
-2. Start #75 to split operator and agent-facing route surfaces.
-3. Tackle #78 lab-safety hardening on top of the clearer route boundary.
-4. Fix #64 so listener, payload/build, and runtime agent identities are
-   separate.
-5. Tackle #88 to make agent tasking, files, and pivots coherent.
+1. Finish #98 so shell tasking uses the versioned, retry-safe typed task/result
+   contract end to end.
+2. Complete #104 before any promotion beyond an isolated lab, binding agent
+   tasking to authenticated enrollment sessions.
+3. Build #97 on the typed contract so agents, task lifecycles, results, payload
+   metadata, and listener events survive restart.
+4. Add #100 on the durable model so operator and agent actions have causal,
+   reviewable audit events.
+5. Tackle #88 after #98, adding file transfer and pivot operations as explicit
+   task types instead of new string commands.
 
-This order keeps momentum while preventing the framework from accumulating more
-prototype debt.
+The data path is **#98 → #97 → #100**. Issue #104 is a parallel P0 security
+gate before promotion, and #99 remains a bounded P1 payload-quality track that
+can proceed alongside it.
