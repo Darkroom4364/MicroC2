@@ -81,6 +81,10 @@ pub struct AgentConfig {
     pub sleep_interval: u64,
     pub jitter: u64,
     pub payload_id: String,
+    #[serde(default)]
+    pub agent_id: String,
+    #[serde(default)]
+    pub listener_id: String,
     pub protocol: String,
     #[serde(default)]
     pub socks5_enabled: bool,
@@ -186,6 +190,8 @@ impl Default for AgentConfig {
             sleep_interval: 5,
             jitter: 2,
             payload_id: String::new(),
+            agent_id: String::new(),
+            listener_id: String::new(),
             protocol: obfstr!("http").to_string(),
             socks5_enabled: false,
             socks5_host: obfstr!("127.0.0.1").to_string(),

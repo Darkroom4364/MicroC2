@@ -40,13 +40,14 @@ type CommandResult struct {
 }
 
 type Agent struct {
-	ID       string    `json:"id"`
-	OS       string    `json:"os"`
-	Hostname string    `json:"hostname"`
-	IP       string    `json:"ip"`
-	IPList   []string  `json:"ip_list,omitempty"`
-	LastSeen time.Time `json:"last_seen"`
-	Commands []string  `json:"last_commands"`
+	ID        string    `json:"id"`
+	PayloadID string    `json:"payload_id,omitempty"`
+	OS        string    `json:"os"`
+	Hostname  string    `json:"hostname"`
+	IP        string    `json:"ip"`
+	IPList    []string  `json:"ip_list,omitempty"`
+	LastSeen  time.Time `json:"last_seen"`
+	Commands  []string  `json:"last_commands"`
 }
 
 // NewHTTPPollingProtocol creates a new HTTP polling protocol instance
@@ -107,6 +108,11 @@ func (p *HTTPPollingProtocol) handleAgentRequests(w http.ResponseWriter, r *http
 
 	AgentID := parts[3]
 	action := parts[4]
+	if AgentID == "" || action == "" {
+		log.Printf("[ERROR] Invalid request path with empty agent ID or action")
+		http.Error(w, "Invalid request path", http.StatusBadRequest)
+		return
+	}
 
 	// log.Printf("[DEBUG] Handling %s request from agent %s", action, AgentID)
 
@@ -159,9 +165,7 @@ func (p *HTTPPollingProtocol) handleAgentHeartbeat(w http.ResponseWriter, r *htt
 		return
 	}
 
-	log.Printf("[DEBUG] Received heartbeat data from agent %s: %s", AgentID, string(body))
-
-	if err := p.processAgentHeartbeat(body); err != nil {
+	if err := p.processAgentHeartbeat(body, AgentID); err != nil {
 		log.Printf("[ERROR] Failed to process heartbeat from agent %s: %v", AgentID, err)
 		http.Error(w, fmt.Sprintf("Error processing agent data: %v", err), http.StatusBadRequest)
 		return
@@ -273,11 +277,17 @@ func (p *HTTPPollingProtocol) HandleFileDownload(filename string) (io.Reader, er
 	return os.Open(filepath.Join(p.config.UploadDir, filename))
 }
 
-func (p *HTTPPollingProtocol) processAgentHeartbeat(agentData []byte) error {
+func (p *HTTPPollingProtocol) processAgentHeartbeat(agentData []byte, expectedAgentID string) error {
 	var agent Agent
 	if err := json.Unmarshal(agentData, &agent); err != nil {
 		log.Printf("[ERROR] Failed to unmarshal agent data: %v. Data: %s", err, string(agentData))
 		return fmt.Errorf("failed to unmarshal agent data: %w", err)
+	}
+	if strings.TrimSpace(agent.ID) == "" {
+		return fmt.Errorf("agent id is required")
+	}
+	if expectedAgentID != "" && agent.ID != expectedAgentID {
+		return fmt.Errorf("agent id mismatch: path %q, body %q", expectedAgentID, agent.ID)
 	}
 
 	p.agents.Lock()
@@ -290,7 +300,7 @@ func (p *HTTPPollingProtocol) processAgentHeartbeat(agentData []byte) error {
 
 // Restore the interface method for Protocol compatibility
 func (p *HTTPPollingProtocol) HandleAgentHeartbeat(agentData []byte) error {
-	return p.processAgentHeartbeat(agentData)
+	return p.processAgentHeartbeat(agentData, "")
 }
 
 // Remove handleSubmitResult from GetRoutes, as it no longer exists or is needed.

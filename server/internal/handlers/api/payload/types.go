@@ -37,11 +37,13 @@ type PayloadConfig struct {
 
 // PayloadResult contains information about a generated payload
 type PayloadResult struct {
-	ID       string `json:"id"`
-	Filename string `json:"filename"`
-	Path     string `json:"path"`
-	Size     int64  `json:"size"`
-	Created  string `json:"created"`
+	ID         string `json:"id"`
+	PayloadID  string `json:"payload_id,omitempty"`
+	ListenerID string `json:"listener_id,omitempty"`
+	Filename   string `json:"filename"`
+	Path       string `json:"path"`
+	Size       int64  `json:"size"`
+	Created    string `json:"created"`
 }
 
 // TLSConfig holds TLS configuration for secure listeners

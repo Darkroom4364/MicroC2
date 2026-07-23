@@ -31,18 +31,22 @@ func (h *APIHandler) HandleRequest(w http.ResponseWriter, r *http.Request) {
 
 	// Handle POST /api/agents/{AgentID}/command
 	if r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/agents/") && strings.HasSuffix(r.URL.Path, "/command") {
-		trimmed := strings.TrimPrefix(r.URL.Path, "/api/agents/")
-		AgentID := strings.TrimSuffix(trimmed, "/command")
-		AgentID = strings.TrimSuffix(AgentID, "/") // Remove trailing slash if present
+		AgentID, ok := parseAgentPathID(r.URL.Path, "/api/agents/", "/command")
+		if !ok {
+			http.Error(w, "Invalid agent ID", http.StatusBadRequest)
+			return
+		}
 		h.handleQueueAgentCommand(w, r, AgentID)
 		return
 	}
 
 	// Add GET /api/agents/{AgentID}/results endpoint
 	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/agents/") && strings.HasSuffix(r.URL.Path, "/results") {
-		trimmed := strings.TrimPrefix(r.URL.Path, "/api/agents/")
-		AgentID := strings.TrimSuffix(trimmed, "/results")
-		AgentID = strings.TrimSuffix(AgentID, "/")
+		AgentID, ok := parseAgentPathID(r.URL.Path, "/api/agents/", "/results")
+		if !ok {
+			http.Error(w, "Invalid agent ID", http.StatusBadRequest)
+			return
+		}
 		h.handleGetAgentResults(w, AgentID)
 		return
 	}
@@ -51,6 +55,16 @@ func (h *APIHandler) HandleRequest(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusNotFound)
 	w.Write([]byte(`{"error":"unknown operator API route"}`))
+}
+
+func parseAgentPathID(path, prefix, suffix string) (string, bool) {
+	trimmed := strings.TrimPrefix(path, prefix)
+	agentID := strings.TrimSuffix(trimmed, suffix)
+	agentID = strings.TrimSuffix(agentID, "/")
+	if agentID == "" || strings.Contains(agentID, "/") {
+		return "", false
+	}
+	return agentID, true
 }
 
 func (h *APIHandler) handleListAgents(w http.ResponseWriter, r *http.Request) {

@@ -3,6 +3,7 @@ pub mod config;
 pub mod dormant;
 pub mod file_handling;
 pub mod high_threat_tools;
+pub mod identity;
 pub mod networking;
 pub mod opsec;
 pub mod state;
