@@ -1,0 +1,69 @@
+{
+  "manifest_version": "1.0",
+  "study_id": "r1-pilot-2026-07",
+  "generated_by": "lab/build_matrix.sh",
+  "generated_at": "2026-07-22T12:00:00Z",
+  "cells": [
+    {
+      "cell_id": "5eed000000000001@slot-a",
+      "seed": "5eed000000000001",
+      "git_revision": "0000000000000000000000000000000000000000",
+      "artifact": {
+        "path": "seed_5eed000000000001/agent.exe",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "provenance_path": "seed_5eed000000000001/provenance.json"
+      },
+      "edr": {
+        "slot_id": "slot-a",
+        "product": "Example EDR One",
+        "version": "8.4.1, signatures 2026-07-20"
+      },
+      "timestamps": {
+        "built_at": "2026-07-22T12:00:01Z",
+        "run_started_at": "2026-07-22T14:03:11Z",
+        "run_finished_at": "2026-07-22T14:13:45Z"
+      },
+      "verdict": "detected",
+      "alert_names": [
+        "Behavior:Win32/SuspiciousBeacon.A",
+        "Suspicious network connection to uncommon host"
+      ],
+      "telemetry": {
+        "sysmon_evtx": "r1-pilot-2026-07/slot-a/5eed000000000001/sysmon.evtx",
+        "etw_etl": "r1-pilot-2026-07/slot-a/5eed000000000001/trace.etl",
+        "agent_network_log": "r1-pilot-2026-07/slot-a/5eed000000000001/c2.log",
+        "edr_export": "r1-pilot-2026-07/slot-a/5eed000000000001/edr_alerts.csv"
+      },
+      "notes": "Blocked at execution (behavioral, not static): on-write scan was clean, alert fired 42 s into dwell after first beacon. Sysmon confirms process + network + DNS events present."
+    },
+    {
+      "cell_id": "5eed000000000002@slot-a",
+      "seed": "5eed000000000002",
+      "git_revision": "0000000000000000000000000000000000000000",
+      "artifact": {
+        "path": "seed_5eed000000000002/agent.exe",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "provenance_path": "seed_5eed000000000002/provenance.json"
+      },
+      "edr": {
+        "slot_id": "slot-a",
+        "product": null,
+        "version": null
+      },
+      "timestamps": {
+        "built_at": "2026-07-22T12:00:02Z",
+        "run_started_at": null,
+        "run_finished_at": null
+      },
+      "verdict": "unknown",
+      "alert_names": [],
+      "telemetry": {
+        "sysmon_evtx": null,
+        "etw_etl": null,
+        "agent_network_log": null,
+        "edr_export": null
+      },
+      "notes": ""
+    }
+  ]
+}

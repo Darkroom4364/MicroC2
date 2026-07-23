@@ -1,0 +1,112 @@
+<!--
+  MicroC2 R1 lab Sysmon configuration.
+
+  Purpose: ground-truth telemetry for the R1 measurement protocol
+  (docs/research/r1-measurement-protocol.md). Derived from the
+  SwiftOnSecurity sysmon-config lineage, trimmed for signal-to-noise:
+  only the channels the protocol attributes against are enabled
+  (process creation, network, image load, file creation, registry, DNS),
+  plus process-access and remote-thread events useful for EDR telemetry
+  attribution. Noise-heavy channels (clipboard, WMI, pipe, driver load)
+  are off; common patch/boot noise is excluded.
+
+  Install:  sysmon64.exe -i sysmonconfig.xml
+  Update:   sysmon64.exe -c sysmonconfig.xml
+-->
+<Sysmon schemaversion="4.90">
+  <HashAlgorithms>sha256</HashAlgorithms>
+  <CheckRevocation/>
+  <DnsLookup>True</DnsLookup>
+  <ArchiveDirectory>Sysmon</ArchiveDirectory>
+  <EventFiltering>
+
+    <!-- ID 1: Process creation. Full command lines and hashes, no excludes
+         beyond the most frequent patch-cycle noise. -->
+    <ProcessCreate onmatch="exclude">
+      <Image condition="is">C:\Windows\System32\MoUsoCoreWorker.exe</Image>
+      <Image condition="is">C:\Windows\System32\usoclient.exe</Image>
+    </ProcessCreate>
+
+    <!-- ID 2: File creation time changed. Off (noise, not attributed). -->
+    <FileCreateTime onmatch="include"/>
+
+    <!-- ID 3: Network connection. Exclude routine Windows service noise;
+         lab VMs have no internet egress so most outbound is signal. -->
+    <NetworkConnect onmatch="exclude">
+      <Image condition="is">C:\Windows\System32\svchost.exe</Image>
+      <Image condition="is">C:\Windows\System32\spoolsv.exe</Image>
+      <Image condition="is">C:\Windows\System32\lsass.exe</Image>
+      <Image condition="begin with">C:\Program Files\Windows Defender\</Image>
+    </NetworkConnect>
+
+    <!-- ID 5: Process terminated. Included: lets the analysis bound the
+         agent's lifetime when the EDR kills it mid-dwell. -->
+    <ProcessTerminate onmatch="include">
+      <Image condition="begin with">C:\</Image>
+    </ProcessTerminate>
+
+    <!-- ID 6: Driver loaded. Off. -->
+    <DriverLoad onmatch="include"/>
+
+    <!-- ID 7: Image load. Expensive, so scoped: only loads into processes
+         outside the Windows/Program Files trees (where the payload and
+         any child processes run in this lab). -->
+    <ImageLoad onmatch="include">
+      <Image condition="excludes">C:\Windows\</Image>
+      <Image condition="excludes">C:\Program Files\</Image>
+      <Image condition="excludes">C:\Program Files (x86)\</Image>
+    </ImageLoad>
+
+    <!-- ID 8: CreateRemoteThread. Classic injection signal; include all,
+         lab volume is low. -->
+    <CreateRemoteThread onmatch="exclude"/>
+
+    <!-- ID 9: RawAccessRead. Off. -->
+    <RawAccessRead onmatch="include"/>
+
+    <!-- ID 10: Process access. Scoped to accesses of lsass (credential
+         access ground truth); general access events are too noisy. -->
+    <ProcessAccess onmatch="include">
+      <TargetImage condition="is">C:\Windows\System32\lsass.exe</TargetImage>
+    </ProcessAccess>
+
+    <!-- ID 11: File created. Include all; per-cell volume in the lab is
+         small and the payload's drops are primary evidence. -->
+    <FileCreate onmatch="exclude">
+      <Image condition="is">C:\Windows\System32\svchost.exe</Image>
+    </FileCreate>
+
+    <!-- ID 12/13/14: Registry create/delete, value set, rename. -->
+    <RegistryEvent onmatch="exclude">
+      <Image condition="is">C:\Windows\System32\svchost.exe</Image>
+    </RegistryEvent>
+
+    <!-- ID 15: File create stream hash (ADS). Cheap in the lab, catches
+         Zone.Identifier and ADS drops. -->
+    <FileCreateStreamHash onmatch="exclude"/>
+
+    <!-- ID 17/18: Pipe events. Off. -->
+    <PipeEvent onmatch="include"/>
+
+    <!-- ID 19/20/21: WMI events. Off. -->
+    <WmiEvent onmatch="include"/>
+
+    <!-- ID 22: DNS query. Include all; lab has no recursive resolver noise
+         beyond the VMs themselves. -->
+    <DnsQuery onmatch="exclude"/>
+
+    <!-- ID 23: File delete (archived). Keep: payload self-deletion or EDR
+         quarantine actions are visible here. -->
+    <FileDelete onmatch="exclude"/>
+
+    <!-- ID 24: Clipboard change. Off. -->
+    <ClipboardChange onmatch="include"/>
+
+    <!-- ID 25: Process tampering. Include: relevant to EDR/agent interplay. -->
+    <ProcessTampering onmatch="exclude"/>
+
+    <!-- ID 26: File delete detected (no archive). Off in favor of ID 23. -->
+    <FileDeleteDetected onmatch="include"/>
+
+  </EventFiltering>
+</Sysmon>
