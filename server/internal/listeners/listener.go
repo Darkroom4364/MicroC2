@@ -9,10 +9,13 @@ import (
 	"log"
 	behaviour "microc2/server/internal/behaviour"
 	"microc2/server/internal/common"
+	"microc2/server/internal/persistence"
+	"microc2/server/internal/tasks"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +25,9 @@ import (
 type ListenerStatus string
 
 const (
+	listenerDirectoryMode = 0o700
+	listenerConfigMode    = 0o600
+
 	// StatusActive indicates the listener is running and accepting connections
 	StatusActive ListenerStatus = "ACTIVE"
 
@@ -90,6 +96,7 @@ type Listener struct {
 	server          *http.Server
 	protocolHandler http.Handler // HTTP handler for http
 	Protocol        common.Protocol
+	onError         func(error)
 }
 
 // ListenerStats tracks operational statistics for a listener
@@ -158,23 +165,44 @@ func cloneStringMap(in map[string]string) map[string]string {
 //   - Listener is in stopped state
 //   - Returns error if the protocol is not supported or configuration is invalid
 func NewListener(config ListenerConfig) (*Listener, error) {
-	config.Protocol = strings.ToLower(config.Protocol)
+	return newListener(
+		config,
+		filepath.Join("static", "listeners"),
+		nil,
+		true,
+	)
+}
 
-	// Create listener-specific directory in static/listeners
-	listenerDir := filepath.Join("static", "listeners", config.Name)
-	if err := os.MkdirAll(listenerDir, 0755); err != nil {
+func newListener(
+	config ListenerConfig,
+	listenersDir string,
+	database *persistence.Database,
+	saveConfig bool,
+) (*Listener, error) {
+	config.Protocol = strings.ToLower(config.Protocol)
+	if err := validateListenerIdentity(config); err != nil {
+		return nil, err
+	}
+	if listenersDir == "" {
+		listenersDir = filepath.Join("static", "listeners")
+	}
+	if err := ensurePrivateDirectory(listenersDir); err != nil {
+		return nil, fmt.Errorf("failed to prepare listeners directory: %v", err)
+	}
+
+	listenerDir := filepath.Join(listenersDir, config.Name)
+	if err := ensurePrivateDirectory(listenerDir); err != nil {
 		return nil, fmt.Errorf("failed to create listener directory: %v", err)
 	}
 
-	// Save configuration to file
-	configJson, err := json.MarshalIndent(config, "", "    ")
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal listener config: %v", err)
-	}
-
-	configPath := filepath.Join(listenerDir, "config.json")
-	if err := os.WriteFile(configPath, configJson, 0644); err != nil {
-		return nil, fmt.Errorf("failed to save listener config: %v", err)
+	if saveConfig {
+		if err := writeListenerConfigProjection(
+			listenersDir,
+			config,
+			database != nil,
+		); err != nil {
+			return nil, err
+		}
 	}
 
 	// Initialize protocol handler based on config
@@ -183,14 +211,33 @@ func NewListener(config ListenerConfig) (*Listener, error) {
 	switch config.Protocol {
 	case "http", "https":
 		protoConfig := common.BaseProtocolConfig{
-			UploadDir: filepath.Join("static", "listeners", config.Name, "uploads"),
+			UploadDir: filepath.Join(listenerDir, "uploads"),
 			Port:      fmt.Sprintf("%d", config.Port),
 		}
-		httpProto := behaviour.NewHTTPPollingProtocol(protoConfig)
+		var httpProto *behaviour.HTTPPollingProtocol
+		if database == nil {
+			httpProto = behaviour.NewHTTPPollingProtocol(protoConfig)
+		} else {
+			var err error
+			httpProto, err = behaviour.NewHTTPPollingProtocolWithPersistence(
+				protoConfig,
+				database,
+				config.ID,
+			)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"load durable protocol state for listener %s: %w",
+					config.ID,
+					err,
+				)
+			}
+		}
 		protoHandler = httpProto.GetHTTPHandler()
 		proto = httpProto
 		// Ensure upload directory exists
-		os.MkdirAll(protoConfig.UploadDir, 0755)
+		if err := ensurePrivateDirectory(protoConfig.UploadDir); err != nil {
+			return nil, fmt.Errorf("create listener upload directory: %w", err)
+		}
 	case "dns", "dnsoverhttps":
 		// DNSoverHTTPS logic (may be implemented later)
 		return nil, fmt.Errorf("DNSoverHTTPS protocol is not implemented yet")
@@ -207,6 +254,172 @@ func NewListener(config ListenerConfig) (*Listener, error) {
 		Protocol:        proto,
 	}
 	return l, nil
+}
+
+func ensurePrivateDirectory(path string) error {
+	if err := os.MkdirAll(path, listenerDirectoryMode); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("path is not a private directory")
+	}
+	if err := os.Chmod(path, listenerDirectoryMode); err != nil {
+		return err
+	}
+	return nil
+}
+
+func writeListenerConfigProjection(
+	listenersDir string,
+	config ListenerConfig,
+	redactSecrets bool,
+) (returnErr error) {
+	if err := validateListenerIdentity(config); err != nil {
+		return err
+	}
+	if redactSecrets {
+		config = redactedListenerConfig(config)
+	}
+	configJSON, err := json.MarshalIndent(config, "", "    ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal listener config: %w", err)
+	}
+
+	if err := ensurePrivateDirectory(listenersDir); err != nil {
+		return fmt.Errorf("secure listeners directory: %w", err)
+	}
+	listenerDir := filepath.Join(listenersDir, config.Name)
+	if err := ensurePrivateDirectory(listenerDir); err != nil {
+		return fmt.Errorf("secure listener directory: %w", err)
+	}
+	configPath := filepath.Join(listenerDir, "config.json")
+	temp, err := os.CreateTemp(listenerDir, ".config-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create listener config temporary file: %w", err)
+	}
+	tempPath := temp.Name()
+	defer func() {
+		if returnErr != nil {
+			_ = temp.Close()
+		}
+		_ = os.Remove(tempPath)
+	}()
+
+	if err := temp.Chmod(listenerConfigMode); err != nil {
+		return fmt.Errorf("secure listener config temporary file: %w", err)
+	}
+	if _, err := temp.Write(configJSON); err != nil {
+		return fmt.Errorf("write listener config temporary file: %w", err)
+	}
+	if err := temp.Sync(); err != nil {
+		return fmt.Errorf("sync listener config temporary file: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("close listener config temporary file: %w", err)
+	}
+	if err := os.Rename(tempPath, configPath); err != nil {
+		return fmt.Errorf("replace listener config atomically: %w", err)
+	}
+	if err := os.Chmod(configPath, listenerConfigMode); err != nil {
+		return fmt.Errorf("secure listener config: %w", err)
+	}
+	if runtime.GOOS != "windows" {
+		directory, err := os.Open(listenerDir)
+		if err != nil {
+			return fmt.Errorf("open listener directory for sync: %w", err)
+		}
+		syncErr := directory.Sync()
+		closeErr := directory.Close()
+		if syncErr != nil {
+			return fmt.Errorf("sync listener directory: %w", syncErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close listener directory after sync: %w", closeErr)
+		}
+	}
+	return nil
+}
+
+func readListenerConfigProjection(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("listener config is not a regular file")
+	}
+	if err := ensurePrivateDirectory(filepath.Dir(path)); err != nil {
+		return nil, fmt.Errorf("secure listener directory: %w", err)
+	}
+	if err := os.Chmod(path, listenerConfigMode); err != nil {
+		return nil, fmt.Errorf("secure listener config: %w", err)
+	}
+	return os.ReadFile(path)
+}
+
+func redactedListenerConfig(config ListenerConfig) ListenerConfig {
+	if config.Proxy == nil {
+		return config
+	}
+	proxy := *config.Proxy
+	proxy.Password = ""
+	config.Proxy = &proxy
+	return config
+}
+
+func validateListenerIdentity(config ListenerConfig) error {
+	if err := tasks.ValidateIdentifier("listener id", config.ID); err != nil {
+		return err
+	}
+	name := config.Name
+	if name == "" {
+		return errors.New("listener name is required")
+	}
+	if name != strings.TrimSpace(name) {
+		return errors.New("listener name must not contain surrounding whitespace")
+	}
+	if len(name) > 128 {
+		return errors.New("listener name must be at most 128 bytes")
+	}
+	for index := 0; index < len(name); index++ {
+		character := name[index]
+		if character < 0x20 || character > 0x7e {
+			return errors.New(
+				"listener name must contain only printable ASCII characters",
+			)
+		}
+		if strings.ContainsRune(`<>:"/\|?*`, rune(character)) {
+			return errors.New(
+				"listener name contains a character that is not portable across filesystems",
+			)
+		}
+	}
+	if strings.HasSuffix(name, ".") {
+		return errors.New("listener name must not end with a period")
+	}
+	if isReservedWindowsListenerName(name) {
+		return errors.New("listener name is reserved on Windows")
+	}
+	return nil
+}
+
+func isReservedWindowsListenerName(name string) bool {
+	stem := name
+	if dot := strings.IndexByte(stem, '.'); dot >= 0 {
+		stem = stem[:dot]
+	}
+	upper := strings.ToUpper(strings.TrimRight(stem, " ."))
+	switch upper {
+	case "CON", "PRN", "AUX", "NUL":
+		return true
+	}
+	return len(upper) == 4 &&
+		(upper[:3] == "COM" || upper[:3] == "LPT") &&
+		upper[3] >= '1' && upper[3] <= '9'
 }
 
 // Start initiates the listener
@@ -392,9 +605,8 @@ func (l *Listener) GetError() string {
 //   - Error message is stored
 func (l *Listener) SetError(err error) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-
 	if l.Status == StatusStopped && (err == http.ErrServerClosed || errors.Is(err, net.ErrClosed)) {
+		l.mu.Unlock()
 		return
 	}
 	l.Status = StatusError
@@ -402,5 +614,10 @@ func (l *Listener) SetError(err error) {
 		l.Error = err.Error()
 	} else {
 		l.Error = "Unknown error"
+	}
+	onError := l.onError
+	l.mu.Unlock()
+	if onError != nil {
+		onError(err)
 	}
 }

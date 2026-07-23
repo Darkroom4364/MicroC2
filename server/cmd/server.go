@@ -15,6 +15,7 @@ import (
 	"microc2/server/internal/handlers/api"
 	"microc2/server/internal/handlers/web"
 	"microc2/server/internal/handlers/ws"
+	"microc2/server/internal/persistence"
 	"microc2/server/internal/protocols" // Updated from `networking`
 	"microc2/server/internal/websocket"
 	"microc2/server/pkg/communication"
@@ -51,6 +52,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
+	stateDatabase, err := persistence.Open(cfg.Storage.Path)
+	if err != nil {
+		log.Fatalf("Failed to initialize durable state: %v", err)
+	}
+	defer stateDatabase.Close()
+	log.Printf("[CONFIG] Durable state database: %s", stateDatabase.Path())
 
 	// Set up the operator guard: loopback clients always pass; non-loopback
 	// clients need the configured operator token. Also enforces the origin
@@ -73,7 +80,7 @@ func main() {
 
 	// Create required directories
 	listenersDir := filepath.Join(cfg.Server.StaticDir, "listeners")
-	if err := os.MkdirAll(listenersDir, 0755); err != nil {
+	if err := os.MkdirAll(listenersDir, 0700); err != nil {
 		log.Fatalf("Failed to create listeners directory: %v", err)
 	}
 	log.Printf("[CONFIG] Created listeners directory: %s", listenersDir)
@@ -91,6 +98,7 @@ func main() {
 		StaticDir:    cfg.Server.StaticDir,
 		ProtocolType: cfg.Communication.Protocol,
 		CORSOrigins:  corsOrigins,
+		Database:     stateDatabase,
 	}
 
 	// Create and start server manager
@@ -111,7 +119,15 @@ func main() {
 	// Initialize payload handler
 	payloadDir := filepath.Join(cfg.Server.StaticDir, "payloads")
 	agentSourceDir := "../agent" // Relative path to agent source code
-	payloadHandler := api.PayloadHandlerSetup(payloadDir, agentSourceDir, serverManager.GetListenerManager())
+	payloadHandler, err := api.PayloadHandlerSetup(
+		payloadDir,
+		agentSourceDir,
+		serverManager.GetListenerManager(),
+		stateDatabase,
+	)
+	if err != nil {
+		log.Fatalf("Failed to initialize payload handler: %v", err)
+	}
 	operatorMux := http.NewServeMux()
 
 	// Set up HTTP routes

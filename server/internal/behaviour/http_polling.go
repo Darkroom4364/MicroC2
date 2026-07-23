@@ -9,10 +9,12 @@ import (
 	"log"
 	"microc2/server/internal/common"
 	"microc2/server/internal/filestore"
+	"microc2/server/internal/persistence"
 	"microc2/server/internal/tasks"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,17 +22,47 @@ import (
 )
 
 type HTTPPollingProtocol struct {
-	config    common.BaseProtocolConfig
-	mux       *http.ServeMux
-	taskStore *tasks.Store
-	results   struct {
+	config     common.BaseProtocolConfig
+	mux        *http.ServeMux
+	taskStore  taskStateStore
+	database   *persistence.Database
+	listenerID string
+	results    struct {
 		sync.Mutex
 		history map[string][]CommandResult // AgentID -> []CommandResult
 	}
 	agents struct {
 		sync.Mutex
-		list map[string]*Agent
+		list           map[string]*Agent
+		activeThisBoot map[string]bool
 	}
+}
+
+type taskStateStore interface {
+	Create(agentID string, request tasks.CreateRequest) (tasks.Task, error)
+	CreateLegacyShell(agentID, command string) (tasks.Task, error)
+	List(agentID string) ([]tasks.Task, error)
+	Get(agentID, taskID string) (tasks.Task, error)
+	DispatchNext(agentID string) (tasks.Task, bool, error)
+	DispatchNextLegacy(agentID string) (tasks.Task, bool, error)
+	MarkRunning(agentID, taskID string, update tasks.StatusUpdate) (tasks.Task, error)
+	CompleteWithInfo(agentID string, result tasks.Result) (tasks.Task, tasks.CompletionInfo, error)
+	Cancel(agentID, taskID string) (tasks.Task, error)
+	CompleteLegacy(agentID, command, output string) (tasks.Task, bool, error)
+}
+
+type durableLegacyResultPager interface {
+	GetLegacyResultsPage(
+		agentID string,
+		offset, limit, maxEncodedBytes int,
+	) ([]tasks.LegacyResult, int, bool, error)
+}
+
+type taskSummaryPager interface {
+	ListTaskSummariesPage(
+		agentID string,
+		offset, limit int,
+	) ([]tasks.TaskSummary, int, error)
 }
 
 type CommandResult struct {
@@ -39,27 +71,72 @@ type CommandResult struct {
 	Timestamp string `json:"timestamp"`
 }
 
+const maxAgentHeartbeatBodyBytes = 64 << 10
+
+var errAgentHeartbeatPersistence = errors.New("agent heartbeat persistence failed")
+
 type Agent struct {
-	ID        string    `json:"id"`
-	PayloadID string    `json:"payload_id,omitempty"`
-	OS        string    `json:"os"`
-	Hostname  string    `json:"hostname"`
-	IP        string    `json:"ip"`
-	IPList    []string  `json:"ip_list,omitempty"`
-	LastSeen  time.Time `json:"last_seen"`
-	Commands  []string  `json:"last_commands"`
+	ID         string    `json:"id"`
+	ListenerID string    `json:"listener_id,omitempty"`
+	PayloadID  string    `json:"payload_id,omitempty"`
+	OS         string    `json:"os"`
+	Hostname   string    `json:"hostname"`
+	IP         string    `json:"ip"`
+	IPList     []string  `json:"ip_list,omitempty"`
+	LastSeen   time.Time `json:"last_seen"`
+	Commands   []string  `json:"last_commands"`
 }
 
 // NewHTTPPollingProtocol creates a new HTTP polling protocol instance
 func NewHTTPPollingProtocol(config common.BaseProtocolConfig) *HTTPPollingProtocol {
+	return newHTTPPollingProtocol(config, tasks.NewStore(), nil, "")
+}
+
+// NewHTTPPollingProtocolWithPersistence loads listener-scoped durable agents,
+// tasks, results, and dispatch lease state. listenerID is supplied by the
+// server-side listener configuration and never trusted from heartbeat data.
+func NewHTTPPollingProtocolWithPersistence(
+	config common.BaseProtocolConfig,
+	database *persistence.Database,
+	listenerID string,
+) (*HTTPPollingProtocol, error) {
+	if database == nil {
+		return nil, errors.New("durable polling protocol requires a database")
+	}
+	if err := tasks.ValidateIdentifier("listener_id", listenerID); err != nil {
+		return nil, err
+	}
+	taskStore, err := tasks.NewDurableStore(database, listenerID, time.Now)
+	if err != nil {
+		return nil, err
+	}
+	p := newHTTPPollingProtocol(config, taskStore, database, listenerID)
+	if err := p.loadPersistedAgents(); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+func newHTTPPollingProtocol(
+	config common.BaseProtocolConfig,
+	taskStore taskStateStore,
+	database *persistence.Database,
+	listenerID string,
+) *HTTPPollingProtocol {
 	p := &HTTPPollingProtocol{
-		config:    config,
-		mux:       http.NewServeMux(),
-		taskStore: tasks.NewStore(),
+		config:     config,
+		mux:        http.NewServeMux(),
+		taskStore:  taskStore,
+		database:   database,
+		listenerID: listenerID,
 		agents: struct {
 			sync.Mutex
-			list map[string]*Agent
-		}{list: make(map[string]*Agent)},
+			list           map[string]*Agent
+			activeThisBoot map[string]bool
+		}{
+			list:           make(map[string]*Agent),
+			activeThisBoot: make(map[string]bool),
+		},
 	}
 	p.results.history = make(map[string][]CommandResult)
 	p.registerRoutes()
@@ -166,15 +243,24 @@ func (p *HTTPPollingProtocol) handleAgentHeartbeat(w http.ResponseWriter, r *htt
 
 	// log.Printf("[DEBUG] Processing heartbeat from agent %s", AgentID)
 
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxAgentHeartbeatBodyBytes))
 	if err != nil {
 		log.Printf("[ERROR] Failed to read heartbeat body from agent %s: %v", AgentID, err)
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			http.Error(w, "Heartbeat request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "Error reading request body", http.StatusBadRequest)
 		return
 	}
 
 	if err := p.processAgentHeartbeat(body, AgentID); err != nil {
 		log.Printf("[ERROR] Failed to process heartbeat from agent %s: %v", AgentID, err)
+		if errors.Is(err, errAgentHeartbeatPersistence) {
+			http.Error(w, "Failed to persist agent heartbeat", http.StatusInternalServerError)
+			return
+		}
 		http.Error(w, fmt.Sprintf("Error processing agent data: %v", err), http.StatusBadRequest)
 		return
 	}
@@ -254,7 +340,8 @@ func (p *HTTPPollingProtocol) handleTypedAgentResult(w http.ResponseWriter, r *h
 		writeTaskError(w, err)
 		return
 	}
-	if completion.LegacyOrigin && completion.Applied {
+	if _, durable := p.taskStore.(durableLegacyResultPager); !durable &&
+		completion.LegacyOrigin && completion.Applied {
 		p.recordLegacyResultForAgent(agentID, projectTypedTaskToLegacyResult(task))
 	}
 	writeTaskJSON(w, http.StatusOK, task)
@@ -286,7 +373,7 @@ func (p *HTTPPollingProtocol) handleLegacyAgentResult(w http.ResponseWriter, r *
 	if _, matched, err := p.taskStore.CompleteLegacy(agentID, result.Command, result.Output); err != nil {
 		writeTaskError(w, err)
 		return
-	} else if matched {
+	} else if _, durable := p.taskStore.(durableLegacyResultPager); matched && !durable {
 		p.recordLegacyResultForAgent(agentID, result)
 	}
 	w.WriteHeader(http.StatusOK)
@@ -341,11 +428,19 @@ func (p *HTTPPollingProtocol) processAgentHeartbeat(agentData []byte, expectedAg
 	if expectedAgentID != "" && agent.ID != expectedAgentID {
 		return fmt.Errorf("agent id mismatch: path %q, body %q", expectedAgentID, agent.ID)
 	}
+	if err := validateAgentHeartbeat(agent); err != nil {
+		return err
+	}
 
 	p.agents.Lock()
 	defer p.agents.Unlock()
-	agent.LastSeen = time.Now()
+	agent.ListenerID = p.listenerID
+	agent.LastSeen = time.Now().UTC().Round(0)
+	if err := p.persistAgent(agent); err != nil {
+		return fmt.Errorf("%w: %w", errAgentHeartbeatPersistence, err)
+	}
 	p.agents.list[agent.ID] = &agent
+	p.agents.activeThisBoot[agent.ID] = true
 	log.Printf("[DEBUG] Agent %s added/updated in list. Total agents: %d", agent.ID, len(p.agents.list))
 	return nil
 }
@@ -549,13 +644,6 @@ func (p *HTTPPollingProtocol) handleListAgents(w http.ResponseWriter, r *http.Re
 	p.agents.Lock()
 	defer p.agents.Unlock()
 
-	// Clean up stale agents (not seen in last 5 minutes)
-	for id, agent := range p.agents.list {
-		if time.Since(agent.LastSeen) > 5*time.Minute {
-			delete(p.agents.list, id)
-		}
-	}
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(p.agents.list)
 }
@@ -577,6 +665,12 @@ func (p *HTTPPollingProtocol) AgentLastSeen(agentID string) (time.Time, bool) {
 	agent, ok := p.agents.list[agentID]
 	if !ok || agent == nil {
 		return time.Time{}, false
+	}
+	if !p.agents.activeThisBoot[agentID] {
+		// Persisted agents are historical after restart. A fresh heartbeat is
+		// required before operator dispatch until #104 adds authenticated
+		// enrollment sessions.
+		return time.Time{}, true
 	}
 	return agent.LastSeen, true
 }
@@ -601,6 +695,46 @@ func (p *HTTPPollingProtocol) ListTasks(agentID string) ([]tasks.Task, error) {
 	return p.taskStore.List(agentID)
 }
 
+// ListTaskSummariesPage uses the durable metadata-only query when available.
+// The in-memory fallback preserves the same newest-first operator contract for
+// focused tests and legacy callers.
+func (p *HTTPPollingProtocol) ListTaskSummariesPage(
+	agentID string,
+	offset, limit int,
+) ([]tasks.TaskSummary, int, error) {
+	if pager, ok := p.taskStore.(taskSummaryPager); ok {
+		return pager.ListTaskSummariesPage(agentID, offset, limit)
+	}
+	history, err := p.taskStore.List(agentID)
+	if err != nil {
+		return nil, 0, err
+	}
+	sort.Slice(history, func(i, j int) bool {
+		if history[i].CreatedAt.Equal(history[j].CreatedAt) {
+			return history[i].ID > history[j].ID
+		}
+		return history[i].CreatedAt.After(history[j].CreatedAt)
+	})
+	total := len(history)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		offset = total
+	}
+	if limit < 0 {
+		limit = 0
+	}
+	if limit > total-offset {
+		limit = total - offset
+	}
+	summaries := make([]tasks.TaskSummary, 0, limit)
+	for _, task := range history[offset : offset+limit] {
+		summaries = append(summaries, tasks.Summarize(task))
+	}
+	return summaries, total, nil
+}
+
 func (p *HTTPPollingProtocol) CancelTask(agentID, taskID string) (tasks.Task, error) {
 	return p.taskStore.Cancel(agentID, taskID)
 }
@@ -621,37 +755,26 @@ func (p *HTTPPollingProtocol) GetResultsHistoryKeys() []string {
 }
 
 func (p *HTTPPollingProtocol) GetResults(AgentID string) []map[string]interface{} {
-	// log.Printf("[DEBUG] GetResults called for AgentID=%s", AgentID)
-	p.results.Lock()
-	defer p.results.Unlock()
-	// Log keys directly to avoid deadlock
-	keys := make([]string, 0, len(p.results.history))
-	for k := range p.results.history {
-		keys = append(keys, k)
-	}
-	// log.Printf("[DEBUG] Results history keys: %v", keys)
-	history := p.results.history[AgentID]
-	// log.Printf("[DEBUG] Results history for AgentID=%s: %+v", AgentID, history)
-	var results []map[string]interface{}
-	for _, res := range history {
-		results = append(results, map[string]interface{}{
-			"command":   res.Command,
-			"output":    res.Output,
-			"timestamp": res.Timestamp,
-		})
-	}
-	// log.Printf("[DEBUG] Returning %d results for AgentID=%s", len(results), AgentID)
+	results, _ := p.GetResultsPage(AgentID, 0, tasks.MaxTaskHistoryPerAgent)
 	return results
 }
 
-// GetResultsPage returns a bounded slice of deprecated command results and the
-// total retained count. The slice is copied while holding the result lock, so
-// callers never need to materialize or race over the full listener history.
-func (p *HTTPPollingProtocol) GetResultsPage(
+// ListLegacyResultsPage returns compatibility results within an encoded JSON
+// body budget. Durable stores apply the budget while SQLite rows are stepped;
+// the in-memory fallback applies the identical accounting to its resident data.
+func (p *HTTPPollingProtocol) ListLegacyResultsPage(
 	agentID string,
-	offset int,
-	limit int,
-) ([]map[string]interface{}, int) {
+	offset, limit, maxEncodedBytes int,
+) ([]tasks.LegacyResult, int, bool, error) {
+	if pager, ok := p.taskStore.(durableLegacyResultPager); ok {
+		return pager.GetLegacyResultsPage(
+			agentID,
+			offset,
+			limit,
+			maxEncodedBytes,
+		)
+	}
+
 	p.results.Lock()
 	defer p.results.Unlock()
 
@@ -666,13 +789,61 @@ func (p *HTTPPollingProtocol) GetResultsPage(
 	if limit < 0 {
 		limit = 0
 	}
-	available := total - offset
-	if limit > available {
-		limit = available
+	if limit > total-offset {
+		limit = total - offset
 	}
-	end := offset + limit
-	results := make([]map[string]interface{}, 0, limit)
-	for _, result := range history[offset:end] {
+
+	results := make([]tasks.LegacyResult, 0, limit)
+	truncated := false
+	encodedSize := len("[]\n")
+	if limit > 0 && maxEncodedBytes < encodedSize {
+		return results, total, true, nil
+	}
+	for _, result := range history[offset : offset+limit] {
+		legacyResult := tasks.LegacyResult{
+			Command:   result.Command,
+			Output:    result.Output,
+			Timestamp: result.Timestamp,
+		}
+		encoded, err := json.Marshal(legacyResult)
+		if err != nil {
+			return nil, 0, false, fmt.Errorf("measure legacy result: %w", err)
+		}
+		separatorSize := 0
+		if len(results) > 0 {
+			separatorSize = 1
+		}
+		used := encodedSize + separatorSize
+		if used > maxEncodedBytes || len(encoded) > maxEncodedBytes-used {
+			truncated = true
+			break
+		}
+		results = append(results, legacyResult)
+		encodedSize = used + len(encoded)
+	}
+	return results, total, truncated, nil
+}
+
+// GetResultsPage retains the legacy no-error interface for compatibility.
+// Operator APIs use ListLegacyResultsPage directly so storage failures become
+// 5xx responses instead of plausible empty history.
+func (p *HTTPPollingProtocol) GetResultsPage(
+	agentID string,
+	offset int,
+	limit int,
+) ([]map[string]interface{}, int) {
+	page, total, _, err := p.ListLegacyResultsPage(
+		agentID,
+		offset,
+		limit,
+		tasks.MaxLegacyResultPageBytes,
+	)
+	if err != nil {
+		log.Printf("[ERROR] Failed to load legacy results: %v", err)
+		return []map[string]interface{}{}, 0
+	}
+	results := make([]map[string]interface{}, 0, len(page))
+	for _, result := range page {
 		results = append(results, map[string]interface{}{
 			"command":   result.Command,
 			"output":    result.Output,

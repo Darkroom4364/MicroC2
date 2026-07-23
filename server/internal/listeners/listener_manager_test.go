@@ -119,6 +119,117 @@ func TestCreateListenerRejectsDuplicateName(t *testing.T) {
 	}
 }
 
+func TestCreateListenerRejectsUnsafeStorageName(t *testing.T) {
+	withTempWorkingDir(t)
+
+	manager := NewListenerManager(nil)
+	for _, name := range []string{
+		"../escape",
+		`..\escape`,
+		".",
+		" padded ",
+		"é",
+		"e\u0301",
+		"trailing.",
+		"bad:name",
+		`bad"name`,
+		"bad|name",
+		"CON",
+		"CON.txt",
+		"con",
+		"PRN",
+		"AUX",
+		"NUL",
+		"COM1",
+		"com9",
+		"LPT1",
+		"lpt9",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := manager.CreateListener(ListenerConfig{
+				Name:     name,
+				Protocol: "http",
+				BindHost: "127.0.0.1",
+				Port:     12345,
+			})
+			if err == nil {
+				t.Fatalf("unsafe listener name %q was accepted", name)
+			}
+		})
+	}
+	for _, name := range []string{
+		"listener",
+		"Listener_01",
+		"http-prod",
+		"base - http",
+		"prod.http",
+		"prod@lab",
+		"_prod",
+		"-prod",
+		".prod",
+		"@prod",
+		"COM0",
+		"LPT10",
+	} {
+		if err := validateListenerIdentity(ListenerConfig{
+			ID:   "portable-name-test",
+			Name: name,
+		}); err != nil {
+			t.Fatalf("portable listener name %q was rejected: %v", name, err)
+		}
+	}
+	if _, err := os.Stat("escape"); !os.IsNotExist(err) {
+		t.Fatalf("unsafe listener name created an escaped path: %v", err)
+	}
+}
+
+func TestAllAgentsUsesUnambiguousScopedKeys(t *testing.T) {
+	withTempWorkingDir(t)
+
+	manager := NewListenerManager(nil)
+	addAgent := func(listenerID, name, agentID string, port int) {
+		t.Helper()
+		listener, err := NewListener(ListenerConfig{
+			ID:       listenerID,
+			Name:     name,
+			Protocol: "http",
+			BindHost: "127.0.0.1",
+			Port:     port,
+		})
+		if err != nil {
+			t.Fatalf("create listener %s: %v", listenerID, err)
+		}
+		heartbeat, err := json.Marshal(map[string]string{
+			"id":       agentID,
+			"os":       "linux",
+			"hostname": listenerID,
+			"ip":       "127.0.0.1",
+		})
+		if err != nil {
+			t.Fatalf("marshal heartbeat: %v", err)
+		}
+		if err := listener.Protocol.HandleAgentHeartbeat(heartbeat); err != nil {
+			t.Fatalf("register agent %s: %v", agentID, err)
+		}
+		if err := manager.AddListener(listener); err != nil {
+			t.Fatalf("add listener %s: %v", listenerID, err)
+		}
+	}
+	addAgent("scope", "scope-listener", "agent", 49011)
+	addAgent("other", "other-listener", "agent", 49012)
+	addAgent("unique", "unique-listener", "scope:agent", 49013)
+
+	agents := manager.AllAgents()
+	if len(agents) != 3 {
+		t.Fatalf("agent map count = %d, want 3: %#v", len(agents), agents)
+	}
+	for _, key := range []string{"scope/agent", "other/agent", "scope:agent"} {
+		if _, exists := agents[key]; !exists {
+			t.Fatalf("agent map is missing unambiguous key %q: %#v", key, agents)
+		}
+	}
+}
+
 func TestCreateHTTPSListenerWithMissingCertDoesNotRegister(t *testing.T) {
 	withTempWorkingDir(t)
 

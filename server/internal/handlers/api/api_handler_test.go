@@ -10,6 +10,7 @@ import (
 	"microc2/server/internal/behaviour"
 	"microc2/server/internal/common"
 	"microc2/server/internal/listeners"
+	"microc2/server/internal/persistence"
 	"microc2/server/internal/tasks"
 	"microc2/server/pkg/communication"
 	"net/http"
@@ -239,6 +240,7 @@ func TestOperatorAPITaskListPaginationIsBoundedAndNewestFirst(t *testing.T) {
 	if emptyPage.Total != len(created) ||
 		emptyPage.Offset != 1000 ||
 		emptyPage.NextOffset != nil ||
+		emptyPage.Tasks == nil ||
 		len(emptyPage.Tasks) != 0 {
 		t.Fatalf("unexpected beyond-end page: %#v", emptyPage)
 	}
@@ -611,6 +613,202 @@ func TestOperatorAPITaskHistoryIncludesStoppedListenerDetail(t *testing.T) {
 	}
 }
 
+func TestOperatorAPIDurableHistorySurvivesWithoutRuntimeListenerConfig(t *testing.T) {
+	root := t.TempDir()
+	databasePath := filepath.Join(root, "state", "microc2.db")
+	database, err := persistence.Open(databasePath)
+	if err != nil {
+		t.Fatalf("open initial durable database: %v", err)
+	}
+
+	listenerID := "orphaned-listener"
+	agentID := "agent-one"
+	protocol, err := behaviour.NewHTTPPollingProtocolWithPersistence(
+		common.BaseProtocolConfig{
+			UploadDir: filepath.Join(root, "listener-uploads"),
+			Port:      "0",
+		},
+		database,
+		listenerID,
+	)
+	if err != nil {
+		t.Fatalf("create initial durable protocol: %v", err)
+	}
+	if err := protocol.HandleAgentHeartbeat([]byte(
+		`{"id":"agent-one","payload_id":"payload-one","os":"linux",` +
+			`"hostname":"durable-host","ip":"127.0.0.1"}`,
+	)); err != nil {
+		t.Fatalf("persist durable agent: %v", err)
+	}
+
+	now := time.Now().UTC()
+	store, err := tasks.NewDurableStore(database, listenerID, func() time.Time {
+		return now
+	})
+	if err != nil {
+		t.Fatalf("create initial durable task store: %v", err)
+	}
+	expiresIn := 300
+	queued, err := store.Create(agentID, tasks.CreateRequest{
+		SchemaVersion:    tasks.SchemaVersion,
+		Type:             tasks.TypeShell,
+		Arguments:        tasks.ShellArguments{Command: "queued-after-restart"},
+		TimeoutSeconds:   30,
+		ExpiresInSeconds: &expiresIn,
+	})
+	if err != nil {
+		t.Fatalf("create queued durable task: %v", err)
+	}
+	legacy, err := store.CreateLegacyShell(agentID, "whoami")
+	if err != nil {
+		t.Fatalf("create durable legacy task: %v", err)
+	}
+	if dispatched, ok, err := store.DispatchNextLegacy(agentID); err != nil ||
+		!ok || dispatched.ID != legacy.ID {
+		t.Fatalf(
+			"dispatch durable legacy task: task=%#v ok=%t err=%v",
+			dispatched,
+			ok,
+			err,
+		)
+	}
+	if completed, matched, err := store.CompleteLegacy(
+		agentID,
+		"whoami",
+		"durable-output\n",
+	); err != nil || !matched || completed.Status != tasks.StatusCompleted {
+		t.Fatalf(
+			"complete durable legacy task: task=%#v matched=%t err=%v",
+			completed,
+			matched,
+			err,
+		)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("close initial durable database: %v", err)
+	}
+
+	database, err = persistence.Open(databasePath)
+	if err != nil {
+		t.Fatalf("reopen durable database: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close reopened durable database: %v", err)
+		}
+	})
+	manager, err := communication.NewServerManager(&communication.ServerConfig{
+		UploadDir:    filepath.Join(root, "uploads"),
+		Port:         "0",
+		StaticDir:    filepath.Join(root, "empty-static"),
+		ProtocolType: "http",
+		Database:     database,
+	})
+	if err != nil {
+		t.Fatalf("create restarted server manager: %v", err)
+	}
+	if listeners := manager.GetListenerManager().ListListeners(); len(listeners) != 0 {
+		t.Fatalf("unexpected runtime listener config: %#v", listeners)
+	}
+	handler := NewAPIHandler(manager)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/agents/list", nil)
+	handler.HandleRequest(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list durable agents: %d: %s", rec.Code, rec.Body.String())
+	}
+	var agents map[string]behaviour.Agent
+	if err := json.Unmarshal(rec.Body.Bytes(), &agents); err != nil {
+		t.Fatalf("decode durable agents: %v", err)
+	}
+	if agent, ok := agents[agentID]; !ok ||
+		agent.ListenerID != listenerID ||
+		agent.Hostname != "durable-host" {
+		t.Fatalf("durable agent history unavailable: %#v", agents)
+	}
+
+	page := getTaskList(t, handler, "/api/agents/agent-one/tasks")
+	if page.Total != 2 || len(page.Tasks) != 2 {
+		t.Fatalf("durable task history unavailable: %#v", page)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(
+		http.MethodGet,
+		"/api/agents/agent-one/tasks/"+legacy.ID,
+		nil,
+	)
+	handler.HandleRequest(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get configless durable task detail: %d: %s", rec.Code, rec.Body.String())
+	}
+	var detail tasks.Task
+	if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("decode configless durable task detail: %v", err)
+	}
+	if detail.Result == nil || detail.Result.Output.Stdout != "durable-output\n" {
+		t.Fatalf("configless durable detail lost output: %#v", detail)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(
+		http.MethodGet,
+		"/api/agents/agent-one/results",
+		nil,
+	)
+	handler.HandleRequest(rec, req)
+	if rec.Code != http.StatusOK ||
+		!strings.Contains(rec.Body.String(), "durable-output") {
+		t.Fatalf("configless durable results unavailable: %d: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(
+		http.MethodPost,
+		"/api/agents/agent-one/tasks/"+queued.ID+"/cancel",
+		nil,
+	)
+	handler.HandleRequest(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cancel configless durable task: %d: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	req = jsonRequest(
+		t,
+		http.MethodPost,
+		"/api/agents/agent-one/tasks",
+		validTaskRequestBody("must-not-dispatch"),
+	)
+	handler.HandleRequest(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf(
+			"historical scope accepted new dispatch: got %d: %s",
+			rec.Code,
+			rec.Body.String(),
+		)
+	}
+
+	if _, err := database.SQL().Exec(`DROP TABLE legacy_results`); err != nil {
+		t.Fatalf("remove legacy results table for read failure: %v", err)
+	}
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(
+		http.MethodGet,
+		"/api/agents/agent-one/results",
+		nil,
+	)
+	handler.HandleRequest(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf(
+			"durable result read failure was presented as history: %d: %s",
+			rec.Code,
+			rec.Body.String(),
+		)
+	}
+}
+
 func TestOperatorAPITaskDetailRejectsAmbiguousOwnership(t *testing.T) {
 	handler, _ := newTestAPIHandler(t, "agent-one")
 	now := time.Now().UTC()
@@ -940,6 +1138,90 @@ func TestOperatorAPIListsAgents(t *testing.T) {
 	}
 	if _, ok := agents["agent-one"]; !ok {
 		t.Fatalf("expected registered agent in list, got %#v", agents)
+	}
+}
+
+func TestOperatorAPIDurableAgentKeysCannotCollide(t *testing.T) {
+	root := t.TempDir()
+	database, err := persistence.Open(filepath.Join(root, "state", "microc2.db"))
+	if err != nil {
+		t.Fatalf("open persistence database: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close persistence database: %v", err)
+		}
+	})
+
+	addAgent := func(listenerID, agentID string) {
+		t.Helper()
+		protocol, err := behaviour.NewHTTPPollingProtocolWithPersistence(
+			common.BaseProtocolConfig{
+				UploadDir: filepath.Join(root, "uploads", listenerID),
+				Port:      "0",
+			},
+			database,
+			listenerID,
+		)
+		if err != nil {
+			t.Fatalf("create durable protocol %s: %v", listenerID, err)
+		}
+		heartbeat, err := json.Marshal(map[string]string{
+			"id":       agentID,
+			"os":       "linux",
+			"hostname": listenerID,
+			"ip":       "127.0.0.1",
+		})
+		if err != nil {
+			t.Fatalf("marshal durable heartbeat: %v", err)
+		}
+		if err := protocol.HandleAgentHeartbeat(heartbeat); err != nil {
+			t.Fatalf("persist durable agent %s: %v", agentID, err)
+		}
+	}
+	addAgent("scope", "agent")
+	addAgent("other", "agent")
+	addAgent("unique", "scope:agent")
+
+	manager, err := communication.NewServerManager(&communication.ServerConfig{
+		UploadDir:    filepath.Join(root, "uploads"),
+		Port:         "0",
+		StaticDir:    filepath.Join(root, "static"),
+		ProtocolType: "http",
+		Database:     database,
+	})
+	if err != nil {
+		t.Fatalf("create durable server manager: %v", err)
+	}
+	handler := NewAPIHandler(manager)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/agents/list", nil)
+	handler.HandleRequest(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list durable agents: %d: %s", rec.Code, rec.Body.String())
+	}
+	var agents map[string]behaviour.Agent
+	if err := json.Unmarshal(rec.Body.Bytes(), &agents); err != nil {
+		t.Fatalf("decode durable agent map: %v", err)
+	}
+	if len(agents) != 3 {
+		t.Fatalf("durable agent map count = %d, want 3: %#v", len(agents), agents)
+	}
+	wantListeners := map[string]string{
+		"scope/agent": "scope",
+		"other/agent": "other",
+		"scope:agent": "unique",
+	}
+	for key, listenerID := range wantListeners {
+		agent, exists := agents[key]
+		if !exists || agent.ListenerID != listenerID {
+			t.Fatalf(
+				"durable agent key %q = %#v, want listener %q",
+				key,
+				agent,
+				listenerID,
+			)
+		}
 	}
 }
 

@@ -1,6 +1,12 @@
 package config
 
 type Config struct {
+	Storage struct {
+		// Path is the local SQLite database used for durable server state.
+		// It must live outside the web-served static directory.
+		Path string `yaml:"path"`
+	} `yaml:"storage"`
+
 	Server struct {
 		Port      string `yaml:"port"`
 		HTTPSPort string `yaml:"httpsPort"`

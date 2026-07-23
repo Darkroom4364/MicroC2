@@ -1,3 +1,8 @@
+storage:
+  # Durable agent, task/result, payload, and listener-event state. Keep this
+  # outside staticDir so operator history is never web-addressable.
+  path: "data/microc2.db"
+
 server:
   port: 8080
   httpsPort: 8443

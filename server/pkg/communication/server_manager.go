@@ -5,12 +5,14 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"microc2/server/internal/behaviour"
 	"microc2/server/internal/common"
 	"microc2/server/internal/listeners"
+	"microc2/server/internal/persistence"
 	"microc2/server/internal/protocols"
 )
 
@@ -27,6 +29,9 @@ type ServerConfig struct {
 	ProtocolType string
 	// CORSOrigins configures the CORS allow list for agent polling routes.
 	CORSOrigins []string
+	// Database is the process-wide durable state database. Nil retains the
+	// in-memory implementation used by focused unit tests.
+	Database *persistence.Database
 }
 
 func NewServerManager(config *ServerConfig) (*ServerManager, error) {
@@ -40,10 +45,24 @@ func NewServerManager(config *ServerConfig) (*ServerManager, error) {
 		AllowedOrigins: config.CORSOrigins,
 	}
 
-	var protocol common.Protocol
+	var (
+		protocol common.Protocol
+		err      error
+	)
 	switch config.ProtocolType {
 	case "http":
-		protocol = behaviour.NewHTTPPollingProtocol(baseConfig)
+		if config.Database == nil {
+			protocol = behaviour.NewHTTPPollingProtocol(baseConfig)
+		} else {
+			protocol, err = behaviour.NewHTTPPollingProtocolWithPersistence(
+				baseConfig,
+				config.Database,
+				"operator-default",
+			)
+			if err != nil {
+				return nil, fmt.Errorf("load durable default protocol state: %w", err)
+			}
+		}
 	case "socks5":
 		protocol = protocols.NewSOCKS5Protocol(baseConfig)
 	default:
@@ -54,7 +73,19 @@ func NewServerManager(config *ServerConfig) (*ServerManager, error) {
 		return nil, fmt.Errorf("failed to initialize protocol: %v", err)
 	}
 
-	listenerManager := listeners.NewListenerManager(protocol)
+	var listenerManager *listeners.ListenerManager
+	if config.Database == nil {
+		listenerManager = listeners.NewListenerManager(protocol)
+	} else {
+		listenerManager, err = listeners.NewListenerManagerWithPersistence(
+			protocol,
+			filepath.Join(config.StaticDir, "listeners"),
+			config.Database,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("load listener manager: %w", err)
+		}
+	}
 
 	return &ServerManager{
 		protocol:        protocol,
@@ -104,4 +135,14 @@ func (sm *ServerManager) Start() error {
 
 func (sm *ServerManager) GetListenerManager() *listeners.ListenerManager {
 	return sm.listenerManager
+}
+
+// GetDatabase exposes the immutable process-wide persistence handle to
+// operator repositories that must query historical state independently of
+// live listener runtime objects.
+func (sm *ServerManager) GetDatabase() *persistence.Database {
+	if sm == nil || sm.config == nil {
+		return nil
+	}
+	return sm.config.Database
 }
