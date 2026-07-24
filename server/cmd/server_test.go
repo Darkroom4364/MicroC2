@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"errors"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -81,6 +83,33 @@ func TestHTTPSRedirectTargetFallsBackForMissingOrMalformedHost(t *testing.T) {
 		if got := httpsRedirectTarget(request, "8443"); got != wants[index] {
 			t.Fatalf("redirect target = %q, want %q", got, wants[index])
 		}
+	}
+}
+
+func TestLogHTTPSRedirectRemovesControlCharacters(t *testing.T) {
+	originalOutput := log.Writer()
+	originalFlags := log.Flags()
+	originalPrefix := log.Prefix()
+	t.Cleanup(func() {
+		log.SetOutput(originalOutput)
+		log.SetFlags(originalFlags)
+		log.SetPrefix(originalPrefix)
+	})
+
+	var output bytes.Buffer
+	log.SetOutput(&output)
+	log.SetFlags(0)
+	log.SetPrefix("")
+
+	logHTTPSRedirect(
+		"/safe?next=ok\r\n[FORGED]\x00\x1b\t\u2028\u202e",
+		"https://operator.lab:8443/safe\r\n[FORGED]\u2029",
+	)
+
+	const want = "[REDIRECT] /safe?next=ok[FORGED] -> " +
+		"https://operator.lab:8443/safe[FORGED]\n"
+	if got := output.String(); got != want {
+		t.Fatalf("redirect log = %q, want %q", got, want)
 	}
 }
 

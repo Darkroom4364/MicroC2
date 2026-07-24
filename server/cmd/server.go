@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	"microc2/server/config"
 	"microc2/server/internal/audit"
@@ -223,7 +224,7 @@ func main() {
 	if cfg.Server.Redirect.Enabled {
 		redirectHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			target := httpsRedirectTarget(r, cfg.Server.Port)
-			log.Printf("[REDIRECT] %s -> %s", r.URL.String(), target)
+			logHTTPSRedirect(r.URL.String(), target)
 			http.Redirect(w, r, target, http.StatusMovedPermanently)
 		})
 		redirectServer := &http.Server{
@@ -327,6 +328,27 @@ func httpsRedirectTarget(r *http.Request, httpsPort string) string {
 		}
 	}
 	return "https://" + net.JoinHostPort(host, httpsPort) + requestURI
+}
+
+func logHTTPSRedirect(requestURL, target string) {
+	// Both values are stripped of control and non-graphic runes below.
+	// foxguard: ignore[go/taint-log-injection]
+	log.Printf(
+		"[REDIRECT] %s -> %s",
+		sanitizeLogValue(requestURL),
+		sanitizeLogValue(target),
+	)
+}
+
+// sanitizeLogValue keeps untrusted redirect diagnostics on one printable log
+// line. In particular, URL.String can retain control characters from RawQuery.
+func sanitizeLogValue(value string) string {
+	return strings.Map(func(character rune) rune {
+		if !unicode.IsGraphic(character) {
+			return -1
+		}
+		return character
+	}, value)
 }
 
 func redirectHostname(hostport string) string {

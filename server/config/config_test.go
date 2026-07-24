@@ -1,20 +1,16 @@
 package config
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
-	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestLoadConfigDefaultsDurableStorageOutsideStaticRoot(t *testing.T) {
@@ -635,30 +631,13 @@ func writeTestConfig(t *testing.T, path, storagePath, staticDir string) {
 
 func writeTestTLSCertificate(t *testing.T, root string) (string, string) {
 	t.Helper()
-	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate test TLS key: %v", err)
-	}
-	template := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "localhost"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:     []string{"localhost"},
-	}
-	certificateDER, err := x509.CreateCertificate(
-		rand.Reader,
-		template,
-		template,
-		&privateKey.PublicKey,
-		privateKey,
-	)
-	if err != nil {
-		t.Fatalf("create test TLS certificate: %v", err)
-	}
-	privateKeyDER, err := x509.MarshalECPrivateKey(privateKey)
+	tlsServer := httptest.NewTLSServer(http.HandlerFunc(
+		func(http.ResponseWriter, *http.Request) {},
+	))
+	certificate := tlsServer.TLS.Certificates[0]
+	tlsServer.Close()
+
+	privateKeyDER, err := x509.MarshalPKCS8PrivateKey(certificate.PrivateKey)
 	if err != nil {
 		t.Fatalf("marshal test TLS key: %v", err)
 	}
@@ -667,12 +646,12 @@ func writeTestTLSCertificate(t *testing.T, root string) (string, string) {
 	keyFile := filepath.Join(root, "server.key")
 	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{
 		Type:  "CERTIFICATE",
-		Bytes: certificateDER,
+		Bytes: certificate.Certificate[0],
 	}), 0o600); err != nil {
 		t.Fatalf("write test TLS certificate: %v", err)
 	}
 	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{
-		Type:  "EC PRIVATE KEY",
+		Type:  "PRIVATE KEY",
 		Bytes: privateKeyDER,
 	}), 0o600); err != nil {
 		t.Fatalf("write test TLS key: %v", err)
