@@ -1,7 +1,9 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"sort"
@@ -35,7 +37,11 @@ func (h *APIHandler) handleAuditEvents(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Audit history is unavailable", http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, page)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(page); err != nil {
+		log.Print("[ERROR] Failed to encode audit page")
+	}
 }
 
 func parseAuditPageOptions(rawQuery string) (audit.PageOptions, error) {
