@@ -2923,11 +2923,18 @@ func TestGeneratePayloadDoesNotUseLegacyFallbackArtifact(t *testing.T) {
 	if legacyArtifactPath == "" {
 		t.Fatal("build hook did not create the legacy artifact")
 	}
+	contents, err := os.ReadFile(legacyArtifactPath)
+	if err != nil {
+		t.Fatalf("read legacy artifact: %v", err)
+	}
+	if string(contents) != "legacy fallback artifact" {
+		t.Fatalf("legacy artifact content changed to %q", contents)
+	}
 	info, err := os.Stat(legacyArtifactPath)
 	if err != nil {
 		t.Fatalf("stat legacy artifact: %v", err)
 	}
-	if info.Mode().Perm() != 0600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
 		t.Fatalf(
 			"legacy artifact mode changed to %o",
 			info.Mode().Perm(),
