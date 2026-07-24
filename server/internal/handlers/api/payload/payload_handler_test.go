@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -102,6 +103,17 @@ func TestGeneratePayloadGeneratesSeedAndWritesProvenance(t *testing.T) {
 	})
 
 	handler := NewPayloadHandlerForIsolatedLab(filepath.Join(tempDir, "static", "payloads"), agentDir)
+	var receivedSeeds []string
+	handler.runBuild = func(command *exec.Cmd) ([]byte, error) {
+		for _, entry := range command.Env {
+			name, value, found := strings.Cut(entry, "=")
+			if found && name == "MUTATION_SEED" {
+				receivedSeeds = append(receivedSeeds, value)
+				break
+			}
+		}
+		return command.CombinedOutput()
+	}
 	config := PayloadConfig{
 		ListenerID: "listener-one",
 		AgentType:  "debugAgent",
@@ -119,13 +131,12 @@ func TestGeneratePayloadGeneratesSeedAndWritesProvenance(t *testing.T) {
 		t.Fatalf("generated mutation seed %q does not match 16 lowercase hex chars", first.MutationSeed)
 	}
 
-	// The build script must receive the seed through its environment.
-	envSeed, err := os.ReadFile(filepath.Join(filepath.Dir(first.Path), "mutation_seed.env"))
-	if err != nil {
-		t.Fatalf("read recorded build env seed: %v", err)
-	}
-	if string(envSeed) != first.MutationSeed {
-		t.Fatalf("build script received MUTATION_SEED=%q, want %q", envSeed, first.MutationSeed)
+	if len(receivedSeeds) != 1 || receivedSeeds[0] != first.MutationSeed {
+		t.Fatalf(
+			"build script received MUTATION_SEED=%q, want %q",
+			receivedSeeds,
+			first.MutationSeed,
+		)
 	}
 
 	provenance := readJSONFile(t, filepath.Join(filepath.Dir(first.Path), "provenance.json"))
@@ -709,9 +720,9 @@ func TestConcurrentPayloadBuildsSerializeSharedAgentWorkspace(t *testing.T) {
 
 	var stateMutex sync.Mutex
 	invocations := 0
-	expectedByOutput := make(map[string]string)
+	expectedByPayloadID := make(map[string]string)
 	handler.runBuild = func(command *exec.Cmd) ([]byte, error) {
-		var credential, outputDir string
+		var credential, outputDir, payloadID string
 		for _, entry := range command.Env {
 			name, value, found := strings.Cut(entry, "=")
 			if found && name == "ENROLLMENT_CREDENTIAL" {
@@ -719,19 +730,21 @@ func TestConcurrentPayloadBuildsSerializeSharedAgentWorkspace(t *testing.T) {
 			}
 		}
 		for index := 0; index+1 < len(command.Args); index++ {
-			if command.Args[index] == "--output" {
+			switch command.Args[index] {
+			case "--output":
 				outputDir = command.Args[index+1]
-				break
+			case "--payload-id":
+				payloadID = command.Args[index+1]
 			}
 		}
-		if credential == "" || outputDir == "" {
+		if credential == "" || outputDir == "" || payloadID == "" {
 			return nil, errors.New("build hook is missing credential or output")
 		}
 
 		stateMutex.Lock()
 		invocations++
 		invocation := invocations
-		expectedByOutput[outputDir] = credential
+		expectedByPayloadID[payloadID] = credential
 		stateMutex.Unlock()
 
 		if err := os.WriteFile(
@@ -830,12 +843,11 @@ func TestConcurrentPayloadBuildsSerializeSharedAgentWorkspace(t *testing.T) {
 	}
 
 	for _, result := range results {
-		outputDir := filepath.Dir(result.Path)
 		stateMutex.Lock()
-		expectedCredential := expectedByOutput[outputDir]
+		expectedCredential := expectedByPayloadID[result.ID]
 		stateMutex.Unlock()
 		if expectedCredential == "" {
-			t.Fatalf("no credential recorded for build output %s", outputDir)
+			t.Fatalf("no credential recorded for build %s", result.ID)
 		}
 		artifact, err := os.ReadFile(result.Path)
 		if err != nil {
@@ -2489,6 +2501,440 @@ func TestBuildingPayloadBecomesInterruptedExactlyOnceOnRestart(t *testing.T) {
 	}
 }
 
+func TestPayloadArtifactOperationsRejectSymlinkEscapes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symlinks requires privileges on Windows")
+	}
+
+	for _, test := range []struct {
+		name  string
+		setup func(t *testing.T, payloadRoot, outsideDir string)
+	}{
+		{
+			name: "parent component",
+			setup: func(t *testing.T, payloadRoot, outsideDir string) {
+				t.Helper()
+				if err := os.Symlink(
+					outsideDir,
+					filepath.Join(payloadRoot, "release", "build"),
+				); err != nil {
+					t.Fatalf("create parent symlink: %v", err)
+				}
+			},
+		},
+		{
+			name: "final components",
+			setup: func(t *testing.T, payloadRoot, outsideDir string) {
+				t.Helper()
+				buildDir := filepath.Join(payloadRoot, "release", "build")
+				if err := os.Mkdir(buildDir, 0700); err != nil {
+					t.Fatalf("create payload build directory: %v", err)
+				}
+				for _, filename := range []string{"agent", "provenance.json"} {
+					if err := os.Symlink(
+						filepath.Join(outsideDir, filename),
+						filepath.Join(buildDir, filename),
+					); err != nil {
+						t.Fatalf("create %s symlink: %v", filename, err)
+					}
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			payloadRoot := filepath.Join(tempDir, "payload-root")
+			outsideDir := filepath.Join(tempDir, "outside")
+			stagingRoot := filepath.Join(tempDir, "staging")
+			if err := os.MkdirAll(
+				filepath.Join(payloadRoot, "release"),
+				0700,
+			); err != nil {
+				t.Fatalf("create payload root: %v", err)
+			}
+			if err := os.Mkdir(outsideDir, 0700); err != nil {
+				t.Fatalf("create outside directory: %v", err)
+			}
+			if err := os.MkdirAll(
+				filepath.Join(stagingRoot, "output"),
+				0700,
+			); err != nil {
+				t.Fatalf("create staging directory: %v", err)
+			}
+			if err := os.WriteFile(
+				filepath.Join(stagingRoot, "output", "agent"),
+				[]byte("trusted staged artifact"),
+				0600,
+			); err != nil {
+				t.Fatalf("write staged artifact: %v", err)
+			}
+
+			artifactSentinel := []byte("outside artifact sentinel")
+			provenanceSentinel := []byte("outside provenance sentinel")
+			artifactPath := filepath.Join(outsideDir, "agent")
+			provenancePath := filepath.Join(outsideDir, "provenance.json")
+			if err := os.WriteFile(artifactPath, artifactSentinel, 0644); err != nil {
+				t.Fatalf("write outside artifact sentinel: %v", err)
+			}
+			if err := os.WriteFile(
+				provenancePath,
+				provenanceSentinel,
+				0644,
+			); err != nil {
+				t.Fatalf("write outside provenance sentinel: %v", err)
+			}
+			originalInfo, err := os.Stat(artifactPath)
+			if err != nil {
+				t.Fatalf("stat outside artifact sentinel: %v", err)
+			}
+
+			test.setup(t, payloadRoot, outsideDir)
+			handler := &PayloadHandler{payloadsDir: payloadRoot}
+			relativeArtifact := filepath.ToSlash(
+				filepath.Join("release", "build", "agent"),
+			)
+			if _, _, err := handler.publishGeneratedArtifact(
+				stagingRoot,
+				filepath.Join("output", "agent"),
+				relativeArtifact,
+			); err == nil {
+				t.Fatal("symlinked artifact publication unexpectedly succeeded")
+			}
+			file, state, _, _ := handler.openVerifiedPayload(
+				payloadBuildRecord{
+					Filename:       "agent",
+					RelativePath:   relativeArtifact,
+					Size:           int64(len(artifactSentinel)),
+					ProvenanceJSON: []byte("{}"),
+				},
+			)
+			if file != nil {
+				_ = file.Close()
+				t.Fatal("symlinked artifact verification unexpectedly succeeded")
+			}
+			if state == payloadStateCompleted {
+				t.Fatal("symlinked artifact was marked completed")
+			}
+			if err := writeProvenance(
+				payloadRoot,
+				relativeArtifact,
+				map[string]interface{}{"source": "attacker-controlled"},
+			); err == nil {
+				t.Fatal("symlinked provenance write unexpectedly succeeded")
+			}
+
+			gotArtifact, err := os.ReadFile(artifactPath)
+			if err != nil {
+				t.Fatalf("read outside artifact sentinel: %v", err)
+			}
+			if !bytes.Equal(gotArtifact, artifactSentinel) {
+				t.Fatalf(
+					"outside artifact changed to %q",
+					gotArtifact,
+				)
+			}
+			gotProvenance, err := os.ReadFile(provenancePath)
+			if err != nil {
+				t.Fatalf("read outside provenance sentinel: %v", err)
+			}
+			if !bytes.Equal(gotProvenance, provenanceSentinel) {
+				t.Fatalf(
+					"outside provenance changed to %q",
+					gotProvenance,
+				)
+			}
+			infoAfter, err := os.Stat(artifactPath)
+			if err != nil {
+				t.Fatalf("restat outside artifact sentinel: %v", err)
+			}
+			if infoAfter.Mode().Perm() != originalInfo.Mode().Perm() {
+				t.Fatalf(
+					"outside artifact mode changed from %o to %o",
+					originalInfo.Mode().Perm(),
+					infoAfter.Mode().Perm(),
+				)
+			}
+		})
+	}
+}
+
+func TestPayloadDirectoryCreationRejectsSymlinkClass(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symlinks requires privileges on Windows")
+	}
+
+	tempDir := t.TempDir()
+	payloadRoot := filepath.Join(tempDir, "payload-root")
+	outsideDir := filepath.Join(tempDir, "outside")
+	if err := os.Mkdir(payloadRoot, 0700); err != nil {
+		t.Fatalf("create payload root: %v", err)
+	}
+	if err := os.Mkdir(outsideDir, 0700); err != nil {
+		t.Fatalf("create outside directory: %v", err)
+	}
+	if err := os.Symlink(
+		outsideDir,
+		filepath.Join(payloadRoot, "release"),
+	); err != nil {
+		t.Fatalf("create payload class symlink: %v", err)
+	}
+
+	if err := createPayloadBuildDirectory(
+		payloadRoot,
+		"release",
+		"build",
+	); err == nil {
+		t.Fatal("created a build directory through a symlinked class")
+	}
+	if _, err := os.Stat(
+		filepath.Join(outsideDir, "build"),
+	); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("outside build directory was created: %v", err)
+	}
+}
+
+func TestPayloadArtifactParentSwapNeverEscapesRoot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symlinks requires privileges on Windows")
+	}
+
+	tempDir := t.TempDir()
+	payloadRoot := filepath.Join(tempDir, "payload-root")
+	releaseDir := filepath.Join(payloadRoot, "release")
+	buildDir := filepath.Join(releaseDir, "build")
+	parkedBuildDir := filepath.Join(releaseDir, "build.real")
+	outsideDir := filepath.Join(tempDir, "outside")
+	stagingRoot := filepath.Join(tempDir, "staging")
+	if err := os.MkdirAll(buildDir, 0700); err != nil {
+		t.Fatalf("create payload build directory: %v", err)
+	}
+	if err := os.Mkdir(outsideDir, 0700); err != nil {
+		t.Fatalf("create outside directory: %v", err)
+	}
+	if err := os.MkdirAll(
+		filepath.Join(stagingRoot, "output"),
+		0700,
+	); err != nil {
+		t.Fatalf("create staging directory: %v", err)
+	}
+
+	trustedArtifact := []byte("trusted artifact")
+	outsideArtifact := []byte("outside artifact sentinel")
+	outsideProvenance := []byte("outside provenance sentinel")
+	if err := os.WriteFile(
+		filepath.Join(buildDir, "agent"),
+		trustedArtifact,
+		0600,
+	); err != nil {
+		t.Fatalf("write trusted artifact: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(outsideDir, "agent"),
+		outsideArtifact,
+		0644,
+	); err != nil {
+		t.Fatalf("write outside artifact sentinel: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(outsideDir, "provenance.json"),
+		outsideProvenance,
+		0644,
+	); err != nil {
+		t.Fatalf("write outside provenance sentinel: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(stagingRoot, "output", "agent"),
+		trustedArtifact,
+		0600,
+	); err != nil {
+		t.Fatalf("write staged artifact: %v", err)
+	}
+
+	stop := make(chan struct{})
+	swapResult := make(chan error, 1)
+	var stopOnce sync.Once
+	stopSwap := func() {
+		stopOnce.Do(func() {
+			close(stop)
+		})
+	}
+	t.Cleanup(stopSwap)
+	go func() {
+		for {
+			if err := os.Rename(buildDir, parkedBuildDir); err != nil {
+				swapResult <- fmt.Errorf("park build directory: %w", err)
+				return
+			}
+			if err := os.Symlink(outsideDir, buildDir); err != nil {
+				swapResult <- fmt.Errorf("install parent symlink: %w", err)
+				return
+			}
+			runtime.Gosched()
+			if err := os.Remove(buildDir); err != nil {
+				swapResult <- fmt.Errorf("remove parent symlink: %w", err)
+				return
+			}
+			if err := os.Rename(parkedBuildDir, buildDir); err != nil {
+				swapResult <- fmt.Errorf("restore build directory: %w", err)
+				return
+			}
+			runtime.Gosched()
+			select {
+			case <-stop:
+				swapResult <- nil
+				return
+			default:
+			}
+		}
+	}()
+
+	relativeArtifact := filepath.ToSlash(
+		filepath.Join("release", "build", "agent"),
+	)
+	handler := &PayloadHandler{payloadsDir: payloadRoot}
+	successfulOpens, successfulPublications := 0, 0
+	for iteration := range 500 {
+		file, err := openPayloadArtifactBeneath(
+			payloadRoot,
+			relativeArtifact,
+		)
+		if err == nil {
+			content, readErr := io.ReadAll(file)
+			closeErr := file.Close()
+			if readErr != nil {
+				t.Fatalf("read safely opened artifact: %v", readErr)
+			}
+			if closeErr != nil {
+				t.Fatalf("close safely opened artifact: %v", closeErr)
+			}
+			if !bytes.Equal(content, trustedArtifact) {
+				t.Fatalf("safely opened artifact contained %q", content)
+			}
+			successfulOpens++
+		}
+		if _, _, err := handler.publishGeneratedArtifact(
+			stagingRoot,
+			filepath.Join("output", "agent"),
+			filepath.ToSlash(filepath.Join(
+				"release",
+				"build",
+				fmt.Sprintf("published-%d", iteration),
+			)),
+		); err == nil {
+			successfulPublications++
+		}
+		_ = writeProvenance(
+			payloadRoot,
+			relativeArtifact,
+			map[string]interface{}{"source": "trusted"},
+		)
+	}
+	stopSwap()
+	if err := <-swapResult; err != nil {
+		t.Fatal(err)
+	}
+	if successfulOpens == 0 {
+		t.Fatal("swap test never opened the legitimate artifact")
+	}
+	if successfulPublications == 0 {
+		t.Fatal("swap test never published into the legitimate directory")
+	}
+
+	gotOutsideArtifact, err := os.ReadFile(
+		filepath.Join(outsideDir, "agent"),
+	)
+	if err != nil {
+		t.Fatalf("read outside artifact sentinel: %v", err)
+	}
+	if !bytes.Equal(gotOutsideArtifact, outsideArtifact) {
+		t.Fatalf("outside artifact changed to %q", gotOutsideArtifact)
+	}
+	gotOutsideProvenance, err := os.ReadFile(
+		filepath.Join(outsideDir, "provenance.json"),
+	)
+	if err != nil {
+		t.Fatalf("read outside provenance sentinel: %v", err)
+	}
+	if !bytes.Equal(gotOutsideProvenance, outsideProvenance) {
+		t.Fatalf("outside provenance changed to %q", gotOutsideProvenance)
+	}
+	outsideEntries, err := os.ReadDir(outsideDir)
+	if err != nil {
+		t.Fatalf("list outside directory: %v", err)
+	}
+	if len(outsideEntries) != 2 {
+		t.Fatalf("outside directory gained entries: %#v", outsideEntries)
+	}
+}
+
+func TestGeneratePayloadDoesNotUseLegacyFallbackArtifact(t *testing.T) {
+	tempDir := t.TempDir()
+	payloadRoot := filepath.Join(tempDir, "payload-root")
+	agentDir := filepath.Join(tempDir, "agent")
+	writePlaceholderBuildScript(t, agentDir)
+	handler, err := newPayloadHandler(
+		payloadRoot,
+		agentDir,
+		testListenerLookup(),
+		nil,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("create payload handler: %v", err)
+	}
+
+	var legacyArtifactPath string
+	handler.runBuild = func(command *exec.Cmd) ([]byte, error) {
+		var buildType, format, payloadID string
+		for index := 0; index+1 < len(command.Args); index++ {
+			switch command.Args[index] {
+			case "--build-type":
+				buildType = command.Args[index+1]
+			case "--format":
+				format = command.Args[index+1]
+			case "--payload-id":
+				payloadID = command.Args[index+1]
+			}
+		}
+		legacyArtifactPath = filepath.Join(
+			agentDir,
+			"static",
+			"payloads",
+			buildType,
+			payloadID,
+			payloadFilename(format),
+		)
+		if err := os.MkdirAll(
+			filepath.Dir(legacyArtifactPath),
+			0700,
+		); err != nil {
+			return nil, err
+		}
+		return nil, os.WriteFile(
+			legacyArtifactPath,
+			[]byte("legacy fallback artifact"),
+			0600,
+		)
+	}
+
+	if _, err := handler.GeneratePayload(testPayloadConfig()); err == nil {
+		t.Fatal("generation accepted an artifact outside the build contract")
+	}
+	if legacyArtifactPath == "" {
+		t.Fatal("build hook did not create the legacy artifact")
+	}
+	info, err := os.Stat(legacyArtifactPath)
+	if err != nil {
+		t.Fatalf("stat legacy artifact: %v", err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf(
+			"legacy artifact mode changed to %o",
+			info.Mode().Perm(),
+		)
+	}
+}
+
 func TestDownloadStreamsVerifiedHandleAcrossPathSwap(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires POSIX rename semantics for an open file")
@@ -2509,7 +2955,14 @@ func TestDownloadStreamsVerifiedHandleAcrossPathSwap(t *testing.T) {
 	if err := os.WriteFile(artifactPath, trustedContent, 0644); err != nil {
 		t.Fatalf("write trusted artifact: %v", err)
 	}
-	artifactHash, err := hashArtifact(artifactPath)
+	artifactFile, err := os.Open(artifactPath)
+	if err != nil {
+		t.Fatalf("open trusted artifact: %v", err)
+	}
+	artifactHash, err := hashOpenArtifact(artifactFile)
+	if closeErr := artifactFile.Close(); err == nil {
+		err = closeErr
+	}
 	if err != nil {
 		t.Fatalf("hash trusted artifact: %v", err)
 	}
@@ -2774,15 +3227,15 @@ func installSuccessfulBuildHook(
 	t *testing.T,
 	handler *PayloadHandler,
 	database *persistence.Database,
-	payloadsDir string,
+	_ string,
 ) {
 	t.Helper()
-	handler.runBuild = func(_ *exec.Cmd) ([]byte, error) {
-		var relativePath, state, artifactHash string
+	handler.runBuild = func(command *exec.Cmd) ([]byte, error) {
+		var relativePath, filename, state, artifactHash string
 		var size int64
 		var provenanceJSON []byte
 		if err := database.SQL().QueryRow(
-			`SELECT relative_path, state, size, sha256, provenance_json
+			`SELECT relative_path, filename, state, size, sha256, provenance_json
 			 FROM payload_builds
 			 WHERE state = ?
 			 ORDER BY created_at DESC
@@ -2790,6 +3243,7 @@ func installSuccessfulBuildHook(
 			payloadStateBuilding,
 		).Scan(
 			&relativePath,
+			&filename,
 			&state,
 			&size,
 			&artifactHash,
@@ -2809,14 +3263,21 @@ func installSuccessfulBuildHook(
 				provenanceJSON,
 			)
 		}
-		artifactPath := filepath.Join(
-			payloadsDir,
-			filepath.FromSlash(relativePath),
-		)
-		if err := os.MkdirAll(filepath.Dir(artifactPath), 0755); err != nil {
-			t.Fatalf("create hooked artifact directory: %v", err)
+		outputDir := ""
+		for index := 0; index+1 < len(command.Args); index++ {
+			if command.Args[index] == "--output" {
+				outputDir = command.Args[index+1]
+				break
+			}
 		}
-		if err := os.WriteFile(artifactPath, []byte("fake agent"), 0644); err != nil {
+		if outputDir == "" {
+			t.Fatal("build command omitted --output")
+		}
+		if err := os.WriteFile(
+			filepath.Join(outputDir, filename),
+			[]byte("fake agent"),
+			0644,
+		); err != nil {
 			t.Fatalf("write hooked payload artifact: %v", err)
 		}
 		return []byte("hook build complete"), nil

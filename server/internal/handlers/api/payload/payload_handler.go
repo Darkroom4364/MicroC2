@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/safeopen"
 	"github.com/google/uuid"
 
 	"microc2/server/internal/audit"
@@ -209,16 +210,22 @@ func newPayloadHandler(
 	if err != nil {
 		return nil, fmt.Errorf("resolve payload directory: %w", err)
 	}
-	for _, dir := range []string{
-		absolutePayloadsDir,
-		filepath.Join(absolutePayloadsDir, "debug"),
-		filepath.Join(absolutePayloadsDir, "release"),
-	} {
-		if err := os.MkdirAll(dir, 0700); err != nil {
-			return nil, fmt.Errorf("create payload directory %s: %w", dir, err)
-		}
-		if err := os.Chmod(dir, 0700); err != nil {
-			return nil, fmt.Errorf("restrict payload directory %s: %w", dir, err)
+	if err := os.MkdirAll(absolutePayloadsDir, 0700); err != nil {
+		return nil, fmt.Errorf("create payload root: %w", err)
+	}
+	if err := os.Chmod(absolutePayloadsDir, 0700); err != nil {
+		return nil, fmt.Errorf("restrict payload root: %w", err)
+	}
+	for _, class := range []string{"debug", "release"} {
+		if err := ensurePayloadClassDirectory(
+			absolutePayloadsDir,
+			class,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"initialize %s payload directory: %w",
+				class,
+				err,
+			)
 		}
 	}
 	var enrollmentStore *enrollment.Store
@@ -304,16 +311,35 @@ func gitRevision(dir string) string {
 // writeProvenance records non-secret build context next to the artifact. The
 // high-entropy enrollment credential is intentionally not retained, so this
 // metadata does not promise byte-for-byte reproduction (issue #99).
-func writeProvenance(artifactDir string, provenance map[string]interface{}) error {
+func writeProvenance(
+	payloadRoot string,
+	artifactRelativePath string,
+	provenance map[string]interface{},
+) error {
 	data, err := json.MarshalIndent(provenance, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal provenance: %w", err)
 	}
-	path := filepath.Join(artifactDir, "provenance.json")
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	nativeArtifactPath, err := containedNativeRelativePath(artifactRelativePath)
+	if err != nil {
+		return fmt.Errorf("invalid artifact path for provenance: %w", err)
+	}
+	relativePath := filepath.Join(
+		filepath.Dir(nativeArtifactPath),
+		"provenance.json",
+	)
+	if err := createPayloadFileBeneath(
+		payloadRoot,
+		relativePath,
+		data,
+		0600,
+	); err != nil {
 		return fmt.Errorf("failed to write provenance: %w", err)
 	}
-	log.Printf("[INFO] Wrote build provenance to %s", path)
+	log.Printf(
+		"[INFO] Wrote build provenance to %s",
+		filepath.Join(payloadRoot, relativePath),
+	)
 	return nil
 }
 
@@ -508,8 +534,8 @@ func advertisedListenerEndpoint(
 }
 
 // runSerializedBuild protects the shared agent source tree and build-script
-// sidecars until the script has copied the artifact from its private Cargo
-// target into the build-specific output directory.
+// sidecars until the script has produced the artifact in private per-build
+// staging.
 func (h *PayloadHandler) runSerializedBuild(cmd *exec.Cmd) ([]byte, error) {
 	h.buildMutex.Lock()
 	defer h.buildMutex.Unlock()
@@ -1326,15 +1352,13 @@ func (h *PayloadHandler) GeneratePayloadWithContext(
 
 	// Create a directory for build artifacts
 	outputDir := filepath.Join(h.payloadsDir, buildType, payloadID)
-	if err := os.MkdirAll(outputDir, 0700); err != nil {
+	if err := createPayloadBuildDirectory(
+		h.payloadsDir,
+		buildType,
+		payloadID,
+	); err != nil {
 		log.Printf("[ERROR] Failed to create output directory %s: %v", outputDir, err)
 		return PayloadResult{}, fmt.Errorf("failed to create output directory: %w", err)
-	}
-	if err := os.Chmod(outputDir, 0700); err != nil {
-		return PayloadResult{}, fmt.Errorf(
-			"failed to restrict output directory: %w",
-			err,
-		)
 	}
 	log.Printf("[INFO] Created output directory: %s", outputDir)
 	payloadPath := filepath.Join(outputDir, payloadFileName)
@@ -1352,9 +1376,21 @@ func (h *PayloadHandler) GeneratePayloadWithContext(
 		"target",
 	)
 	cargoTargetPath := filepath.Join(h.agentSourceDir, cargoTargetDir)
+	stagingOutputDir := filepath.Join(cargoBuildDir, "output")
+	stagingArtifactRelativePath := filepath.Join(
+		"output",
+		payloadFileName,
+	)
 
-	// Create agent config file
-	configPath := filepath.Join(outputDir, "config.json")
+	// Create the build config through a root-anchored handle. The build
+	// contract still receives the ordinary output directory path, but server
+	// writes never follow a swapped component outside the payload root.
+	configRelativePath := filepath.Join(
+		buildType,
+		payloadID,
+		"config.json",
+	)
+	configPath := filepath.Join(h.payloadsDir, configRelativePath)
 
 	allowInsecureIsolatedLab :=
 		protocol == "http" && h.allowInsecureIsolatedLab
@@ -1417,7 +1453,12 @@ func (h *PayloadHandler) GeneratePayloadWithContext(
 		return PayloadResult{}, fmt.Errorf("failed to marshal agent config: %w", err)
 	}
 
-	if err := os.WriteFile(configPath, configJSON, 0644); err != nil {
+	if err := createPayloadFileBeneath(
+		h.payloadsDir,
+		configRelativePath,
+		configJSON,
+		0600,
+	); err != nil {
 		log.Printf("[ERROR] Failed to write agent config to %s: %v", configPath, err)
 		return PayloadResult{}, fmt.Errorf("failed to write agent config: %w", err)
 	}
@@ -1449,7 +1490,7 @@ func (h *PayloadHandler) GeneratePayloadWithContext(
 	cmdArgs := []string{
 		buildScript,
 		"--target", buildTarget,
-		"--output", outputDir,
+		"--output", stagingOutputDir,
 		"--build-type", buildType,
 		"--format", config.Format,
 		"--payload-id", payloadID,
@@ -1487,7 +1528,7 @@ func (h *PayloadHandler) GeneratePayloadWithContext(
 	// Add environment variables
 	cmd.Env = append(os.Environ(),
 		fmt.Sprintf("TARGET=%s", buildTarget),
-		fmt.Sprintf("OUTPUT_DIR=%s", outputDir),
+		fmt.Sprintf("OUTPUT_DIR=%s", stagingOutputDir),
 		fmt.Sprintf("CARGO_TARGET_DIR=%s", cargoTargetDir),
 		fmt.Sprintf("BUILD_TYPE=%s", buildType),
 		fmt.Sprintf("PROTOCOL=%s", protocol),
@@ -1523,17 +1564,29 @@ func (h *PayloadHandler) GeneratePayloadWithContext(
 	)
 
 	log.Printf("[INFO] Environment variables set: TARGET=%s, OUTPUT_DIR=%s, BUILD_TYPE=%s, SLEEP_INTERVAL=%d, SOCKS5_ENABLED=%t, SOCKS5_PORT=%d",
-		buildTarget, outputDir, buildType, config.Sleep, config.Socks5Enabled, config.Socks5Port)
+		buildTarget, stagingOutputDir, buildType, config.Sleep, config.Socks5Enabled, config.Socks5Port)
 
 	log.Printf("[INFO] Starting build process...")
 	if err := ensurePrivateCargoBuildDirectories(
 		cargoBuildRoot,
 		cargoBuildDir,
 		cargoTargetPath,
+		stagingOutputDir,
 	); err != nil {
 		return PayloadResult{}, err
 	}
 	_, err = h.runSerializedBuild(cmd)
+	var (
+		fileInfo     os.FileInfo
+		artifactHash string
+	)
+	if err == nil {
+		fileInfo, artifactHash, err = h.publishGeneratedArtifact(
+			cargoBuildDir,
+			stagingArtifactRelativePath,
+			plannedRelativePath,
+		)
+	}
 	if cleanupErr := removePrivateCargoBuildDirectory(
 		cargoBuildRoot,
 		cargoBuildDir,
@@ -1557,68 +1610,10 @@ func (h *PayloadHandler) GeneratePayloadWithContext(
 	}
 	log.Printf("[INFO] Payload build command completed")
 
-	// Find the generated payload
-	log.Printf("[INFO] Checking for payload at: %s", payloadPath)
-
-	// Check if file exists
-	fileInfo, err := os.Stat(payloadPath)
-	if err != nil {
-		log.Printf("[ERROR] Payload not found at expected location %s: %v", payloadPath, err)
-		// Check alternative location (the one the build script uses)
-		alternativePayloadPath := filepath.Join(h.agentSourceDir, "static", "payloads", buildType, payloadID, payloadFileName)
-		log.Printf("[INFO] Checking alternative location: %s", alternativePayloadPath)
-
-		alternativeFileInfo, alternativeErr := os.Stat(alternativePayloadPath)
-		if alternativeErr == nil {
-			// Found it in the alternative location, update the path
-			log.Printf("[INFO] Found payload at alternative location: %s", alternativePayloadPath)
-			payloadPath = alternativePayloadPath
-			fileInfo = alternativeFileInfo
-		} else {
-			// Still not found, look in any subdirectory of the output directory
-			log.Printf("[INFO] Searching for payload in output directory and subdirectories...")
-			var foundPath string
-			var foundInfo os.FileInfo
-
-			// Walk through the output directory to find the payload file
-			err := filepath.Walk(outputDir, func(path string, info os.FileInfo, err error) error {
-				if err != nil {
-					return err
-				}
-				if !info.IsDir() && (info.Name() == payloadFileName || strings.HasSuffix(info.Name(), payloadFileName)) {
-					foundPath = path
-					foundInfo = info
-					return filepath.SkipAll // Stop the walk
-				}
-				return nil
-			})
-
-			if err == nil && foundPath != "" {
-				log.Printf("[INFO] Found payload during directory search: %s", foundPath)
-				payloadPath = foundPath
-				fileInfo = foundInfo
-			} else {
-				// List directory contents to aid debugging
-				files, err := os.ReadDir(outputDir)
-				if err != nil {
-					log.Printf("[ERROR] Failed to read output directory: %v", err)
-				} else {
-					log.Printf("[INFO] Output directory %s contents:", outputDir)
-					for _, file := range files {
-						log.Printf("[INFO] - %s", file.Name())
-					}
-				}
-				return PayloadResult{}, fmt.Errorf("payload not found at expected location: %w", err)
-			}
-		}
-	}
-
-	if err := os.Chmod(payloadPath, 0700); err != nil {
-		return PayloadResult{}, fmt.Errorf(
-			"restrict generated payload artifact permissions: %w",
-			err,
-		)
-	}
+	// The build contract has one deterministic artifact path. Publishing,
+	// permission restriction, and hashing all used the same anchored handle;
+	// legacy fallback searches cannot preserve that guarantee.
+	log.Printf("[INFO] Published payload at: %s", payloadPath)
 	completedAt := time.Now().UTC()
 
 	// Persist non-secret provenance. Enrollment uses a fresh, deliberately
@@ -1634,22 +1629,17 @@ func (h *PayloadHandler) GeneratePayloadWithContext(
 		"mutation_flags":               []string{"config-xor-key", "junk-code", "surface-strings"},
 		"enrollment_credential_source": "server-generated-ephemeral",
 	}
-	if err := writeProvenance(filepath.Dir(payloadPath), provenance); err != nil {
+	if err := writeProvenance(
+		h.payloadsDir,
+		plannedRelativePath,
+		provenance,
+	); err != nil {
 		log.Printf("[WARNING] Failed to write build provenance: %v", err)
 	}
 	provenanceJSON, err := json.Marshal(provenance)
 	if err != nil {
 		return PayloadResult{}, fmt.Errorf("marshal payload provenance: %w", err)
 	}
-	relativePath, err := h.relativeArtifactPath(payloadPath)
-	if err != nil {
-		return PayloadResult{}, err
-	}
-	artifactHash, err := hashArtifact(payloadPath)
-	if err != nil {
-		return PayloadResult{}, fmt.Errorf("hash payload artifact: %w", err)
-	}
-
 	// Create the result
 	result = PayloadResult{
 		ID:           payloadID,
@@ -1660,7 +1650,7 @@ func (h *PayloadHandler) GeneratePayloadWithContext(
 		Path:         payloadPath,
 		Size:         fileInfo.Size(),
 		Created:      completedAt.Format(time.RFC3339Nano),
-		relativePath: relativePath,
+		relativePath: plannedRelativePath,
 		sha256:       artifactHash,
 		provenanceJSON: append(
 			json.RawMessage(nil),
@@ -2022,7 +2012,7 @@ func (h *PayloadHandler) lookupPayload(id string) (payloadBuildRecord, error) {
 			record.RelativePath = relativePath
 		}
 		if record.SHA256 == "" {
-			hash, err := hashArtifact(result.Path)
+			hash, err := h.hashPayloadArtifact(record.RelativePath)
 			if err != nil {
 				return payloadBuildRecord{}, err
 			}
@@ -2373,18 +2363,20 @@ func (h *PayloadHandler) openVerifiedPayload(
 	if !validPayloadFilename(record.Filename) {
 		return nil, payloadStateCorrupt, "payload filename is invalid", ""
 	}
-	artifactPath, err := h.resolveArtifactPath(record.RelativePath)
+	nativeRelativePath, err := containedNativeRelativePath(
+		record.RelativePath,
+	)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, payloadStateMissing, "artifact is missing", ""
-		}
 		return nil, payloadStateCorrupt, err.Error(), ""
 	}
-	if filepath.Base(artifactPath) != record.Filename {
+	if filepath.Base(nativeRelativePath) != record.Filename {
 		return nil, payloadStateCorrupt, "artifact filename does not match metadata", ""
 	}
 
-	file, err = openPayloadArtifact(artifactPath)
+	file, err = openPayloadArtifactBeneath(
+		h.payloadsDir,
+		nativeRelativePath,
+	)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, payloadStateMissing, "artifact is missing", ""
@@ -2448,50 +2440,22 @@ func (h *PayloadHandler) relativeArtifactPath(artifactPath string) (string, erro
 		return "", fmt.Errorf("resolve artifact path: %w", err)
 	}
 	relativePath, err := filepath.Rel(h.payloadsDir, absoluteArtifactPath)
-	if err != nil || !isContainedRelativePath(relativePath) {
+	if err != nil {
 		return "", errors.New("payload artifact is outside the configured payload root")
 	}
-	resolvedRoot, err := filepath.EvalSymlinks(h.payloadsDir)
-	if err != nil {
-		return "", fmt.Errorf("resolve payload root: %w", err)
-	}
-	resolvedArtifact, err := filepath.EvalSymlinks(absoluteArtifactPath)
-	if err != nil {
-		return "", fmt.Errorf("resolve payload artifact: %w", err)
-	}
-	resolvedRelative, err := filepath.Rel(resolvedRoot, resolvedArtifact)
-	if err != nil || !isContainedRelativePath(resolvedRelative) {
-		return "", errors.New("payload artifact resolves outside the configured payload root")
+	if _, err := containedNativeRelativePath(relativePath); err != nil {
+		return "", errors.New("payload artifact is outside the configured payload root")
 	}
 	return filepath.ToSlash(relativePath), nil
 }
 
-func (h *PayloadHandler) resolveArtifactPath(relativePath string) (string, error) {
-	if relativePath == "" || filepath.IsAbs(relativePath) {
-		return "", errors.New("artifact path is not a contained relative path")
-	}
+func containedNativeRelativePath(relativePath string) (string, error) {
 	nativeRelativePath := filepath.FromSlash(relativePath)
-	if !isContainedRelativePath(nativeRelativePath) {
+	if !isContainedRelativePath(nativeRelativePath) ||
+		filepath.Clean(nativeRelativePath) != nativeRelativePath {
 		return "", errors.New("artifact path is not a contained relative path")
 	}
-	artifactPath := filepath.Join(h.payloadsDir, nativeRelativePath)
-	lexicalRelative, err := filepath.Rel(h.payloadsDir, artifactPath)
-	if err != nil || !isContainedRelativePath(lexicalRelative) {
-		return "", errors.New("artifact path escapes the configured payload root")
-	}
-	resolvedRoot, err := filepath.EvalSymlinks(h.payloadsDir)
-	if err != nil {
-		return "", fmt.Errorf("resolve payload root: %w", err)
-	}
-	resolvedArtifact, err := filepath.EvalSymlinks(artifactPath)
-	if err != nil {
-		return "", err
-	}
-	resolvedRelative, err := filepath.Rel(resolvedRoot, resolvedArtifact)
-	if err != nil || !isContainedRelativePath(resolvedRelative) {
-		return "", errors.New("artifact path resolves outside the configured payload root")
-	}
-	return resolvedArtifact, nil
+	return nativeRelativePath, nil
 }
 
 func isContainedRelativePath(path string) bool {
@@ -2499,6 +2463,166 @@ func isContainedRelativePath(path string) bool {
 		return false
 	}
 	return !strings.HasPrefix(path, ".."+string(filepath.Separator))
+}
+
+func validPayloadDirectorySegment(segment string) bool {
+	return segment != "" &&
+		segment != "." &&
+		segment != ".." &&
+		!strings.ContainsAny(segment, "/\\:\x00")
+}
+
+func openPayloadArtifactBeneath(
+	payloadRoot string,
+	relativePath string,
+) (*os.File, error) {
+	nativeRelativePath, err := containedNativeRelativePath(relativePath)
+	if err != nil {
+		return nil, err
+	}
+	return safeopen.OpenBeneath(payloadRoot, nativeRelativePath)
+}
+
+func createPayloadFileBeneath(
+	payloadRoot string,
+	relativePath string,
+	data []byte,
+	mode os.FileMode,
+) (returnErr error) {
+	nativeRelativePath, err := containedNativeRelativePath(relativePath)
+	if err != nil {
+		return err
+	}
+	file, err := safeopen.OpenFileBeneath(
+		payloadRoot,
+		nativeRelativePath,
+		os.O_RDWR|os.O_CREATE|os.O_EXCL,
+		mode,
+	)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil && returnErr == nil {
+			returnErr = closeErr
+		}
+	}()
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("payload path is not a regular file")
+	}
+	if err := file.Chmod(mode); err != nil {
+		return err
+	}
+	written, err := file.Write(data)
+	if err != nil {
+		return err
+	}
+	if written != len(data) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+func (h *PayloadHandler) publishGeneratedArtifact(
+	stagingRoot string,
+	stagingRelativePath string,
+	destinationRelativePath string,
+) (info os.FileInfo, artifactHash string, returnErr error) {
+	source, err := openPayloadArtifactBeneath(
+		stagingRoot,
+		stagingRelativePath,
+	)
+	if err != nil {
+		return nil, "", fmt.Errorf("open staged payload artifact: %w", err)
+	}
+	defer func() {
+		if closeErr := source.Close(); closeErr != nil && returnErr == nil {
+			returnErr = closeErr
+		}
+	}()
+	sourceInfo, err := source.Stat()
+	if err != nil {
+		return nil, "", fmt.Errorf("inspect staged payload artifact: %w", err)
+	}
+	if !sourceInfo.Mode().IsRegular() {
+		return nil, "", errors.New("staged payload artifact is not a regular file")
+	}
+
+	nativeDestination, err := containedNativeRelativePath(
+		destinationRelativePath,
+	)
+	if err != nil {
+		return nil, "", err
+	}
+	destination, err := safeopen.OpenFileBeneath(
+		h.payloadsDir,
+		nativeDestination,
+		os.O_RDWR|os.O_CREATE|os.O_EXCL,
+		0700,
+	)
+	if err != nil {
+		return nil, "", fmt.Errorf("create published payload artifact: %w", err)
+	}
+	defer func() {
+		if closeErr := destination.Close(); closeErr != nil &&
+			returnErr == nil {
+			returnErr = closeErr
+		}
+	}()
+	if err := destination.Chmod(0700); err != nil {
+		return nil, "", fmt.Errorf(
+			"restrict published payload artifact permissions: %w",
+			err,
+		)
+	}
+	copied, err := io.Copy(destination, source)
+	if err != nil {
+		return nil, "", fmt.Errorf("publish payload artifact: %w", err)
+	}
+	if copied != sourceInfo.Size() {
+		return nil, "", errors.New(
+			"staged payload artifact changed during publishing",
+		)
+	}
+	artifactHash, err = hashOpenArtifact(destination)
+	if err != nil {
+		return nil, "", fmt.Errorf("hash published payload artifact: %w", err)
+	}
+	info, err = destination.Stat()
+	if err != nil {
+		return nil, "", fmt.Errorf(
+			"inspect published payload artifact: %w",
+			err,
+		)
+	}
+	if !info.Mode().IsRegular() || info.Size() != copied {
+		return nil, "", errors.New(
+			"published payload artifact changed during inspection",
+		)
+	}
+	return info, artifactHash, nil
+}
+
+func (h *PayloadHandler) hashPayloadArtifact(
+	relativePath string,
+) (artifactHash string, returnErr error) {
+	file, err := openPayloadArtifactBeneath(
+		h.payloadsDir,
+		relativePath,
+	)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil && returnErr == nil {
+			returnErr = closeErr
+		}
+	}()
+	return hashOpenArtifact(file)
 }
 
 func validPayloadFilename(filename string) bool {
@@ -2523,15 +2647,6 @@ func validPayloadID(id string) bool {
 	return true
 }
 
-func hashArtifact(path string) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-	return hashOpenArtifact(file)
-}
-
 func hashOpenArtifact(file *os.File) (string, error) {
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return "", err
@@ -2544,10 +2659,6 @@ func hashOpenArtifact(file *os.File) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("%x", hash.Sum(nil)), nil
-}
-
-func openPayloadArtifact(path string) (*os.File, error) {
-	return os.Open(filepath.Clean(path))
 }
 
 // RegisterRoutes registers all payload-related routes on the provided mux.
