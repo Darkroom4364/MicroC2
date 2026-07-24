@@ -13,6 +13,8 @@ import (
 	"strings"
 )
 
+const maxListenerCreateRequestBytes = 64 << 10
+
 // NewListenerHandlers creates a new listener handlers instance
 func NewListenerHandlers(manager *listeners.ListenerManager) *ListenerHandlers {
 	handler := &ListenerHandlers{manager: manager}
@@ -33,16 +35,22 @@ func (h *ListenerHandlers) HandleCreateListener(w http.ResponseWriter, r *http.R
 	}
 
 	var config listeners.ListenerConfig
-	if err := json.NewDecoder(r.Body).Decode(&config); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
+	if err := decodeStrictJSON(
+		w,
+		r,
+		&config,
+		maxListenerCreateRequestBytes,
+	); err != nil {
+		writeJSONDecodeError(w, "Invalid request body", err)
 		return
 	}
 
-	// Trim whitespace from bind host to avoid invalid addresses
-	config.BindHost = strings.TrimSpace(config.BindHost)
-
 	listener, err := h.manager.CreateListenerWithContext(r.Context(), config)
 	if err != nil {
+		if listeners.IsListenerConfigValidationError(err) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

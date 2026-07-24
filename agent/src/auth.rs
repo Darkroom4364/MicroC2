@@ -1078,7 +1078,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn build_sidecars_and_output_never_contain_the_bootstrap_secret() {
+    fn build_output_and_logs_never_contain_the_bootstrap_secret() {
         use std::os::unix::fs::PermissionsExt;
 
         let workspace = unique_temp_dir("build-redaction");
@@ -1089,7 +1089,7 @@ mod tests {
         let fake_cargo = fake_bin.join("cargo");
         fs::write(
             &fake_cargo,
-            "#!/bin/sh\ncargo_target_dir=${CARGO_TARGET_DIR:-target}\nmkdir -p \"$cargo_target_dir/x86_64-unknown-linux-gnu/debug\"\nprintf fake > \"$cargo_target_dir/x86_64-unknown-linux-gnu/debug/agent\"\n",
+            "#!/bin/sh\ncargo_target_dir=${CARGO_TARGET_DIR:-target}\nmkdir -p \"$cargo_target_dir/x86_64-unknown-linux-gnu/debug\" \"$cargo_target_dir/.fingerprint\"\nprintf '{\"MICROC2_BUILD_NONCE\":\"%s\"}\\n' \"${MICROC2_BUILD_NONCE:-missing}\" >> \"$cargo_target_dir/.fingerprint/build.jsonl\"\nprintf '%s' \"${JITTER:-missing}\" > \"$cargo_target_dir/x86_64-unknown-linux-gnu/debug/agent\"\n",
         )
         .expect("write fake cargo");
         fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o700))
@@ -1101,60 +1101,127 @@ mod tests {
 
         let secret = TEST_BOOTSTRAP_CREDENTIAL;
         let inherited_path = std::env::var("PATH").unwrap_or_default();
-        let output = Command::new("/bin/bash")
-            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/build.sh"))
-            .args([
-                "--target",
-                "x86_64-unknown-linux-gnu",
-                "--output",
-                output_dir.to_str().expect("UTF-8 output path"),
-                "--build-type",
-                "debug",
-                "--format",
-                "linux_elf",
-                "--listener-host",
-                "127.0.0.1",
-                "--listener-port",
-                "8080",
-                "--payload-id",
-                "payload-one",
-                "--protocol",
-                "http",
-            ])
-            .current_dir(&workspace)
-            .env("PATH", format!("{}:{inherited_path}", fake_bin.display()))
-            .env("CARGO_TARGET_DIR", &cargo_target_dir)
-            .env("LISTENER_ID", "listener-one")
-            .env("ENROLLMENT_CREDENTIAL", secret)
-            .env("ALLOW_INSECURE_ISOLATED_LAB", "true")
-            .output()
-            .expect("run build script");
-        assert!(
-            output.status.success(),
-            "build script failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
-        assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+        let run_build = |extra_args: &[&str], extra_env: &[(&str, &str)]| {
+            let mut command = Command::new("/bin/bash");
+            command
+                .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/build.sh"))
+                .args([
+                    "--target",
+                    "x86_64-unknown-linux-gnu",
+                    "--output",
+                    output_dir.to_str().expect("UTF-8 output path"),
+                    "--build-type",
+                    "debug",
+                    "--format",
+                    "linux_elf",
+                    "--listener-host",
+                    "127.0.0.1",
+                    "--listener-port",
+                    "8080",
+                    "--jitter",
+                    "17",
+                    "--payload-id",
+                    "payload-one",
+                    "--protocol",
+                    "http",
+                ])
+                .args(extra_args)
+                .current_dir(&workspace)
+                .env("PATH", format!("{}:{inherited_path}", fake_bin.display()))
+                .env("CARGO_TARGET_DIR", &cargo_target_dir)
+                .env("LISTENER_ID", "listener-one")
+                .env("ENROLLMENT_CREDENTIAL", secret)
+                .env("ALLOW_INSECURE_ISOLATED_LAB", "true");
+            for (name, value) in extra_env {
+                command.env(name, value);
+            }
+            command.output().expect("run build script")
+        };
+        for output in [run_build(&[], &[]), run_build(&[], &[])] {
+            assert!(
+                output.status.success(),
+                "build script failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+        }
         assert!(output_dir.join("agent").exists());
+        assert_eq!(
+            fs::read_to_string(output_dir.join("agent")).expect("read staged artifact"),
+            "17",
+            "--jitter must reach the Cargo build environment"
+        );
         assert!(cargo_target_dir
             .join("x86_64-unknown-linux-gnu")
             .join("debug")
             .join("agent")
             .exists());
+        let fingerprint =
+            fs::read_to_string(cargo_target_dir.join(".fingerprint").join("build.jsonl"))
+                .expect("read simulated Cargo fingerprint");
+        let nonces = fingerprint.lines().collect::<Vec<_>>();
+        assert_eq!(nonces.len(), 2);
+        assert_ne!(
+            nonces[0], nonces[1],
+            "each wrapper build needs a fresh nonce"
+        );
+        assert!(!fingerprint.contains(secret));
 
-        for config_path in [
-            workspace.join(".config/config.json"),
-            output_dir.join(".config/config.json"),
+        let build_script_source =
+            fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/build.rs"))
+                .expect("read build.rs");
+        assert!(build_script_source.contains("cargo:rerun-if-env-changed=MICROC2_BUILD_NONCE"));
+        assert!(!build_script_source.contains("cargo:rerun-if-env-changed=ENROLLMENT_CREDENTIAL"));
+
+        for (extra_args, extra_env) in [
+            (vec!["--format", "windows_dll"], vec![]),
+            (vec!["--sleep", "0"], vec![]),
+            (
+                vec!["--sleep", "18446744073709551615", "--jitter", "1"],
+                vec![],
+            ),
+            (
+                vec![],
+                vec![("BASE_SCORE_THRESHOLD_BG_TO_REDUCED", "100.1")],
+            ),
+            (
+                vec![],
+                vec![
+                    ("BASE_SCORE_THRESHOLD_BG_TO_REDUCED", "60"),
+                    ("BASE_SCORE_THRESHOLD_REDUCED_TO_FULL", "60"),
+                ],
+            ),
+            (vec![], vec![("C2_THRESH_INC_FACTOR", "0.5")]),
+            (vec![], vec![("C2_THRESH_DEC_FACTOR", "1.1")]),
+            (vec![], vec![("C2_THRESH_MAX_MULT", "0.5")]),
+            (vec![], vec![("BASE_MAX_C2_FAILS", "4294967296")]),
+            (
+                vec![],
+                vec![(
+                    "C2_THRESH_MAX_MULT",
+                    "340282346638528859811704183484516925441",
+                )],
+            ),
         ] {
-            let projected = fs::read_to_string(&config_path).expect("read projected config");
+            let output = run_build(&extra_args, &extra_env);
             assert!(
-                !projected.contains(secret),
-                "{} contains the bootstrap credential",
-                config_path.display()
+                !output.status.success(),
+                "invalid direct-build settings unexpectedly reached Cargo"
             );
-            assert!(projected.contains(r#""enrollment_credential": """#));
         }
+        assert_eq!(
+            fs::read_to_string(cargo_target_dir.join(".fingerprint").join("build.jsonl"))
+                .expect("read simulated Cargo fingerprint after rejections")
+                .lines()
+                .count(),
+            2,
+            "invalid settings invoked Cargo before failing"
+        );
+
+        assert!(!workspace.join(".config/config.json").exists());
+        assert!(!output_dir.join(".config/config.json").exists());
+        assert_tree_excludes(&workspace, secret.as_bytes());
 
         let _ = fs::remove_dir_all(workspace);
     }
@@ -1226,5 +1293,25 @@ mod tests {
             nanos,
             name
         ))
+    }
+
+    fn assert_tree_excludes(root: &Path, needle: &[u8]) {
+        for entry in fs::read_dir(root).expect("read test output tree") {
+            let entry = entry.expect("read test output entry");
+            let path = entry.path();
+            let file_type = entry.file_type().expect("read test output type");
+            if file_type.is_dir() {
+                assert_tree_excludes(&path, needle);
+            } else if file_type.is_file() {
+                let contents = fs::read(&path).expect("read test output file");
+                assert!(
+                    !contents
+                        .windows(needle.len())
+                        .any(|window| window == needle),
+                    "{} contains bootstrap credential material",
+                    path.display()
+                );
+            }
+        }
     }
 }

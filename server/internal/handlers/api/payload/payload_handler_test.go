@@ -29,6 +29,138 @@ import (
 	"microc2/server/internal/persistence"
 )
 
+func TestDecodePayloadConfigRequestDistinguishesOmittedDefaultsFromExplicitZero(
+	t *testing.T,
+) {
+	decode := func(body string) PayloadConfig {
+		t.Helper()
+		request := httptest.NewRequest(
+			http.MethodPost,
+			"/api/payload/generate",
+			strings.NewReader(body),
+		)
+		config, err := decodePayloadConfigRequest(httptest.NewRecorder(), request)
+		if err != nil {
+			t.Fatalf("decode payload request %s: %v", body, err)
+		}
+		return config
+	}
+
+	omitted := decode(`{}`)
+	defaults := defaultPayloadRequestConfig()
+	if omitted.ProcScanIntervalSecs != defaults.ProcScanIntervalSecs ||
+		omitted.BaseThresholdEnterFullOpsec != defaults.BaseThresholdEnterFullOpsec ||
+		omitted.BaseThresholdEnterReducedActivity != defaults.BaseThresholdEnterReducedActivity ||
+		omitted.MinDurationFullOpsecSecs != defaults.MinDurationFullOpsecSecs ||
+		omitted.MinDurationReducedActivitySecs != defaults.MinDurationReducedActivitySecs ||
+		omitted.MinDurationBackgroundOpsecSecs != defaults.MinDurationBackgroundOpsecSecs ||
+		omitted.ReducedActivitySleepSecs != defaults.ReducedActivitySleepSecs ||
+		omitted.BaseMaxConsecutiveC2Failures != defaults.BaseMaxConsecutiveC2Failures ||
+		omitted.C2FailureThresholdIncreaseFactor != defaults.C2FailureThresholdIncreaseFactor ||
+		omitted.C2FailureThresholdDecreaseFactor != defaults.C2FailureThresholdDecreaseFactor ||
+		omitted.C2ThresholdAdjustIntervalSecs != defaults.C2ThresholdAdjustIntervalSecs ||
+		omitted.C2DynamicThresholdMaxMultiplier != defaults.C2DynamicThresholdMaxMultiplier {
+		t.Fatalf("omitted OPSEC settings did not resolve to defaults: %#v", omitted)
+	}
+
+	explicitZero := decode(`{
+		"proc_scan_interval_secs": 0,
+		"base_threshold_enter_full_opsec": 0,
+		"base_threshold_enter_reduced_activity": 0,
+		"min_duration_full_opsec_secs": 0,
+		"min_duration_reduced_activity_secs": 0,
+		"min_duration_background_opsec_secs": 0,
+		"reduced_activity_sleep_secs": 0,
+		"base_max_consecutive_c2_failures": 0,
+		"c2_failure_threshold_increase_factor": 0,
+		"c2_failure_threshold_decrease_factor": 0,
+		"c2_threshold_adjust_interval_secs": 0,
+		"c2_dynamic_threshold_max_multiplier": 0
+	}`)
+	if explicitZero.ProcScanIntervalSecs != 0 ||
+		explicitZero.BaseThresholdEnterFullOpsec != 0 ||
+		explicitZero.BaseThresholdEnterReducedActivity != 0 ||
+		explicitZero.MinDurationFullOpsecSecs != 0 ||
+		explicitZero.MinDurationReducedActivitySecs != 0 ||
+		explicitZero.MinDurationBackgroundOpsecSecs != 0 ||
+		explicitZero.ReducedActivitySleepSecs != 0 ||
+		explicitZero.BaseMaxConsecutiveC2Failures != 0 ||
+		explicitZero.C2FailureThresholdIncreaseFactor != 0 ||
+		explicitZero.C2FailureThresholdDecreaseFactor != 0 ||
+		explicitZero.C2ThresholdAdjustIntervalSecs != 0 ||
+		explicitZero.C2DynamicThresholdMaxMultiplier != 0 {
+		t.Fatalf("explicit zero OPSEC settings were replaced by defaults: %#v", explicitZero)
+	}
+}
+
+func TestPayloadBuildPinsJitterAndPreservesRustF32Values(t *testing.T) {
+	t.Setenv("JITTER", "18446744073709551615")
+	tempDir := t.TempDir()
+	agentDir := filepath.Join(tempDir, "agent")
+	writePlaceholderBuildScript(t, agentDir)
+	handler, err := newPayloadHandler(
+		filepath.Join(tempDir, "payloads"),
+		agentDir,
+		testListenerLookup(),
+		nil,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("create payload handler: %v", err)
+	}
+
+	values := make(map[string]string)
+	handler.runBuild = func(command *exec.Cmd) ([]byte, error) {
+		for _, entry := range command.Env {
+			name, value, found := strings.Cut(entry, "=")
+			if found {
+				values[name] = value
+			}
+		}
+		for index := 0; index+1 < len(command.Args); index++ {
+			if command.Args[index] != "--output" {
+				continue
+			}
+			if err := os.WriteFile(
+				filepath.Join(command.Args[index+1], "agent"),
+				[]byte("fake agent"),
+				0o600,
+			); err != nil {
+				return nil, err
+			}
+			if err := writeTestEffectiveConfig(command); err != nil {
+				return nil, err
+			}
+			return []byte("hook build complete"), nil
+		}
+		return nil, errors.New("build command omitted --output")
+	}
+
+	config := testPayloadConfig()
+	config.BaseThresholdEnterFullOpsec = 63.125
+	config.BaseThresholdEnterReducedActivity = 17.75
+	config.C2FailureThresholdIncreaseFactor = 1.234
+	config.C2FailureThresholdDecreaseFactor = 0.876
+	config.C2DynamicThresholdMaxMultiplier = 2.345
+	if _, err := handler.GeneratePayload(config); err != nil {
+		t.Fatalf("generate payload: %v", err)
+	}
+
+	want := map[string]string{
+		"JITTER":                               "2",
+		"BASE_SCORE_THRESHOLD_REDUCED_TO_FULL": "63.125",
+		"BASE_SCORE_THRESHOLD_BG_TO_REDUCED":   "17.75",
+		"C2_THRESH_INC_FACTOR":                 "1.234",
+		"C2_THRESH_DEC_FACTOR":                 "0.876",
+		"C2_THRESH_MAX_MULT":                   "2.345",
+	}
+	for name, expected := range want {
+		if values[name] != expected {
+			t.Fatalf("%s = %q, want %q", name, values[name], expected)
+		}
+	}
+}
+
 func TestGeneratePayloadCreatesBuildIDsDistinctFromListenerID(t *testing.T) {
 	tempDir := withTempWorkingDir(t)
 	agentDir := filepath.Join(tempDir, "agent")
@@ -43,11 +175,13 @@ func TestGeneratePayloadCreatesBuildIDsDistinctFromListenerID(t *testing.T) {
 
 	handler := NewPayloadHandlerForIsolatedLab(filepath.Join(tempDir, "static", "payloads"), agentDir)
 	config := PayloadConfig{
-		ListenerID:   "listener-one",
-		AgentType:    "debugAgent",
-		Architecture: "x64",
-		Format:       "linux_elf",
-		Sleep:        5,
+		ListenerID:                        "listener-one",
+		AgentType:                         "debugAgent",
+		Architecture:                      "x64",
+		Format:                            "linux_elf",
+		Sleep:                             5,
+		BaseThresholdEnterFullOpsec:       60,
+		BaseThresholdEnterReducedActivity: 20,
 	}
 
 	first, err := handler.GeneratePayload(config)
@@ -116,11 +250,13 @@ func TestGeneratePayloadGeneratesSeedAndWritesProvenance(t *testing.T) {
 		return command.CombinedOutput()
 	}
 	config := PayloadConfig{
-		ListenerID:   "listener-one",
-		AgentType:    "debugAgent",
-		Architecture: "x64",
-		Format:       "linux_elf",
-		Sleep:        5,
+		ListenerID:                        "listener-one",
+		AgentType:                         "debugAgent",
+		Architecture:                      "x64",
+		Format:                            "linux_elf",
+		Sleep:                             5,
+		BaseThresholdEnterFullOpsec:       60,
+		BaseThresholdEnterReducedActivity: 20,
 	}
 
 	seedPattern := regexp.MustCompile(`^[0-9a-f]{16}$`)
@@ -1602,8 +1738,10 @@ func TestPayloadEnrollmentRevokeOperatorRoute(t *testing.T) {
 func TestPayloadGenerationRejectsInvalidSessionAllowance(t *testing.T) {
 	handler := NewPayloadHandlerForIsolatedLab(t.TempDir(), t.TempDir())
 	body, err := json.Marshal(PayloadConfig{
-		ListenerID:  "listener-one",
-		MaxSessions: 65,
+		ListenerID:                        "listener-one",
+		MaxSessions:                       65,
+		BaseThresholdEnterFullOpsec:       60,
+		BaseThresholdEnterReducedActivity: 20,
 	})
 	if err != nil {
 		t.Fatalf("marshal invalid payload request: %v", err)
@@ -1659,12 +1797,14 @@ func TestGeneratePayloadHonoursSuppliedMutationSeed(t *testing.T) {
 
 	handler := NewPayloadHandlerForIsolatedLab(filepath.Join(tempDir, "static", "payloads"), agentDir)
 	config := PayloadConfig{
-		ListenerID:   "listener-one",
-		AgentType:    "debugAgent",
-		Architecture: "x64",
-		Format:       "linux_elf",
-		Sleep:        5,
-		MutationSeed: "0123456789abcdef",
+		ListenerID:                        "listener-one",
+		AgentType:                         "debugAgent",
+		Architecture:                      "x64",
+		Format:                            "linux_elf",
+		Sleep:                             5,
+		MutationSeed:                      "0123456789abcdef",
+		BaseThresholdEnterFullOpsec:       60,
+		BaseThresholdEnterReducedActivity: 20,
 	}
 
 	result, err := handler.GeneratePayload(config)
@@ -3123,7 +3263,10 @@ func TestGeneratePayloadDoesNotUseLegacyFallbackArtifact(t *testing.T) {
 			"payloads",
 			buildType,
 			payloadID,
-			payloadFilename(format),
+			map[string]string{
+				"linux_elf":   "agent",
+				"windows_exe": "agent.exe",
+			}[format],
 		)
 		if err := os.MkdirAll(
 			filepath.Dir(legacyArtifactPath),
@@ -3277,12 +3420,14 @@ func TestDownloadStreamsVerifiedHandleAcrossPathSwap(t *testing.T) {
 func generatePayloadOverHTTP(t *testing.T, handler *PayloadHandler) PayloadResult {
 	t.Helper()
 	body, err := json.Marshal(PayloadConfig{
-		ListenerID:   "listener-one",
-		AgentType:    "debugAgent",
-		Architecture: "x64",
-		Format:       "linux_elf",
-		Sleep:        5,
-		MutationSeed: "0123456789abcdef",
+		ListenerID:                        "listener-one",
+		AgentType:                         "debugAgent",
+		Architecture:                      "x64",
+		Format:                            "linux_elf",
+		Sleep:                             5,
+		MutationSeed:                      "0123456789abcdef",
+		BaseThresholdEnterFullOpsec:       60,
+		BaseThresholdEnterReducedActivity: 20,
 	})
 	if err != nil {
 		t.Fatalf("marshal payload request: %v", err)
@@ -3316,14 +3461,14 @@ func generatePayloadOverHTTP(t *testing.T, handler *PayloadHandler) PayloadResul
 }
 
 func testPayloadConfig() PayloadConfig {
-	return PayloadConfig{
-		ListenerID:   "listener-one",
-		AgentType:    "debugAgent",
-		Architecture: "x64",
-		Format:       "linux_elf",
-		Sleep:        5,
-		MutationSeed: "0123456789abcdef",
-	}
+	config := defaultPayloadRequestConfig()
+	config.ListenerID = "listener-one"
+	config.AgentType = "debugAgent"
+	config.Architecture = "x64"
+	config.Format = "linux_elf"
+	config.Sleep = 5
+	config.MutationSeed = "0123456789abcdef"
+	return config
 }
 
 func testListenerLookup() staticListenerLookup {
@@ -3435,7 +3580,7 @@ printf 'fake agent' > "$output/$artifact"
 printf '%s' "${MUTATION_SEED:-}" > "$output/mutation_seed.env"
 if [[ -n "${EFFECTIVE_CONFIG_PATH:-}" ]]; then
   mkdir -p "$(dirname "$EFFECTIVE_CONFIG_PATH")"
-  printf '{"server_url":"%s","payload_id":"%s","agent_id":"","listener_id":"%s","mutation_seed":"%s","protocol":"%s","user_agent":"test-agent","mutation_endpoint_segments":["segment-a","segment-b"],"allow_invalid_certs":false}' \
+  printf '{"server_url":"%s","payload_id":"%s","agent_id":"","listener_id":"%s","mutation_seed":"%s","protocol":"%s","user_agent":"test-agent","allow_invalid_certs":false}' \
     "${SERVER_URL:-}" "${PAYLOAD_ID:-}" "${LISTENER_ID:-}" "${MUTATION_SEED:-}" "${PROTOCOL:-https}" \
     > "$EFFECTIVE_CONFIG_PATH"
 fi
@@ -3475,15 +3620,14 @@ func writeTestEffectiveConfig(command *exec.Cmd) error {
 		destination = filepath.Join(command.Dir, destination)
 	}
 	config := map[string]interface{}{
-		"server_url":                 values["SERVER_URL"],
-		"payload_id":                 values["PAYLOAD_ID"],
-		"agent_id":                   "",
-		"listener_id":                values["LISTENER_ID"],
-		"mutation_seed":              values["MUTATION_SEED"],
-		"protocol":                   values["PROTOCOL"],
-		"user_agent":                 "test-agent",
-		"mutation_endpoint_segments": []string{"segment-a", "segment-b"},
-		"allow_invalid_certs":        false,
+		"server_url":          values["SERVER_URL"],
+		"payload_id":          values["PAYLOAD_ID"],
+		"agent_id":            "",
+		"listener_id":         values["LISTENER_ID"],
+		"mutation_seed":       values["MUTATION_SEED"],
+		"protocol":            values["PROTOCOL"],
+		"user_agent":          "test-agent",
+		"allow_invalid_certs": false,
 	}
 	data, err := json.Marshal(config)
 	if err != nil {

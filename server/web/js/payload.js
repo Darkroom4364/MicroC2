@@ -1,3 +1,37 @@
+function integerOrDefault(value, fallback) {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function floatOrDefault(value, fallback) {
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function normalizePayloadFormConfig(config) {
+    config.socks5_enabled = config.socks5_enabled === 'on';
+    config.socks5_host = String(config.socks5_host || '').trim();
+    config.socks5_port = integerOrDefault(config.socks5_port, 0);
+
+    config.proc_scan_interval_secs = integerOrDefault(config.proc_scan_interval_secs, 300);
+    config.base_threshold_enter_full_opsec = floatOrDefault(config.base_threshold_enter_full_opsec, 60.0);
+    config.base_threshold_enter_reduced_activity = floatOrDefault(config.base_threshold_enter_reduced_activity, 20.0);
+    config.min_duration_full_opsec_secs = integerOrDefault(config.min_duration_full_opsec_secs, 300);
+    config.min_duration_reduced_activity_secs = integerOrDefault(config.min_duration_reduced_activity_secs, 120);
+    config.min_duration_background_opsec_secs = integerOrDefault(config.min_duration_background_opsec_secs, 60);
+    config.reduced_activity_sleep_secs = integerOrDefault(config.reduced_activity_sleep_secs, 120);
+    config.base_max_consecutive_c2_failures = integerOrDefault(config.base_max_consecutive_c2_failures, 5);
+    config.c2_failure_threshold_increase_factor = floatOrDefault(config.c2_failure_threshold_increase_factor, 1.1);
+    config.c2_failure_threshold_decrease_factor = floatOrDefault(config.c2_failure_threshold_decrease_factor, 0.9);
+    config.c2_threshold_adjust_interval_secs = integerOrDefault(config.c2_threshold_adjust_interval_secs, 3600);
+    config.c2_dynamic_threshold_max_multiplier = floatOrDefault(config.c2_dynamic_threshold_max_multiplier, 2.0);
+
+    if (config.sleep) {
+        config.sleep = Number.parseInt(config.sleep, 10);
+    }
+    return config;
+}
+
 class PayloadManager {
     constructor() {
         this.logSocket = null;
@@ -172,29 +206,7 @@ class PayloadManager {
             this.addLogEntry('payload', 'No listener selected. Payload generation aborted.', 'ERROR');
             return;
         }
-        // Convert checkbox values to boolean
-        config.socks5_enabled = config.socks5_enabled === 'on';
-        config.socks5_host = String(config.socks5_host || '').trim();
-        config.socks5_port = parseInt(config.socks5_port, 10) || 0;
-
-        // ---  Parse OPSEC fields ---
-        config.proc_scan_interval_secs = parseInt(config.proc_scan_interval_secs, 10) || 300;
-        config.base_threshold_enter_full_opsec = parseFloat(config.base_threshold_enter_full_opsec) || 60.0;
-        config.base_threshold_enter_reduced_activity = parseFloat(config.base_threshold_enter_reduced_activity) || 20.0;
-        config.min_duration_full_opsec_secs = parseInt(config.min_duration_full_opsec_secs, 10) || 300;
-        config.min_duration_reduced_activity_secs = parseInt(config.min_duration_reduced_activity_secs, 10) || 120;
-        config.min_duration_background_opsec_secs = parseInt(config.min_duration_background_opsec_secs, 10) || 60;
-        config.reduced_activity_sleep_secs = parseInt(config.reduced_activity_sleep_secs, 10) || 120;
-        config.base_max_consecutive_c2_failures = parseInt(config.base_max_consecutive_c2_failures, 10) || 5;
-        config.c2_failure_threshold_increase_factor = parseFloat(config.c2_failure_threshold_increase_factor) || 1.1;
-        config.c2_failure_threshold_decrease_factor = parseFloat(config.c2_failure_threshold_decrease_factor) || 0.9;
-        config.c2_threshold_adjust_interval_secs = parseInt(config.c2_threshold_adjust_interval_secs, 10) || 3600;
-        config.c2_dynamic_threshold_max_multiplier = parseFloat(config.c2_dynamic_threshold_max_multiplier) || 2.0;
-        // --- END NEW OPSEC FIELDS ---
-
-        if (config.sleep) {
-            config.sleep = parseInt(config.sleep, 10);
-        }
+        normalizePayloadFormConfig(config);
 
         const downloadSection = document.getElementById('download-section');
         downloadSection.classList.add('hidden');
@@ -308,6 +320,12 @@ class PayloadManager {
 
 // Initialize the payload manager when the page loads
 let payloadManager;
-document.addEventListener('DOMContentLoaded', () => {
-    payloadManager = new PayloadManager();
-});
+if (typeof document !== 'undefined') {
+    document.addEventListener('DOMContentLoaded', () => {
+        payloadManager = new PayloadManager();
+    });
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {normalizePayloadFormConfig, PayloadManager};
+}

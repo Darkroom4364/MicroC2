@@ -195,6 +195,7 @@ func TestOperatorGuardCheckOrigin(t *testing.T) {
 		{"same host origin", "https://example.com:8443", true},
 		{"unconfigured loopback origin", "http://localhost:9090", false},
 		{"configured origin", "https://operator.lab:9443", true},
+		{"configured host with wrong scheme", "http://operator.lab:9443", false},
 		{"cross-site origin", "https://evil.example", false},
 	}
 

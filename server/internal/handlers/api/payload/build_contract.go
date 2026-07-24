@@ -10,11 +10,45 @@ import (
 	"io"
 	"math"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 )
 
-const payloadBuildManifestSchemaV1 = "microc2.payload-build-manifest.v1"
+const (
+	payloadBuildManifestSchemaV1 = "microc2.payload-build-manifest.v1"
+	payloadBuildJitterSeconds    = 2
+	maxRustU32                   = uint64(1<<32 - 1)
+)
+
+func defaultPayloadRequestConfig() PayloadConfig {
+	return PayloadConfig{
+		ProcScanIntervalSecs:              300,
+		BaseThresholdEnterFullOpsec:       60,
+		BaseThresholdEnterReducedActivity: 20,
+		MinDurationFullOpsecSecs:          300,
+		MinDurationReducedActivitySecs:    120,
+		MinDurationBackgroundOpsecSecs:    60,
+		ReducedActivitySleepSecs:          120,
+		BaseMaxConsecutiveC2Failures:      5,
+		C2FailureThresholdIncreaseFactor:  1.1,
+		C2FailureThresholdDecreaseFactor:  0.9,
+		C2ThresholdAdjustIntervalSecs:     3600,
+		C2DynamicThresholdMaxMultiplier:   2,
+	}
+}
+
+func normalizeRustF32(value float64) float64 {
+	normalized := float32(value)
+	if normalized == 0 {
+		return 0
+	}
+	return float64(normalized)
+}
+
+func formatRustF32(value float64) string {
+	return strconv.FormatFloat(value, 'f', -1, 32)
+}
 
 type payloadProfileKey struct {
 	architecture string
@@ -197,6 +231,13 @@ func validateAndResolvePayloadConfig(
 			)
 		}
 	}
+	if config.BaseMaxConsecutiveC2Failures >= 0 &&
+		uint64(config.BaseMaxConsecutiveC2Failures) > maxRustU32 {
+		return payloadBuildPlan{}, invalidPayloadConfig(
+			"base_max_consecutive_c2_failures",
+			"must fit the agent's unsigned 32-bit counter",
+		)
+	}
 	for _, setting := range []struct {
 		field string
 		value float64
@@ -213,6 +254,19 @@ func validateAndResolvePayloadConfig(
 			return payloadBuildPlan{}, invalidPayloadConfig(
 				setting.field,
 				"must be a finite non-negative number",
+			)
+		}
+		if setting.value > math.MaxFloat32 {
+			return payloadBuildPlan{}, invalidPayloadConfig(
+				setting.field,
+				"must not exceed the agent's finite 32-bit float range",
+			)
+		}
+		if setting.value != 0 &&
+			setting.value < math.SmallestNonzeroFloat32 {
+			return payloadBuildPlan{}, invalidPayloadConfig(
+				setting.field,
+				"must be zero or representable as a non-zero 32-bit float",
 			)
 		}
 	}
@@ -246,6 +300,23 @@ func validateAndResolvePayloadConfig(
 		return payloadBuildPlan{}, invalidPayloadConfig(
 			"c2_dynamic_threshold_max_multiplier",
 			"must be at least 1 when set",
+		)
+	}
+	config.BaseThresholdEnterFullOpsec =
+		normalizeRustF32(config.BaseThresholdEnterFullOpsec)
+	config.BaseThresholdEnterReducedActivity =
+		normalizeRustF32(config.BaseThresholdEnterReducedActivity)
+	config.C2FailureThresholdIncreaseFactor =
+		normalizeRustF32(config.C2FailureThresholdIncreaseFactor)
+	config.C2FailureThresholdDecreaseFactor =
+		normalizeRustF32(config.C2FailureThresholdDecreaseFactor)
+	config.C2DynamicThresholdMaxMultiplier =
+		normalizeRustF32(config.C2DynamicThresholdMaxMultiplier)
+	if config.BaseThresholdEnterReducedActivity >=
+		config.BaseThresholdEnterFullOpsec {
+		return payloadBuildPlan{}, invalidPayloadConfig(
+			"base_threshold_enter_reduced_activity",
+			"must be lower than base_threshold_enter_full_opsec",
 		)
 	}
 

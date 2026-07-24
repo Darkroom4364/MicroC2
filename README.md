@@ -100,11 +100,11 @@ This framework can be used to:
 - **Adaptive OPSEC**: Dynamic operational mode adjustment based on threat scoring
 - **Memory Protection**: In-memory encryption of sensitive state data
 - **Anti-Analysis**: String obfuscation, process monitoring, sandbox evasion
-- **Network Flexibility**: HTTP(S) polling, SOCKS5 proxy support, reverse tunneling
+- **Network Flexibility**: HTTP(S) polling with optional outbound SOCKS5 proxying
 
 ### Web Interface
 - **Dashboard**: Real-time agent status and system monitoring
-- **Listener Management**: HTTP(S) and SOCKS5 listener configuration
+- **Listener Management**: HTTP(S) polling listener configuration
 - **Payload Generation**: Cross-platform agent compilation with custom configuration
 - **File Operations**: Secure upload/download functionality
 
@@ -115,7 +115,7 @@ This framework can be used to:
 - **Adaptive OPSEC Engine**: Dynamic behavioral adjustment based on environmental threat assessment
 - **Memory Protection**: AES-256-GCM encryption of sensitive state with immediate zeroization
 - **Platform-Specific Evasion**: Windows API hiding and Linux session detection mechanisms
-- **SOCKS5 Proxy Pivoting**: Multi-hop network traversal with reverse tunneling capabilities
+- **SOCKS5 Egress**: Optional outbound proxying for agent HTTP(S) traffic
 - **Minimal Footprint**: Optimized Rust agent with aggressive size reduction and anti-analysis features
 - **Modular Architecture**: Extensible framework supporting multiple communication protocols
 
@@ -159,16 +159,20 @@ This framework was built by someone running on way too much caffeine. If you enc
    git clone https://github.com/Darkroom4364/MicroC2.git
    cd MicroC2
    ```
-2. **Build the server:**cd 
+2. **Build the server:**
    ```sh
    cd server
-   go build -o server ./cmd/server.go
+   go build -o server ./cmd
    ```
-3. **Build the agent (optionally use cargo strip to reduce compile build as much as possible):**
+3. **Compile-check the agent source:**
    ```sh
    cd ../agent
-   cargo build --release
+   cargo build --locked --release
    ```
+   This direct Cargo artifact intentionally has no listener identity or
+   enrollment credential and is not deployable. After starting the server,
+   create a listener and use the Payload page to generate a validated Linux
+   x64 ELF or Windows x64 EXE payload.
 4. **Build the agent for Windows (from Linux):**
    - Install MinGW-w64:
      ```sh
@@ -191,6 +195,18 @@ This framework was built by someone running on way too much caffeine. If you enc
 
 ### Configuration
 - Edit `server/config/settings.yaml` for server settings.
+- The operator server is always HTTPS. `server.port` is its sole HTTPS port;
+  `server.tls.certFile` and `server.tls.keyFile` are mandatory. When
+  `server.redirect.enabled` is true, `server.redirect.httpPort` serves only the
+  HTTP-to-HTTPS redirect. It must be empty when redirects are disabled. Keep
+  both TLS files outside `server.staticDir`; HTTPS agent listeners inherit
+  these paths unless their API configuration supplies an explicit certificate
+  and key override.
+- `server.uploadDir`, `server.staticDir`, and `logging.file` select the
+  operator upload root, static root, and log file. Unknown or retired YAML
+  fields are rejected instead of ignored.
+- Browser-origin entries must be `"*"` or exact HTTP(S) origins without paths;
+  allow-list matching includes scheme, host, and effective port.
 - Durable server state defaults to `server/data/microc2.db` when the server is
   launched from `server/`. Keep `storage.path` outside `server.staticDir`; use
   `MICROC2_STORAGE_PATH` for an environment-specific override. See
@@ -215,8 +231,9 @@ This framework was built by someone running on way too much caffeine. If you enc
   MICROC2_OPERATOR_TOKEN='<random-lab-secret>' ./server
   ```
 
-  Remote API clients must send that value in `X-Operator-Token`. Browser
-  origins must also appear in `security.operatorAllowedOrigins`.
+  Remote API clients must send that value in `X-Operator-Token`. Cross-origin
+  browser origins must also appear in `security.operatorAllowedOrigins`;
+  exact same-origin browser requests are allowed automatically.
 - Agent-listener CORS is limited by `security.corsOrigins`. An empty list
   disables cross-origin browser access; `"*"` is an explicit unsafe escape
   hatch and should not be used for normal lab runs.
@@ -259,8 +276,14 @@ This framework was built by someone running on way too much caffeine. If you enc
   generated payloads.
 
 ### Creating Listeners
-- Use the web UI to create HTTPS polling or SOCKS5 listeners. Plain HTTP
-  polling requires the explicit isolated-lab transport override.
+- Use the web UI to create HTTPS polling listeners. Plain HTTP polling requires
+  the explicit isolated-lab transport override.
+- A listener may set one advertised DNS name or IP for generated payloads. It
+  may be omitted only when the bind host itself is a specific, advertiseable
+  address; wildcard bind addresses require the advertised host. Host rotation,
+  custom listener headers/URIs/user-agents, listener-side proxies,
+  DNS-over-HTTPS, and SOCKS5 listener mode are not implemented and are rejected
+  if submitted through the API.
 - Agents will connect to the listener endpoints you configure.
 
 ### Building Payloads
@@ -275,62 +298,12 @@ This framework was built by someone running on way too much caffeine. If you enc
 ### File Drop
 - Upload and download files via the File Drop section in the web UI. Folder in codebase is /server/uploads/
 
-## SOCKS5 Proxy Pivoting Setup (Multi-Hop Example)
+## SOCKS5 Egress
 
-MicroC2 supports SOCKS5 proxy pivoting, including multi-hop scenarios. Below is a tested workflow for chaining agents and listeners to pivot through multiple internal hosts.
-
-### Topology Example
-
-```
-Client <-> Server <-> VM1 <-> VM2
-```
-
-- **Server**: Runs MicroC2 server and first agent (pivot entry point)
-- **VM1**: First virtual machine, runs agent and acts as a SOCKS5 pivot server and uses a socks reverse proxy to connect to the c2 server
-- **VM2**: second virtual machine, runs second agent
-
----
-
-### Step-by-Step Workflow
-
-#### 1. **Set Up Two SOCKS5 Listeners**
-
-- In the MicroC2 web UI, create two SOCKS5 listeners (everything apart from URI setup is free to be configured): 
-  - **Listener 1**: For the agent on VM1 (e.g., port 8443)
-  - **Listener 2**: For the agent on VM2 (e.g., port 8444)
-
-#### 2. **Deploy and Configure Agents**
-
-- **On VM1:**
-  - Build an agent payload in the web UI, enabling SOCKS5 configuration.
-  - Set the SOCKS5 proxy host/port to point to the MicroC2 server and Listener 1.
-  - Deploy and run the agent on VM1.
-  - Start the SOCKS5 pivot on VM1:
-    ```sh
-    pivot_start 1080
-    ```
-  - (Optional) Start SSH if needed for port forwarding on c2 server and pivot server:
-    ```sh
-    sudo systemctl start ssh
-    ```
-  - and connect on the agent side with
-    ```sh
-    ssh -N -D SOCKS5_PROXY_PORT ServerUsername@ServerIP
-    ```
-
-- **On VM2:**
-  - Build a second agent payload, configuring it to use VM1 as its SOCKS5 proxy (host: 127.0.0.1, port: 1080).
-  - Deploy and run the agent on VM2.
-  - Start the SOCKS5 pivot on VM2:
-    ```sh
-    pivot_start 1081
-    ```
-  - SSH from VM2 to VM1 if needed:
-    ```sh
-    ssh -N -D VM1_PROXY_PORT Vm1Username@IPofVm1
-    ```
-
----
+The payload builder can configure the agent's HTTP client to use an existing
+SOCKS5 proxy. This is outbound proxy configuration only. MicroC2 does not yet
+provide a supported SOCKS5 listener or multi-hop pivot workflow; the remaining
+pivot modules are prototype code tracked on the roadmap.
 
 ## 📄 License and Academic Use
 

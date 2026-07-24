@@ -13,6 +13,7 @@ import (
 
 	"microc2/server/internal/audit"
 	"microc2/server/internal/enrollment"
+	"microc2/server/internal/listeners"
 	"microc2/server/internal/persistence"
 )
 
@@ -262,6 +263,217 @@ func TestAgentSessionManagementRoutesRejectAmbiguousRequests(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCreateListenerRejectsNonAuthoritativeJSON(t *testing.T) {
+	handler := newListenerHandlerForTest(t)
+
+	for _, test := range []struct {
+		name       string
+		body       string
+		wantStatus int
+		wantError  string
+	}{
+		{
+			name: "unknown field",
+			body: `{
+				"name":"unknown-field",
+				"protocol":"http",
+				"host":"127.0.0.1",
+				"port":12345,
+				"host_header":"ignored.example"
+			}`,
+			wantStatus: http.StatusBadRequest,
+			wantError:  "unknown field",
+		},
+		{
+			name: "trailing JSON value",
+			body: `{
+				"name":"trailing-value",
+				"protocol":"http",
+				"host":"127.0.0.1",
+				"port":12345
+			} {}`,
+			wantStatus: http.StatusBadRequest,
+			wantError:  "exactly one JSON value",
+		},
+		{
+			name:       "oversized body",
+			body:       `{"padding":"` + strings.Repeat("a", maxListenerCreateRequestBytes) + `"}`,
+			wantStatus: http.StatusRequestEntityTooLarge,
+			wantError:  "request body too large",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"/api/listeners/create",
+				strings.NewReader(test.body),
+			)
+			response := httptest.NewRecorder()
+
+			handler.HandleCreateListener(response, request)
+
+			if response.Code != test.wantStatus {
+				t.Fatalf(
+					"status = %d, want %d; body=%q",
+					response.Code,
+					test.wantStatus,
+					response.Body.String(),
+				)
+			}
+			if !strings.Contains(response.Body.String(), test.wantError) {
+				t.Fatalf(
+					"response body = %q, want %q",
+					response.Body.String(),
+					test.wantError,
+				)
+			}
+		})
+	}
+}
+
+func TestCreateListenerRejectsInactiveSettingsBeforeSideEffects(t *testing.T) {
+	manager, err := listeners.NewListenerManagerWithPersistenceForIsolatedLab(
+		nil,
+		filepath.Join(t.TempDir(), "listeners"),
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("create listener manager: %v", err)
+	}
+	handler := NewListenerHandlers(manager)
+
+	for _, test := range []struct {
+		name      string
+		bindHost  string
+		extraJSON string
+		wantError string
+	}{
+		{
+			name:      "caller supplied id",
+			extraJSON: `,"id":"caller-selected"`,
+			wantError: "id is server-generated",
+		},
+		{
+			name:      "multiple advertised hosts",
+			extraJSON: `,"hosts":["one.example","two.example"]`,
+			wantError: "supports one advertised host",
+		},
+		{
+			name:      "invalid advertised host",
+			extraJSON: `,"hosts":["https://c2.example"]`,
+			wantError: "invalid listener advertised host",
+		},
+		{
+			name:      "unspecified endpoint without advertised host",
+			bindHost:  "0.0.0.0",
+			wantError: "hosts[0] is required",
+		},
+		{
+			name:      "invalid bind host",
+			bindHost:  "https://127.0.0.1",
+			extraJSON: `,"hosts":["c2.example"]`,
+			wantError: "invalid listener bind host",
+		},
+		{
+			name:      "bind host surrounding whitespace",
+			bindHost:  " 127.0.0.1",
+			extraJSON: `,"hosts":["c2.example"]`,
+			wantError: "surrounding whitespace",
+		},
+		{
+			name:      "host rotation",
+			extraJSON: `,"host_rotation":"round-robin"`,
+			wantError: "host_rotation is not implemented",
+		},
+		{
+			name:      "custom URI",
+			extraJSON: `,"uris":["/custom"]`,
+			wantError: "custom URIs are not implemented",
+		},
+		{
+			name:      "custom header",
+			extraJSON: `,"headers":{"X-Test":"value"}`,
+			wantError: "custom headers are not implemented",
+		},
+		{
+			name:      "user agent",
+			extraJSON: `,"user_agent":"custom-agent"`,
+			wantError: "user_agent is not implemented",
+		},
+		{
+			name:      "proxy",
+			extraJSON: `,"proxy":{"type":"http","host":"proxy.example","port":8080}`,
+			wantError: "proxy configuration is not implemented",
+		},
+		{
+			name:      "SOCKS5 listener config",
+			extraJSON: `,"socks5_config":{}`,
+			wantError: "SOCKS5 configuration is not implemented",
+		},
+		{
+			name:      "DNS protocol",
+			extraJSON: "",
+			wantError: "DNS over HTTPS listener protocol is not implemented",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			protocol := "http"
+			if test.name == "DNS protocol" {
+				protocol = "dns"
+			}
+			bindHost := test.bindHost
+			if bindHost == "" {
+				bindHost = "127.0.0.1"
+			}
+			body := `{
+				"name":"unsupported-setting",
+				"protocol":"` + protocol + `",
+				"host":"` + bindHost + `",
+				"port":12345` + test.extraJSON + `
+			}`
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"/api/listeners/create",
+				strings.NewReader(body),
+			)
+			response := httptest.NewRecorder()
+
+			handler.HandleCreateListener(response, request)
+
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf(
+					"status = %d, want 400; body=%q",
+					response.Code,
+					response.Body.String(),
+				)
+			}
+			if !strings.Contains(response.Body.String(), test.wantError) {
+				t.Fatalf(
+					"response body = %q, want %q",
+					response.Body.String(),
+					test.wantError,
+				)
+			}
+			if got := len(manager.ListListeners()); got != 0 {
+				t.Fatalf("rejected request registered %d listener(s)", got)
+			}
+		})
+	}
+}
+
+func newListenerHandlerForTest(t *testing.T) *ListenerHandlers {
+	t.Helper()
+	manager, err := listeners.NewListenerManagerWithPersistenceForIsolatedLab(
+		nil,
+		filepath.Join(t.TempDir(), "listeners"),
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("create listener manager: %v", err)
+	}
+	return NewListenerHandlers(manager)
 }
 
 func activateAPITestPayload(

@@ -2,7 +2,6 @@ package listeners
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -34,6 +33,7 @@ type ListenerManager struct {
 	auditStore       *audit.Store
 	transportPolicy  common.AgentTransportPolicy
 	requireAgentAuth bool
+	defaultTLSConfig *TLSConfig
 	now              func() time.Time
 	mu               sync.RWMutex
 }
@@ -57,6 +57,7 @@ func NewListenerManager(proto common.Protocol) *ListenerManager {
 		nil,
 		common.AgentTransportPolicy{},
 		true,
+		nil,
 		time.Now,
 	)
 	if err != nil {
@@ -67,6 +68,7 @@ func NewListenerManager(proto common.Protocol) *ListenerManager {
 			listenersDir:     filepath.Join("static", "listeners"),
 			transportPolicy:  common.AgentTransportPolicy{},
 			requireAgentAuth: true,
+			defaultTLSConfig: nil,
 			now:              time.Now,
 		}
 	}
@@ -82,6 +84,7 @@ func NewListenerManagerForIsolatedLab(proto common.Protocol) *ListenerManager {
 		nil,
 		common.IsolatedLabAgentTransportPolicy(),
 		false,
+		nil,
 		time.Now,
 	)
 	if err != nil {
@@ -92,6 +95,7 @@ func NewListenerManagerForIsolatedLab(proto common.Protocol) *ListenerManager {
 			listenersDir:     filepath.Join("static", "listeners"),
 			transportPolicy:  common.IsolatedLabAgentTransportPolicy(),
 			requireAgentAuth: false,
+			defaultTLSConfig: nil,
 			now:              time.Now,
 		}
 	}
@@ -112,6 +116,7 @@ func NewListenerManagerWithPersistence(
 		database,
 		common.AgentTransportPolicy{},
 		true,
+		nil,
 		time.Now,
 	)
 }
@@ -129,6 +134,7 @@ func NewListenerManagerWithPersistenceForIsolatedLab(
 		database,
 		common.IsolatedLabAgentTransportPolicy(),
 		false,
+		nil,
 		time.Now,
 	)
 }
@@ -147,6 +153,30 @@ func NewProductionListenerManager(
 		database,
 		transportPolicy,
 		true,
+		nil,
+		time.Now,
+	)
+}
+
+// NewProductionListenerManagerWithTLSDefaults constructs a production
+// listener manager whose HTTPS listeners inherit the operator server
+// certificate and key when they do not provide an explicit per-listener
+// override. The defaults are process configuration, not listener persistence,
+// so a server configuration change takes effect when listeners are reloaded.
+func NewProductionListenerManagerWithTLSDefaults(
+	proto common.Protocol,
+	listenersDir string,
+	database *persistence.Database,
+	transportPolicy common.AgentTransportPolicy,
+	defaultTLSConfig TLSConfig,
+) (*ListenerManager, error) {
+	return newListenerManager(
+		proto,
+		listenersDir,
+		database,
+		transportPolicy,
+		true,
+		&defaultTLSConfig,
 		time.Now,
 	)
 }
@@ -157,6 +187,7 @@ func newListenerManager(
 	database *persistence.Database,
 	transportPolicy common.AgentTransportPolicy,
 	requireAgentAuth bool,
+	defaultTLSConfig *TLSConfig,
 	now func() time.Time,
 ) (*ListenerManager, error) {
 	if listenersDir == "" {
@@ -181,6 +212,7 @@ func newListenerManager(
 		auditStore:       auditStore,
 		transportPolicy:  transportPolicy,
 		requireAgentAuth: requireAgentAuth,
+		defaultTLSConfig: cloneTLSConfig(defaultTLSConfig),
 		now:              now,
 	}
 
@@ -210,6 +242,7 @@ func newListenerManager(
 			database,
 			manager.transportPolicy,
 			manager.requireAgentAuth,
+			manager.defaultTLSConfig,
 			false,
 		)
 		if err != nil {
@@ -262,8 +295,15 @@ func newListenerManager(
 			continue
 		}
 
-		var config ListenerConfig
-		if err := json.Unmarshal(configData, &config); err != nil {
+		config, err := decodeListenerConfigProjection(configData)
+		if err != nil {
+			if database != nil {
+				return nil, fmt.Errorf(
+					"saved listener config in %s is invalid: %w",
+					configPath,
+					err,
+				)
+			}
 			log.Printf("[WARNING] Failed to parse config for listener %s: %v", entry.Name(), err)
 			continue
 		}
@@ -279,11 +319,18 @@ func newListenerManager(
 			log.Printf("[WARNING] Saved listener %s has an unsafe identity; skipping", entry.Name())
 			continue
 		}
-		if err := manager.validateListenerConfig(config); err != nil {
+		if err := manager.validateListenerConfig(&config); err != nil {
 			if errors.Is(err, common.ErrInsecureHTTPAgentTransport) ||
 				errors.Is(err, common.ErrClientCertificateValidationUnavailable) {
 				return nil, fmt.Errorf(
 					"saved listener %s violates agent transport policy: %w",
+					config.ID,
+					err,
+				)
+			}
+			if database != nil && IsListenerConfigValidationError(err) {
+				return nil, fmt.Errorf(
+					"saved listener %s has unsupported configuration: %w",
 					config.ID,
 					err,
 				)
@@ -325,6 +372,7 @@ func newListenerManager(
 			database,
 			manager.transportPolicy,
 			manager.requireAgentAuth,
+			manager.defaultTLSConfig,
 			false,
 		)
 		if err != nil {
@@ -392,12 +440,17 @@ func (m *ListenerManager) CreateListenerWithContext(
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if config.ID != "" {
+		return nil, invalidListenerConfig(errors.New(
+			"listener id is server-generated and must be omitted",
+		))
+	}
 	config.ID = uuid.New().String()
 	if config.BindHost == "" {
 		config.BindHost = "0.0.0.0"
 	}
 	config.Protocol = strings.ToLower(config.Protocol)
-	if err := m.validateListenerConfig(config); err != nil {
+	if err := m.validateListenerConfig(&config); err != nil {
 		return nil, err
 	}
 	if m.hasNameConflict(config) {
@@ -413,6 +466,7 @@ func (m *ListenerManager) CreateListenerWithContext(
 		m.database,
 		m.transportPolicy,
 		m.requireAgentAuth,
+		m.defaultTLSConfig,
 		m.database == nil,
 	)
 	if err != nil {
@@ -530,7 +584,7 @@ func (m *ListenerManager) AddListener(listener *Listener) error {
 		)
 	}
 	config := listener.Config
-	if err := m.validateListenerConfig(config); err != nil {
+	if err := m.validateListenerConfig(&config); err != nil {
 		return err
 	}
 	if _, exists := m.listeners[config.ID]; exists {
@@ -549,6 +603,9 @@ func (m *ListenerManager) AddListener(listener *Listener) error {
 
 	listener.transportPolicy = m.transportPolicy
 	listener.requireAgentAuth = m.requireAgentAuth
+	listener.defaultTLSConfig = cloneTLSConfig(m.defaultTLSConfig)
+	listener.staticRoot = filepath.Dir(m.listenersDir)
+	listener.Config = config
 	m.listeners[config.ID] = listener
 	return nil
 }
@@ -927,45 +984,58 @@ func (m *ListenerManager) DeleteAll() []error {
 //
 // Post-conditions:
 //   - Returns error if the configuration is invalid
-func (m *ListenerManager) validateListenerConfig(config ListenerConfig) error {
-	if err := validateListenerIdentity(config); err != nil {
-		log.Printf("[ERROR] Listener identity validation failed")
+func (m *ListenerManager) validateListenerConfig(config *ListenerConfig) error {
+	if config == nil {
+		return invalidListenerConfig(errors.New(
+			"listener configuration is required",
+		))
+	}
+	if err := normalizeAndValidateSupportedListenerSettings(config); err != nil {
 		return err
+	}
+	if err := validateListenerIdentity(*config); err != nil {
+		log.Printf("[ERROR] Listener identity validation failed")
+		return invalidListenerConfig(err)
 	}
 
 	if config.Protocol == "" {
 		log.Printf("[ERROR] Listener validation failed: protocol is required")
-		return fmt.Errorf("protocol is required")
+		return invalidListenerConfig(errors.New("protocol is required"))
 	}
 	protocol := strings.ToLower(config.Protocol)
+	config.Protocol = protocol
 	switch protocol {
 	case "http", "https":
 	case "dns", "dnsoverhttps":
-		return fmt.Errorf("DNSoverHTTPS protocol is not implemented yet")
+		return invalidListenerConfig(errors.New(
+			"DNS over HTTPS listener protocol is not implemented",
+		))
 	default:
-		return fmt.Errorf("unsupported protocol: %s", config.Protocol)
-	}
-	if err := validateListenerTLSProtocol(protocol, config.TLSConfig); err != nil {
-		return err
+		return invalidListenerConfig(fmt.Errorf(
+			"unsupported protocol: %s",
+			config.Protocol,
+		))
 	}
 	if err := m.transportPolicy.ValidateListener(
 		protocol,
 		config.TLSConfig != nil && config.TLSConfig.RequireClientCert,
 	); err != nil {
-		return err
+		return invalidListenerConfig(err)
 	}
-
+	if err := validateListenerTLSProtocol(
+		protocol,
+		config.TLSConfig,
+		m.defaultTLSConfig,
+		filepath.Dir(m.listenersDir),
+	); err != nil {
+		return invalidListenerConfig(err)
+	}
 	if config.Port < 1 || config.Port > 65535 {
 		log.Printf("[ERROR] Listener validation failed: invalid port number %d", config.Port)
-		return fmt.Errorf("invalid port number: %d", config.Port)
-	}
-
-	// Validate TLS configuration if provided
-	if config.TLSConfig != nil {
-		if config.TLSConfig.CertFile == "" || config.TLSConfig.KeyFile == "" {
-			log.Printf("[ERROR] Listener validation failed: both certificate and key files are required for TLS")
-			return fmt.Errorf("both certificate and key files are required for TLS")
-		}
+		return invalidListenerConfig(fmt.Errorf(
+			"invalid port number: %d",
+			config.Port,
+		))
 	}
 
 	log.Print("[INFO] Listener configuration validated successfully")
@@ -1038,8 +1108,8 @@ func (m *ListenerManager) LoadSavedListener(configPath string) (*Listener, error
 		return nil, fmt.Errorf("failed to read config file: %v", err)
 	}
 
-	var config ListenerConfig
-	if err := json.Unmarshal(configData, &config); err != nil {
+	config, err := decodeListenerConfigProjection(configData)
+	if err != nil {
 		return nil, fmt.Errorf("failed to parse config: %v", err)
 	}
 
@@ -1050,6 +1120,7 @@ func (m *ListenerManager) LoadSavedListener(configPath string) (*Listener, error
 		m.database,
 		m.transportPolicy,
 		m.requireAgentAuth,
+		m.defaultTLSConfig,
 		false,
 	)
 	if err != nil {

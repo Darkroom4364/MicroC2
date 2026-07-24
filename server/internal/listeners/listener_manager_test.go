@@ -112,7 +112,9 @@ func TestHTTPListenerRejectsTLSConfigurationInIsolatedLab(t *testing.T) {
 	}
 
 	manager := NewListenerManagerForIsolatedLab(nil)
-	if _, err := manager.CreateListener(config); err == nil ||
+	managerConfig := config
+	managerConfig.ID = ""
+	if _, err := manager.CreateListener(managerConfig); err == nil ||
 		!strings.Contains(err.Error(), `requires protocol "https"`) {
 		t.Fatalf(
 			"manager HTTP/TLS mismatch error = %v, want protocol rejection",
@@ -172,6 +174,286 @@ func TestProductionTransportPolicyAcceptsHTTPSWithTLS12Minimum(t *testing.T) {
 	}
 	if err := manager.DeleteListener(listener.Config.ID); err != nil {
 		t.Fatalf("delete HTTPS listener: %v", err)
+	}
+}
+
+func TestProductionHTTPSListenerUsesConfiguredTLSDefaults(t *testing.T) {
+	database := openListenerManagerTestDatabase(t)
+	certFile, keyFile := writeTestTLSCertificate(t)
+	manager, err := NewProductionListenerManagerWithTLSDefaults(
+		nil,
+		filepath.Join(t.TempDir(), "static", "listeners"),
+		database,
+		common.AgentTransportPolicy{},
+		TLSConfig{CertFile: certFile, KeyFile: keyFile},
+	)
+	if err != nil {
+		t.Fatalf("create production listener manager: %v", err)
+	}
+
+	listener, err := manager.CreateListener(ListenerConfig{
+		Name:     "default-server-tls",
+		Protocol: "https",
+		BindHost: "127.0.0.1",
+		Port:     freeTCPPort(t),
+		Hosts:    []string{"C2.Example.Test."},
+	})
+	if err != nil {
+		t.Fatalf("create HTTPS listener with server TLS defaults: %v", err)
+	}
+	if listener.Config.TLSConfig != nil {
+		t.Fatalf(
+			"server TLS defaults leaked into listener persistence: %#v",
+			listener.Config.TLSConfig,
+		)
+	}
+	if len(listener.Config.Hosts) != 1 ||
+		listener.Config.Hosts[0] != "c2.example.test" {
+		t.Fatalf("advertised host was not normalized: %#v", listener.Config.Hosts)
+	}
+	gotCert, gotKey, err := listener.tlsCertFiles()
+	if err != nil {
+		t.Fatalf("resolve inherited listener TLS files: %v", err)
+	}
+	if gotCert != certFile || gotKey != keyFile {
+		t.Fatalf(
+			"inherited TLS files = (%q, %q), want (%q, %q)",
+			gotCert,
+			gotKey,
+			certFile,
+			keyFile,
+		)
+	}
+	if err := manager.DeleteListener(listener.Config.ID); err != nil {
+		t.Fatalf("delete HTTPS listener: %v", err)
+	}
+}
+
+func TestExplicitHTTPSListenerTLSOverridesConfiguredDefaults(t *testing.T) {
+	database := openListenerManagerTestDatabase(t)
+	certFile, keyFile := writeTestTLSCertificate(t)
+	manager, err := NewProductionListenerManagerWithTLSDefaults(
+		nil,
+		filepath.Join(t.TempDir(), "static", "listeners"),
+		database,
+		common.AgentTransportPolicy{},
+		TLSConfig{
+			CertFile: filepath.Join(t.TempDir(), "missing-default.crt"),
+			KeyFile:  filepath.Join(t.TempDir(), "missing-default.key"),
+		},
+	)
+	if err != nil {
+		t.Fatalf("create production listener manager: %v", err)
+	}
+
+	listener, err := manager.CreateListener(ListenerConfig{
+		Name:     "explicit-listener-tls",
+		Protocol: "https",
+		BindHost: "127.0.0.1",
+		Port:     freeTCPPort(t),
+		TLSConfig: &TLSConfig{
+			CertFile: certFile,
+			KeyFile:  keyFile,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create HTTPS listener with explicit TLS override: %v", err)
+	}
+	gotCert, gotKey, err := listener.tlsCertFiles()
+	if err != nil {
+		t.Fatalf("resolve explicit listener TLS files: %v", err)
+	}
+	if gotCert != certFile || gotKey != keyFile {
+		t.Fatalf(
+			"explicit TLS files = (%q, %q), want (%q, %q)",
+			gotCert,
+			gotKey,
+			certFile,
+			keyFile,
+		)
+	}
+	if err := manager.DeleteListener(listener.Config.ID); err != nil {
+		t.Fatalf("delete HTTPS listener: %v", err)
+	}
+}
+
+func TestListenerAdvertisedHostValidationAndNormalization(t *testing.T) {
+	t.Run("unspecified bind requires advertised host", func(t *testing.T) {
+		root := t.TempDir()
+		manager, err := NewListenerManagerWithPersistenceForIsolatedLab(
+			nil,
+			filepath.Join(root, "static", "listeners"),
+			nil,
+		)
+		if err != nil {
+			t.Fatalf("create listener manager: %v", err)
+		}
+		_, err = manager.CreateListener(ListenerConfig{
+			Name:     "missing-advertised-host",
+			Protocol: "http",
+			BindHost: "0.0.0.0",
+			Port:     freeTCPPort(t),
+		})
+		if err == nil || !strings.Contains(err.Error(), "hosts[0] is required") {
+			t.Fatalf("unspecified bind host error = %v", err)
+		}
+		if len(manager.ListListeners()) != 0 {
+			t.Fatal("missing advertised host registered a listener")
+		}
+	})
+
+	invalidHosts := []string{
+		"",
+		"0.0.0.0",
+		"::",
+		"https://c2.example",
+		"c2.example:443",
+		"c2.example/agent",
+		"operator@c2.example",
+		`c2.example"`,
+		"c2.example\ninjected",
+	}
+	for index, host := range invalidHosts {
+		t.Run(fmt.Sprintf("invalid-%d", index), func(t *testing.T) {
+			root := t.TempDir()
+			manager, err := NewListenerManagerWithPersistenceForIsolatedLab(
+				nil,
+				filepath.Join(root, "static", "listeners"),
+				nil,
+			)
+			if err != nil {
+				t.Fatalf("create listener manager: %v", err)
+			}
+			_, err = manager.CreateListener(ListenerConfig{
+				Name:     "invalid-advertised-host",
+				Protocol: "http",
+				BindHost: "127.0.0.1",
+				Port:     freeTCPPort(t),
+				Hosts:    []string{host},
+			})
+			if err == nil ||
+				!strings.Contains(err.Error(), "invalid listener advertised host") {
+				t.Fatalf("advertised host %q error = %v", host, err)
+			}
+			if len(manager.ListListeners()) != 0 {
+				t.Fatal("invalid advertised host registered a listener")
+			}
+			if _, statErr := os.Stat(filepath.Join(
+				root,
+				"static",
+				"listeners",
+				"invalid-advertised-host",
+			)); !os.IsNotExist(statErr) {
+				t.Fatalf(
+					"invalid advertised host created listener state: %v",
+					statErr,
+				)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		input string
+		want  string
+	}{
+		{input: "C2.Example.Test.", want: "c2.example.test"},
+		{input: "192.0.2.10", want: "192.0.2.10"},
+		{input: "[2001:0db8::1]", want: "2001:db8::1"},
+	} {
+		t.Run("valid-"+test.want, func(t *testing.T) {
+			manager, err := NewListenerManagerWithPersistenceForIsolatedLab(
+				nil,
+				filepath.Join(t.TempDir(), "static", "listeners"),
+				nil,
+			)
+			if err != nil {
+				t.Fatalf("create listener manager: %v", err)
+			}
+			listener, err := manager.CreateListener(ListenerConfig{
+				Name:     "valid-advertised-host",
+				Protocol: "http",
+				BindHost: "127.0.0.1",
+				Port:     freeTCPPort(t),
+				Hosts:    []string{test.input},
+			})
+			if err != nil {
+				t.Fatalf("create listener for host %q: %v", test.input, err)
+			}
+			if len(listener.Config.Hosts) != 1 ||
+				listener.Config.Hosts[0] != test.want {
+				t.Fatalf(
+					"normalized advertised host = %#v, want %q",
+					listener.Config.Hosts,
+					test.want,
+				)
+			}
+			if err := manager.DeleteListener(listener.Config.ID); err != nil {
+				t.Fatalf("delete listener: %v", err)
+			}
+		})
+	}
+}
+
+func TestListenerBindHostValidationAndNormalization(t *testing.T) {
+	for _, value := range []string{
+		"https://127.0.0.1",
+		"127.0.0.1:8443",
+		"127.0.0.1/path",
+		"operator@localhost",
+		`localhost"`,
+		"localhost\ninjected",
+		" localhost",
+	} {
+		t.Run("reject-"+value, func(t *testing.T) {
+			root := t.TempDir()
+			manager, err := NewListenerManagerWithPersistenceForIsolatedLab(
+				nil,
+				filepath.Join(root, "static", "listeners"),
+				nil,
+			)
+			if err != nil {
+				t.Fatalf("create listener manager: %v", err)
+			}
+			_, err = manager.CreateListener(ListenerConfig{
+				Name:     "invalid-bind-host",
+				Protocol: "http",
+				BindHost: value,
+				Port:     freeTCPPort(t),
+				Hosts:    []string{"c2.example"},
+			})
+			if err == nil ||
+				!strings.Contains(err.Error(), "invalid listener bind host") {
+				t.Fatalf("bind host %q error = %v", value, err)
+			}
+			if len(manager.ListListeners()) != 0 {
+				t.Fatal("invalid bind host registered a listener")
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		input string
+		want  string
+	}{
+		{input: "LOCALHOST.", want: "localhost"},
+		{input: "0.0.0.0", want: "0.0.0.0"},
+		{input: "[::]", want: "::"},
+		{input: "[2001:0db8::1]", want: "2001:db8::1"},
+	} {
+		t.Run("normalize-"+test.input, func(t *testing.T) {
+			got, err := NormalizeBindHost(test.input)
+			if err != nil {
+				t.Fatalf("normalize bind host %q: %v", test.input, err)
+			}
+			if got != test.want {
+				t.Fatalf(
+					"normalized bind host %q = %q, want %q",
+					test.input,
+					got,
+					test.want,
+				)
+			}
+		})
 	}
 }
 

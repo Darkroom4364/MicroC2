@@ -1,12 +1,18 @@
 package config
 
 import (
+	"bytes"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+
+	"microc2/server/internal/common"
 
 	"gopkg.in/yaml.v3"
 )
@@ -24,87 +30,195 @@ func LoadConfig(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("error reading config file: %v", err)
 	}
 
-	// Parse the YAML
+	// Parse exactly one YAML document and reject unknown fields. Silently
+	// accepting misspelled or retired settings would make the file look
+	// authoritative while the runtime ignores it.
 	config := &Config{}
-	if err := yaml.Unmarshal(data, config); err != nil {
-		return nil, fmt.Errorf("error parsing config file: %v", err)
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(config); err != nil {
+		return nil, fmt.Errorf("error parsing config file: %w", err)
+	}
+	var trailingDocument any
+	if err := decoder.Decode(&trailingDocument); !errors.Is(err, io.EOF) {
+		if err != nil {
+			return nil, fmt.Errorf("error parsing config file: %w", err)
+		}
+		return nil, errors.New("error parsing config file: multiple YAML documents are not supported")
 	}
 
-	// Validate and set defaults
+	applyDefaults(config)
 	if err := validateConfig(config); err != nil {
-		return nil, fmt.Errorf("config validation error: %v", err)
+		return nil, fmt.Errorf("config validation error: %w", err)
+	}
+	if err := prepareDirectories(config); err != nil {
+		return nil, fmt.Errorf("config preparation error: %w", err)
 	}
 
 	return config, nil
 }
 
-func validateConfig(config *Config) error {
+func applyDefaults(config *Config) {
 	if config.Storage.Path == "" {
 		config.Storage.Path = "data/microc2.db"
 	}
 	if configuredPath := os.Getenv("MICROC2_STORAGE_PATH"); configuredPath != "" {
 		config.Storage.Path = configuredPath
 	}
+	if config.Server.Port == "" {
+		config.Server.Port = "8443"
+	}
+	if config.Logging.File == "" {
+		config.Logging.File = "server.log"
+	}
+	if config.Security.OperatorToken == "" {
+		config.Security.OperatorToken = os.Getenv("MICROC2_OPERATOR_TOKEN")
+	}
+}
+
+func validateConfig(config *Config) error {
+	if config == nil {
+		return errors.New("configuration is required")
+	}
 	if strings.TrimSpace(config.Server.StaticDir) == "" {
 		return fmt.Errorf("server static directory is required")
+	}
+	if strings.TrimSpace(config.Server.UploadDir) == "" {
+		return fmt.Errorf("server upload directory is required")
 	}
 	if strings.TrimSpace(config.Storage.Path) == "" {
 		return fmt.Errorf("storage path is required")
 	}
+	if strings.TrimSpace(config.Logging.File) == "" {
+		return fmt.Errorf("logging file is required")
+	}
+	if strings.TrimSpace(config.Server.TLS.CertFile) == "" ||
+		strings.TrimSpace(config.Server.TLS.KeyFile) == "" {
+		return fmt.Errorf("server TLS certificate and key files are required")
+	}
 
-	// Ensure required directories exist or can be created
-	dirs := []string{config.Server.UploadDir, config.Server.StaticDir}
-	for _, dir := range dirs {
-		if dir == "" {
-			continue
-		}
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return fmt.Errorf("failed to create directory %s: %v", dir, err)
-		}
-	}
-	storagePath, err := canonicalPathThroughExisting(config.Storage.Path)
+	operatorPort, err := validatePort("server.port", config.Server.Port)
 	if err != nil {
-		return fmt.Errorf("resolve storage path: %v", err)
+		return err
 	}
+	if config.Server.Redirect.Enabled {
+		redirectPort, err := validatePort(
+			"server.redirect.httpPort",
+			config.Server.Redirect.HTTPPort,
+		)
+		if err != nil {
+			return err
+		}
+		if redirectPort == operatorPort {
+			return fmt.Errorf(
+				"server.redirect.httpPort must differ from server.port",
+			)
+		}
+	} else if strings.TrimSpace(config.Server.Redirect.HTTPPort) != "" {
+		return fmt.Errorf(
+			"server.redirect.httpPort must be empty when redirects are disabled",
+		)
+	}
+	if err := validateOrigins(
+		"security.corsOrigins",
+		config.Security.CORSOrigins,
+	); err != nil {
+		return err
+	}
+	if err := validateOrigins(
+		"security.operatorAllowedOrigins",
+		config.Security.OperatorAllowedOrigins,
+	); err != nil {
+		return err
+	}
+
+	if _, err := tls.LoadX509KeyPair(
+		config.Server.TLS.CertFile,
+		config.Server.TLS.KeyFile,
+	); err != nil {
+		return fmt.Errorf("load server TLS certificate and key: %w", err)
+	}
+
 	staticPath, err := canonicalPathThroughExisting(config.Server.StaticDir)
 	if err != nil {
 		return fmt.Errorf("resolve static directory: %v", err)
 	}
-	withinStatic, err := pathWithinDirectory(staticPath, storagePath)
-	if err != nil {
-		return fmt.Errorf("compare storage and static paths: %v", err)
+	privatePaths := []struct {
+		name  string
+		value string
+	}{
+		{name: "storage path", value: config.Storage.Path},
+		{name: "server upload directory", value: config.Server.UploadDir},
+		{name: "logging file", value: config.Logging.File},
+		{name: "server TLS certificate", value: config.Server.TLS.CertFile},
+		{name: "server TLS private key", value: config.Server.TLS.KeyFile},
 	}
-	if withinStatic {
-		return fmt.Errorf("storage path must be outside the web-served static directory")
-	}
-
-	// Validate protocol selection
-	switch config.Communication.Protocol {
-	case "http", "socks5":
-		// Valid protocols
-	default:
-		return fmt.Errorf("unsupported protocol: %s", config.Communication.Protocol)
-	}
-
-	// Set defaults if not specified
-	if config.Server.Port == "" {
-		config.Server.Port = "8080"
-	}
-
-	if config.Communication.HTTPPolling.HeartbeatInterval == 0 {
-		config.Communication.HTTPPolling.HeartbeatInterval = 60
-	}
-
-	if config.Logging.Level == "" {
-		config.Logging.Level = "info"
-	}
-
-	// The operator token can also come from the environment so it does not
-	// have to be stored in the config file.
-	if config.Security.OperatorToken == "" {
-		config.Security.OperatorToken = os.Getenv("MICROC2_OPERATOR_TOKEN")
+	for _, privatePath := range privatePaths {
+		candidate, err := canonicalPathThroughExisting(privatePath.value)
+		if err != nil {
+			return fmt.Errorf("resolve %s: %w", privatePath.name, err)
+		}
+		withinStatic, err := pathWithinDirectory(staticPath, candidate)
+		if err != nil {
+			return fmt.Errorf(
+				"compare %s and static paths: %w",
+				privatePath.name,
+				err,
+			)
+		}
+		if withinStatic {
+			return fmt.Errorf(
+				"%s must be outside the web-served static directory",
+				privatePath.name,
+			)
+		}
 	}
 
+	return nil
+}
+
+func validatePort(field, value string) (int, error) {
+	if value == "" {
+		return 0, fmt.Errorf("%s is required", field)
+	}
+	if value != strings.TrimSpace(value) {
+		return 0, fmt.Errorf("%s must not contain surrounding whitespace", field)
+	}
+	port, err := strconv.Atoi(value)
+	if err != nil || port < 1 || port > 65535 {
+		return 0, fmt.Errorf("%s must be an integer between 1 and 65535", field)
+	}
+	return port, nil
+}
+
+func validateOrigins(field string, values []string) error {
+	for index, value := range values {
+		if value == "*" {
+			if len(values) != 1 {
+				return fmt.Errorf(
+					"%s[%d] wildcard must be the only configured origin",
+					field,
+					index,
+				)
+			}
+			continue
+		}
+		if err := common.ValidateHTTPOrigin(value); err != nil {
+			return fmt.Errorf("%s[%d] %w", field, index, err)
+		}
+	}
+	return nil
+}
+
+func prepareDirectories(config *Config) error {
+	for _, dir := range []string{
+		config.Server.UploadDir,
+		config.Server.StaticDir,
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("failed to create directory %s: %w", dir, err)
+		}
+	}
 	return nil
 }
 
@@ -186,6 +300,9 @@ func pathWithinDirectoryWithCaseFolding(
 	// when EvalSymlinks preserves a caller-provided case spelling.
 	directoryInfo, err := os.Stat(directory)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
 		return false, err
 	}
 	current := candidate

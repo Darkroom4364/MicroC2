@@ -170,15 +170,13 @@ where
 }
 
 pub fn determine_agent_mode(config: &crate::config::AgentConfig) -> AgentMode {
-    with_opsec_state_mut(|opsec_state| {
-        adjust_c2_failure_threshold(opsec_state, config);
-    });
-
-    let mut context = OpsecContext::default();
-    context.is_business_hours = check_business_hours();
-    context.user_idle_level = check_idle_level();
-    context.suspicious_window_detected = check_window_state();
-    context.c2_connection_unstable = check_c2_stability();
+    let mut context = OpsecContext {
+        is_business_hours: check_business_hours(),
+        user_idle_level: check_idle_level(),
+        suspicious_window_detected: check_window_state(),
+        c2_connection_unstable: check_c2_stability(),
+        ..OpsecContext::default()
+    };
 
     let current_score = with_opsec_state(|state| state.current_score);
 
@@ -699,7 +697,9 @@ fn adjust_dynamic_thresholds(
 ) {
     // Check if enough time has passed since last adjustment
     let adjustment_interval = config.c2_threshold_adjust_interval_secs;
-    if timestamp_elapsed_secs(opsec_state.last_c2_threshold_adjustment) < adjustment_interval {
+    if adjustment_interval == 0
+        || timestamp_elapsed_secs(opsec_state.last_c2_threshold_adjustment) < adjustment_interval
+    {
         return;
     }
 
@@ -776,6 +776,7 @@ fn adjust_dynamic_thresholds(
     let old_exit_full = opsec_state.dyn_exit_full;
     let old_enter_reduced = opsec_state.dyn_enter_reduced;
     let old_exit_reduced = opsec_state.dyn_exit_reduced;
+    let old_max_c2_failures = opsec_state.dynamic_max_c2_failures;
 
     // Apply adjustments with clamping
     opsec_state.dyn_enter_full = (opsec_state.dyn_enter_full + adjusted_change)
@@ -800,6 +801,11 @@ fn adjust_dynamic_thresholds(
         opsec_state.dyn_enter_reduced = opsec_state.dyn_enter_full - 10.0;
         opsec_state.dyn_exit_reduced = opsec_state.dyn_enter_reduced - HYSTERESIS_BUFFER;
     }
+    opsec_state.dynamic_max_c2_failures = adjusted_c2_failure_threshold(
+        opsec_state.dynamic_max_c2_failures,
+        opsec_state.consecutive_c2_failures,
+        config,
+    );
 
     // Update adjustment timestamp and history
     opsec_state.last_c2_threshold_adjustment = now_timestamp();
@@ -819,6 +825,12 @@ fn adjust_dynamic_thresholds(
         debug!(
             "[OPSEC DYNAMIC] Threshold adjustment #{}: No significant change (net: {:.1})",
             opsec_state.threshold_adjustment_history, adjusted_change
+        );
+    }
+    if opsec_state.dynamic_max_c2_failures != old_max_c2_failures {
+        info!(
+            "[OPSEC DYNAMIC] C2 failure threshold adjusted: {} -> {}",
+            old_max_c2_failures, opsec_state.dynamic_max_c2_failures
         );
     }
 }
@@ -893,50 +905,56 @@ fn calculate_correlation_bonus(context: &OpsecContext, opsec_state: &OpsecState)
     (multiplier, correlation_bonus)
 }
 
-// Add the missing C2 stability function:
 fn check_c2_stability() -> bool {
     with_opsec_state(|state| {
-        // Consider C2 unstable if we have consecutive failures
-        if state.consecutive_c2_failures > 0 {
+        if c2_failure_threshold_exceeded(state) {
             debug!(
-                "[OPSEC] C2 connection unstable: {} consecutive failures",
-                state.consecutive_c2_failures
+                "[OPSEC] C2 connection unstable: {} consecutive failures (threshold {})",
+                state.consecutive_c2_failures, state.dynamic_max_c2_failures
             );
             true
         } else {
-            debug!("[OPSEC] C2 connection stable");
+            debug!(
+                "[OPSEC] C2 connection below instability threshold: {}/{} failures",
+                state.consecutive_c2_failures, state.dynamic_max_c2_failures
+            );
             false
         }
     })
 }
 
-// Add the missing C2 threshold adjustment function:
-fn adjust_c2_failure_threshold(opsec_state: &mut OpsecState, config: &crate::config::AgentConfig) {
-    // Adjust the dynamic threshold based on current consecutive failures
+fn adjusted_c2_failure_threshold(
+    current_threshold: u32,
+    consecutive_failures: u32,
+    config: &crate::config::AgentConfig,
+) -> u32 {
     let base_threshold = config.base_max_consecutive_c2_failures;
-
-    if opsec_state.consecutive_c2_failures > 0 {
-        // We have failures - consider decreasing threshold (more sensitive)
-        let decrease_factor = config.c2_failure_threshold_decrease_factor;
-        let new_threshold = ((opsec_state.dynamic_max_c2_failures as f32) * decrease_factor) as u32;
-        opsec_state.dynamic_max_c2_failures = new_threshold.max(1); // At least 1
-        debug!(
-            "[OPSEC] C2 threshold decreased to {} due to failures",
-            opsec_state.dynamic_max_c2_failures
-        );
-    } else {
-        // No recent failures - consider increasing threshold (less sensitive)
-        let increase_factor = config.c2_failure_threshold_increase_factor;
-        let max_multiplier = config.c2_dynamic_threshold_max_multiplier;
-        let max_allowed = ((base_threshold as f32) * max_multiplier) as u32;
-
-        let new_threshold = ((opsec_state.dynamic_max_c2_failures as f32) * increase_factor) as u32;
-        opsec_state.dynamic_max_c2_failures = new_threshold.min(max_allowed);
-        debug!(
-            "[OPSEC] C2 threshold adjusted to {} (stable connection)",
-            opsec_state.dynamic_max_c2_failures
-        );
+    if base_threshold == 0 {
+        return 0;
     }
+    if consecutive_failures > 0 {
+        if config.c2_failure_threshold_decrease_factor == 0.0 {
+            return current_threshold.max(1);
+        }
+        ((current_threshold as f32 * config.c2_failure_threshold_decrease_factor).floor() as u32)
+            .max(1)
+    } else {
+        if config.c2_failure_threshold_increase_factor == 0.0
+            || config.c2_dynamic_threshold_max_multiplier == 0.0
+        {
+            return current_threshold.max(base_threshold);
+        }
+        let max_allowed =
+            (base_threshold as f32 * config.c2_dynamic_threshold_max_multiplier).ceil() as u32;
+        let proposed =
+            (current_threshold as f32 * config.c2_failure_threshold_increase_factor).ceil() as u32;
+        proposed.min(max_allowed).max(base_threshold)
+    }
+}
+
+fn c2_failure_threshold_exceeded(state: &OpsecState) -> bool {
+    state.dynamic_max_c2_failures > 0
+        && state.consecutive_c2_failures >= state.dynamic_max_c2_failures
 }
 
 /// Called when C2 communication fails
@@ -949,7 +967,7 @@ pub fn record_c2_failure() {
         );
 
         // Check if we've exceeded the dynamic threshold
-        if state.consecutive_c2_failures >= state.dynamic_max_c2_failures {
+        if c2_failure_threshold_exceeded(state) {
             warn!(
                 "[OPSEC] C2 failure threshold exceeded: {}/{}",
                 state.consecutive_c2_failures, state.dynamic_max_c2_failures
@@ -981,5 +999,56 @@ pub fn record_noisy_command() {
 
 /// Check if C2 failures have exceeded threshold
 pub fn c2_failures_exceeded() -> bool {
-    with_opsec_state(|state| state.consecutive_c2_failures >= state.dynamic_max_c2_failures)
+    with_opsec_state(c2_failure_threshold_exceeded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_c2_failure_controls_change_the_effective_threshold() {
+        let config = crate::config::AgentConfig {
+            base_max_consecutive_c2_failures: 5,
+            c2_failure_threshold_increase_factor: 1.1,
+            c2_failure_threshold_decrease_factor: 0.9,
+            c2_dynamic_threshold_max_multiplier: 2.0,
+            ..Default::default()
+        };
+
+        assert_eq!(adjusted_c2_failure_threshold(5, 0, &config), 6);
+        assert_eq!(adjusted_c2_failure_threshold(5, 1, &config), 4);
+        assert_eq!(adjusted_c2_failure_threshold(10, 0, &config), 10);
+
+        let disabled = crate::config::AgentConfig {
+            base_max_consecutive_c2_failures: 0,
+            ..config
+        };
+        assert_eq!(adjusted_c2_failure_threshold(5, 3, &disabled), 0);
+    }
+
+    #[test]
+    fn c2_instability_requires_the_effective_failure_threshold() {
+        let mut state = create_default_opsec_state(&crate::config::AgentConfig::default());
+        state.dynamic_max_c2_failures = 5;
+        state.consecutive_c2_failures = 4;
+        assert!(!c2_failure_threshold_exceeded(&state));
+        state.consecutive_c2_failures = 5;
+        assert!(c2_failure_threshold_exceeded(&state));
+    }
+
+    #[test]
+    fn zero_adjustment_interval_disables_dynamic_adjustment() {
+        let config = crate::config::AgentConfig {
+            c2_threshold_adjust_interval_secs: 0,
+            ..Default::default()
+        };
+        let mut state = create_default_opsec_state(&config);
+        state.last_c2_threshold_adjustment = 0;
+        let original = state;
+
+        adjust_dynamic_thresholds(&mut state, &OpsecContext::default(), &config);
+
+        assert_eq!(state, original);
+    }
 }

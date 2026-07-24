@@ -30,6 +30,11 @@ type ServerConfig struct {
 	Port         string
 	StaticDir    string
 	ProtocolType string
+	// TLSCertFile and TLSKeyFile are the authoritative server TLS paths.
+	// HTTPS agent listeners inherit them unless an explicit listener override
+	// is supplied.
+	TLSCertFile string
+	TLSKeyFile  string
 	// CORSOrigins configures the CORS allow list for agent polling routes.
 	CORSOrigins []string
 	// Database is the process-wide durable state database. Nil retains the
@@ -126,12 +131,17 @@ func newServerManager(
 
 	var listenerManager *listeners.ListenerManager
 	if requireAgentAuth {
-		listenerManager, err = listeners.NewProductionListenerManager(
-			protocol,
-			filepath.Join(config.StaticDir, "listeners"),
-			config.Database,
-			agentTransportPolicy,
-		)
+		listenerManager, err =
+			listeners.NewProductionListenerManagerWithTLSDefaults(
+				protocol,
+				filepath.Join(config.StaticDir, "listeners"),
+				config.Database,
+				agentTransportPolicy,
+				listeners.TLSConfig{
+					CertFile: config.TLSCertFile,
+					KeyFile:  config.TLSKeyFile,
+				},
+			)
 	} else {
 		listenerManager, err =
 			listeners.NewListenerManagerWithPersistenceForIsolatedLab(

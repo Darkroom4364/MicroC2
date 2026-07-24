@@ -541,13 +541,6 @@ func TestDurableListenersLoadWithoutConfigDirectoryAndRecoverGlobally(t *testing
 			Protocol: "http",
 			BindHost: "127.0.0.1",
 			Port:     41001,
-			Proxy: &ProxyConfig{
-				Type:     "http",
-				Host:     "proxy.internal",
-				Port:     8080,
-				Username: "operator",
-				Password: "database-only-secret",
-			},
 		},
 		{
 			ID:       "error-listener",
@@ -610,21 +603,6 @@ func TestDurableListenersLoadWithoutConfigDirectoryAndRecoverGlobally(t *testing
 		}
 	}
 
-	activeProjection := readProjectedConfigForTest(
-		t,
-		filepath.Join(listenersDir, configs[0].Name, "config.json"),
-	)
-	if activeProjection.Proxy == nil || activeProjection.Proxy.Password != "" {
-		t.Fatalf("proxy password leaked into compatibility projection: %#v", activeProjection.Proxy)
-	}
-	activeRuntime, err := manager.GetListener(configs[0].ID)
-	if err != nil {
-		t.Fatalf("get active listener runtime: %v", err)
-	}
-	if activeRuntime.Config.Proxy == nil ||
-		activeRuntime.Config.Proxy.Password != "database-only-secret" {
-		t.Fatalf("runtime did not retain authoritative database secret")
-	}
 	assertPrivateListenerProjectionModes(t, listenersDir, configs)
 
 	activeEvents, err := manager.ListListenerEvents(configs[0].ID)
@@ -731,25 +709,13 @@ func TestDurableListenerConfigOverridesStaleProjection(t *testing.T) {
 		Protocol: "http",
 		BindHost: "127.0.0.1",
 		Port:     41201,
-		Proxy: &ProxyConfig{
-			Type:     "http",
-			Host:     "proxy.internal",
-			Port:     8080,
-			Username: "operator",
-			Password: "durable-secret",
-		},
+		Hosts:    []string{"durable.example"},
 	}
 	insertDurableListenerForTest(t, database, authoritative, StatusStopped, "")
 
 	stale := authoritative
 	stale.Port = 49999
-	stale.Proxy = &ProxyConfig{
-		Type:     "http",
-		Host:     "stale.invalid",
-		Port:     8888,
-		Username: "stale",
-		Password: "stale-secret",
-	}
+	stale.Hosts = []string{"stale.invalid"}
 	writeProjectionForTest(t, listenersDir, stale)
 
 	manager, err := NewListenerManagerWithPersistenceForIsolatedLab(nil, listenersDir, database)
@@ -761,8 +727,8 @@ func TestDurableListenerConfigOverridesStaleProjection(t *testing.T) {
 		t.Fatalf("get authoritative listener: %v", err)
 	}
 	if listener.Config.Port != authoritative.Port ||
-		listener.Config.Proxy == nil ||
-		listener.Config.Proxy.Password != "durable-secret" {
+		len(listener.Config.Hosts) != 1 ||
+		listener.Config.Hosts[0] != "durable.example" {
 		t.Fatalf("runtime used stale projection: %#v", listener.Config)
 	}
 
@@ -771,9 +737,9 @@ func TestDurableListenerConfigOverridesStaleProjection(t *testing.T) {
 		filepath.Join(listenersDir, authoritative.Name, "config.json"),
 	)
 	if projected.Port != authoritative.Port ||
-		projected.Proxy == nil ||
-		projected.Proxy.Password != "" {
-		t.Fatalf("projection was not replaced with redacted durable state: %#v", projected)
+		len(projected.Hosts) != 1 ||
+		projected.Hosts[0] != "durable.example" {
+		t.Fatalf("projection was not replaced with durable state: %#v", projected)
 	}
 
 	var durableJSON []byte
@@ -788,14 +754,14 @@ func TestDurableListenerConfigOverridesStaleProjection(t *testing.T) {
 		t.Fatalf("decode authoritative durable config: %v", err)
 	}
 	if durable.Port != authoritative.Port ||
-		durable.Proxy == nil ||
-		durable.Proxy.Password != "durable-secret" {
+		len(durable.Hosts) != 1 ||
+		durable.Hosts[0] != "durable.example" {
 		t.Fatalf("durable config was overwritten by stale projection: %#v", durable)
 	}
 	assertPrivateListenerProjectionModes(t, listenersDir, []ListenerConfig{authoritative})
 }
 
-func TestDiskOnlyListenerIsImportedThenProjectionIsRedacted(t *testing.T) {
+func TestDiskOnlySupportedListenerIsImported(t *testing.T) {
 	root := t.TempDir()
 	listenersDir := filepath.Join(root, "static", "listeners")
 	database, err := persistence.Open(filepath.Join(root, "state", "microc2.db"))
@@ -810,13 +776,7 @@ func TestDiskOnlyListenerIsImportedThenProjectionIsRedacted(t *testing.T) {
 		Protocol: "http",
 		BindHost: "127.0.0.1",
 		Port:     41301,
-		Proxy: &ProxyConfig{
-			Type:     "http",
-			Host:     "proxy.internal",
-			Port:     8080,
-			Username: "operator",
-			Password: "imported-secret",
-		},
+		Hosts:    []string{"disk-only.example"},
 	}
 	writeProjectionForTest(t, listenersDir, config)
 
@@ -828,9 +788,9 @@ func TestDiskOnlyListenerIsImportedThenProjectionIsRedacted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get imported listener: %v", err)
 	}
-	if listener.Config.Proxy == nil ||
-		listener.Config.Proxy.Password != "imported-secret" {
-		t.Fatalf("imported runtime lost proxy password: %#v", listener.Config.Proxy)
+	if len(listener.Config.Hosts) != 1 ||
+		listener.Config.Hosts[0] != "disk-only.example" {
+		t.Fatalf("imported runtime lost advertised host: %#v", listener.Config)
 	}
 
 	var durableJSON []byte
@@ -844,15 +804,15 @@ func TestDiskOnlyListenerIsImportedThenProjectionIsRedacted(t *testing.T) {
 	if err := json.Unmarshal(durableJSON, &durable); err != nil {
 		t.Fatalf("decode imported durable config: %v", err)
 	}
-	if durable.Proxy == nil || durable.Proxy.Password != "imported-secret" {
-		t.Fatalf("durable import lost proxy password: %#v", durable.Proxy)
+	if len(durable.Hosts) != 1 || durable.Hosts[0] != "disk-only.example" {
+		t.Fatalf("durable import lost advertised host: %#v", durable)
 	}
 	projected := readProjectedConfigForTest(
 		t,
 		filepath.Join(listenersDir, config.Name, "config.json"),
 	)
-	if projected.Proxy == nil || projected.Proxy.Password != "" {
-		t.Fatalf("imported projection retained proxy password: %#v", projected.Proxy)
+	if len(projected.Hosts) != 1 || projected.Hosts[0] != "disk-only.example" {
+		t.Fatalf("imported projection lost advertised host: %#v", projected)
 	}
 	events, err := manager.ListListenerEvents(config.ID)
 	if err != nil {
@@ -860,6 +820,204 @@ func TestDiskOnlyListenerIsImportedThenProjectionIsRedacted(t *testing.T) {
 	}
 	assertListenerEventTypes(t, events, "imported")
 	assertPrivateListenerProjectionModes(t, listenersDir, []ListenerConfig{config})
+}
+
+func TestLegacyListenerProjectionStillRedactsProxyPasswords(t *testing.T) {
+	listenersDir := filepath.Join(t.TempDir(), "static", "listeners")
+	config := ListenerConfig{
+		ID:       "legacy-proxy-listener",
+		Name:     "legacy-proxy",
+		Protocol: "http",
+		BindHost: "127.0.0.1",
+		Port:     41302,
+		Proxy: &ProxyConfig{
+			Type:     "http",
+			Host:     "proxy.example",
+			Port:     8080,
+			Username: "operator",
+			Password: "legacy-secret",
+		},
+	}
+	if err := writeListenerConfigProjection(listenersDir, config, true); err != nil {
+		t.Fatalf("write redacted legacy projection: %v", err)
+	}
+	projected := readProjectedConfigForTest(
+		t,
+		filepath.Join(listenersDir, config.Name, "config.json"),
+	)
+	if projected.Proxy == nil ||
+		projected.Proxy.Username != config.Proxy.Username ||
+		projected.Proxy.Password != "" {
+		t.Fatalf(
+			"legacy proxy projection was not safely redacted: %#v",
+			projected.Proxy,
+		)
+	}
+}
+
+func TestDurableListenerWithUnsupportedSettingsFailsStartup(t *testing.T) {
+	root := t.TempDir()
+	listenersDir := filepath.Join(root, "static", "listeners")
+	database, err := persistence.Open(filepath.Join(root, "state", "microc2.db"))
+	if err != nil {
+		t.Fatalf("open persistence database: %v", err)
+	}
+	defer database.Close()
+
+	config := ListenerConfig{
+		ID:       "unsupported-proxy-listener",
+		Name:     "unsupported-proxy",
+		Protocol: "http",
+		BindHost: "127.0.0.1",
+		Port:     41303,
+		Proxy: &ProxyConfig{
+			Type: "http",
+			Host: "proxy.example",
+			Port: 8080,
+		},
+	}
+	insertDurableListenerForTest(t, database, config, StatusStopped, "")
+
+	_, err = NewListenerManagerWithPersistenceForIsolatedLab(
+		nil,
+		listenersDir,
+		database,
+	)
+	if err == nil || !strings.Contains(
+		err.Error(),
+		"listener proxy configuration is not implemented",
+	) {
+		t.Fatalf("unsupported durable listener error = %v", err)
+	}
+}
+
+func TestInvalidHTTPSKeyPairIsRejectedBeforePersistence(t *testing.T) {
+	root := t.TempDir()
+	listenersDir := filepath.Join(root, "static", "listeners")
+	database, err := persistence.Open(filepath.Join(root, "state", "microc2.db"))
+	if err != nil {
+		t.Fatalf("open persistence database: %v", err)
+	}
+	defer database.Close()
+	manager, err := NewListenerManagerWithPersistenceForIsolatedLab(
+		nil,
+		listenersDir,
+		database,
+	)
+	if err != nil {
+		t.Fatalf("create listener manager: %v", err)
+	}
+
+	certFile, _ := writeTestTLSCertificate(t)
+	invalidKeyFile := filepath.Join(t.TempDir(), "invalid.key")
+	if err := os.WriteFile(
+		invalidKeyFile,
+		[]byte("not a private key"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write invalid TLS key: %v", err)
+	}
+	_, err = manager.CreateListener(ListenerConfig{
+		Name:     "invalid-tls",
+		Protocol: "https",
+		BindHost: "127.0.0.1",
+		Port:     freeTCPPort(t),
+		TLSConfig: &TLSConfig{
+			CertFile: certFile,
+			KeyFile:  invalidKeyFile,
+		},
+	})
+	if err == nil ||
+		!strings.Contains(err.Error(), "certificate and key") {
+		t.Fatalf("invalid HTTPS key pair error = %v", err)
+	}
+	assertRejectedListenerHasNoDurableSideEffects(
+		t,
+		manager,
+		database,
+		filepath.Join(listenersDir, "invalid-tls"),
+	)
+}
+
+func TestHTTPSKeyMaterialInsideStaticRootIsRejectedBeforePersistence(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	listenersDir := filepath.Join(root, "static", "listeners")
+	database, err := persistence.Open(filepath.Join(root, "state", "microc2.db"))
+	if err != nil {
+		t.Fatalf("open persistence database: %v", err)
+	}
+	defer database.Close()
+	manager, err := NewListenerManagerWithPersistenceForIsolatedLab(
+		nil,
+		listenersDir,
+		database,
+	)
+	if err != nil {
+		t.Fatalf("create listener manager: %v", err)
+	}
+
+	sourceCert, sourceKey := writeTestTLSCertificate(t)
+	staticCert := filepath.Join(root, "static", "listener.crt")
+	staticKey := filepath.Join(root, "static", "listener.key")
+	for source, destination := range map[string]string{
+		sourceCert: staticCert,
+		sourceKey:  staticKey,
+	} {
+		data, err := os.ReadFile(source)
+		if err != nil {
+			t.Fatalf("read TLS test material: %v", err)
+		}
+		if err := os.WriteFile(destination, data, 0o600); err != nil {
+			t.Fatalf("write TLS test material under static root: %v", err)
+		}
+	}
+
+	_, err = manager.CreateListener(ListenerConfig{
+		Name:     "static-tls",
+		Protocol: "https",
+		BindHost: "127.0.0.1",
+		Port:     freeTCPPort(t),
+		TLSConfig: &TLSConfig{
+			CertFile: staticCert,
+			KeyFile:  staticKey,
+		},
+	})
+	if err == nil ||
+		!strings.Contains(err.Error(), "outside the static directory") {
+		t.Fatalf("static-root HTTPS material error = %v", err)
+	}
+	assertRejectedListenerHasNoDurableSideEffects(
+		t,
+		manager,
+		database,
+		filepath.Join(listenersDir, "static-tls"),
+	)
+}
+
+func assertRejectedListenerHasNoDurableSideEffects(
+	t *testing.T,
+	manager *ListenerManager,
+	database *persistence.Database,
+	listenerDir string,
+) {
+	t.Helper()
+	if len(manager.ListListeners()) != 0 {
+		t.Fatal("rejected listener was registered")
+	}
+	if _, err := os.Stat(listenerDir); !os.IsNotExist(err) {
+		t.Fatalf("rejected listener created a directory: %v", err)
+	}
+	var rowCount int
+	if err := database.SQL().QueryRow(
+		`SELECT COUNT(*) FROM listeners`,
+	).Scan(&rowCount); err != nil {
+		t.Fatalf("count durable listeners: %v", err)
+	}
+	if rowCount != 0 {
+		t.Fatalf("rejected listener persisted %d row(s)", rowCount)
+	}
 }
 
 func TestLegacySpacedListenerNameImportsAndRestarts(t *testing.T) {

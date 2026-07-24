@@ -90,22 +90,18 @@ check_existing_builds() {
     # Check agent build
     if [ -f "$AGENT_DIR/target/release/agent" ]; then
         if [ -x "$AGENT_DIR/target/release/agent" ]; then
-            print_success "Agent binary found and executable"
+            print_success "Agent compile-check artifact found"
             agent_built=true
         else
-            print_warning "Agent binary found but not executable"
+            print_warning "Agent compile-check artifact found but not executable"
         fi
     else
-        print_warning "Agent binary not found"
+        print_warning "Agent compile-check artifact not found"
     fi
     
     # Check cross-compilation targets
     if [ -d "$AGENT_DIR/target/x86_64-pc-windows-gnu" ]; then
         print_success "Windows x64 target directory found"
-    fi
-    
-    if [ -d "$AGENT_DIR/target/i686-pc-windows-gnu" ]; then
-        print_success "Windows x86 target directory found"
     fi
     
     return $((server_built && agent_built))
@@ -165,14 +161,7 @@ check_configuration() {
     
     if [ -f "$SERVER_DIR/config/settings.yaml" ]; then
         print_success "Server configuration found"
-        
-        # Check if config file contains required sections
-        if grep -q "server:" "$SERVER_DIR/config/settings.yaml" && \
-           grep -q "tls:" "$SERVER_DIR/config/settings.yaml"; then
-            print_success "Configuration appears valid"
-        else
-            print_warning "Configuration file exists but may be incomplete"
-        fi
+        print_status "The server validates the complete schema, ports, paths, and TLS files at startup"
     else
         print_warning "Server configuration not found"
     fi
@@ -183,7 +172,7 @@ check_rust_targets() {
     print_status "Checking Rust cross-compilation targets..."
     
     if command_exists rustup; then
-        local targets=("x86_64-pc-windows-gnu" "i686-pc-windows-gnu" "aarch64-unknown-linux-gnu" "x86_64-unknown-linux-musl")
+        local targets=("x86_64-pc-windows-gnu" "x86_64-unknown-linux-gnu")
         local installed_targets
         installed_targets=$(rustup target list --installed)
         
@@ -217,7 +206,7 @@ show_installation_summary() {
     echo
     print_status "Components:"
     [ -f "$SERVER_DIR/server" ] && print_success "✓ Server binary" || print_warning "✗ Server binary"
-    [ -f "$AGENT_DIR/target/release/agent" ] && print_success "✓ Agent binary" || print_warning "✗ Agent binary"
+    [ -f "$AGENT_DIR/target/release/agent" ] && print_success "✓ Agent compile-check artifact" || print_warning "✗ Agent compile-check artifact"
     
     # Infrastructure summary
     echo
@@ -431,7 +420,7 @@ setup_rust_targets() {
         return
     fi
     
-    local targets=("x86_64-pc-windows-gnu" "i686-pc-windows-gnu" "aarch64-unknown-linux-gnu" "x86_64-unknown-linux-musl")
+    local targets=("x86_64-pc-windows-gnu" "x86_64-unknown-linux-gnu")
     
     for target in "${targets[@]}"; do
         print_status "Adding Rust target: $target"
@@ -473,8 +462,10 @@ build_agent() {
     # Clean previous builds
     cargo clean
     
-    # Build release version
-    cargo build --release
+    # Compile the agent source. This artifact has no listener-bound enrollment
+    # configuration and is not a deployable payload; production payloads are
+    # generated through the server after a listener is selected.
+    cargo build --locked --release
     
     # Strip binary to reduce size
     if command_exists strip; then
@@ -482,7 +473,7 @@ build_agent() {
         print_success "Agent stripped for size optimization"
     fi
     
-    print_success "Agent built successfully"
+    print_success "Agent source compiled successfully (generate deployable payloads through the web UI)"
     cd "$SCRIPT_DIR"
 }
 
@@ -501,7 +492,8 @@ generate_certificates() {
             -keyout certs/server.key \
             -out certs/server.crt \
             -days 365 -nodes \
-            -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost"
+            -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
         
         print_success "TLS certificates generated"
     else
@@ -535,22 +527,33 @@ setup_configuration() {
     if [ ! -f "$SERVER_DIR/config/settings.yaml" ]; then
         cat > "$SERVER_DIR/config/settings.yaml" << EOF
 # MicroC2 Server Configuration
+storage:
+  path: "data/microc2.db"
+
 server:
-  host: "localhost"
-  port: 8080
-  protocol: "https"  # http or https
-  
-tls:
-  cert_file: "certs/server.crt"
-  key_file: "certs/server.key"
-  
-directories:
-  static: "static"
-  uploads: "uploads"
-  file_drop: "static/file_drop"
-  
+  port: 8443
+  uploadDir: "uploads"
+  staticDir: "static"
+  tls:
+    certFile: "certs/server.crt"
+    keyFile: "certs/server.key"
+  redirect:
+    enabled: true
+    httpPort: 8080
+
+security:
+  enableServerTerminal: false
+  agentTransport:
+    allowInsecureIsolatedLab: false
+  corsOrigins:
+    - "https://localhost:8443"
+    - "http://localhost:8080"
+  operatorToken: ""
+  operatorAllowedOrigins:
+    - "https://localhost:8443"
+    - "http://localhost:8080"
+
 logging:
-  level: "info"
   file: "server.log"
 EOF
         print_success "Default server configuration created"
@@ -597,16 +600,10 @@ show_final_instructions() {
     echo "   cd server && ./server"
     echo
     echo "2. Access the web interface:"
-    echo "   https://localhost:8080/home/"
+    echo "   https://localhost:8443/home/"
     echo
-    echo "3. Build additional agent variants:"
-    echo "   cd agent"
-    echo "   # For Windows 64-bit:"
-    echo "   cargo build --release --target x86_64-pc-windows-gnu"
-    echo "   # For Windows 32-bit:"
-    echo "   cargo build --release --target i686-pc-windows-gnu"
-    echo "   # For Linux ARM64:"
-    echo "   cargo build --release --target aarch64-unknown-linux-gnu"
+    echo "3. Create an HTTPS listener, then generate a configured payload in the web UI."
+    echo "   Supported payload profiles: Linux x64 ELF and Windows x64 EXE."
     echo
     echo "4. Configuration files:"
     echo "   - Server: server/config/settings.yaml"

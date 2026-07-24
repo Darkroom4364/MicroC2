@@ -706,6 +706,7 @@ func TestHTTPPollingProtocolCORSUsesConfiguredOrigins(t *testing.T) {
 		wantHeader string
 	}{
 		{"allowed origin is reflected", "https://operator.lab:8443", "https://operator.lab:8443"},
+		{"configured host with wrong scheme gets no CORS header", "http://operator.lab:8443", ""},
 		{"unconfigured loopback origin gets no CORS header", "http://localhost:8080", ""},
 		{"disallowed origin gets no CORS header", "https://evil.example", ""},
 		{"no origin header gets no CORS header", "", ""},

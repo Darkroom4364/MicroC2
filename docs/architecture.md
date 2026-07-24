@@ -45,14 +45,14 @@ multi-user authorization system.
 | `server/internal/tasks/` | Typed in-memory test store and listener-scoped durable task/result store. |
 | `server/internal/listeners/` | Listener lifecycle, configuration persistence, start/stop/delete logic. |
 | `server/internal/behaviour/` | HTTP polling protocol used by active agents. |
-| `server/internal/handlers/api/` | Operator APIs for agents, listeners, payloads, file drop, and SOCKS5 management. |
+| `server/internal/handlers/api/` | Operator APIs for agents, listeners, payloads, audit records, and file drop. |
 | `server/internal/handlers/web/` | Static UI serving. |
 | `server/internal/handlers/ws/` and `server/internal/websocket/` | Log streaming and server terminal WebSockets. |
 | `server/internal/filestore/` | Operator file-drop storage helper. |
 | `server/internal/protocols/` | SOCKS5 server/protocol experiments. |
 | `server/web/` | Static HTML, CSS, and JavaScript operator UI. |
-| `agent/src/main.rs` | Agent bootstrap, OPSEC-gated main loop, SOCKS5/pivot task setup. |
-| `agent/src/config.rs` and `agent/build.rs` | Build-time embedded config, fallback config loading, HTTP client setup. |
+| `agent/src/main.rs` | Agent bootstrap, OPSEC-gated main loop, and optional outbound SOCKS5 egress setup. |
+| `agent/src/config.rs` and `agent/build.rs` | Strict build-time embedded config and HTTP client setup. |
 | `agent/src/commands/` | HTTP polling, shell command execution, result submission, command obfuscation helpers. |
 | `agent/src/opsec.rs` | Adaptive OPSEC scoring and mode transitions. |
 | `agent/src/dormant.rs` and `agent/src/state.rs` | In-memory state protection helpers. |
@@ -63,12 +63,30 @@ multi-user authorization system.
 
 The server starts from `server/cmd/server.go`. Startup loads
 `server/config/settings.yaml`, opens the process-wide SQLite database and
-`server.log`, initializes the file store, creates a communication manager,
+the configured log file, initializes the file store, creates a communication manager,
 reconciles listeners and payload records, registers HTTP routes, and starts an
 HTTPS server using the configured certificate and key. When redirect support
 is enabled, a separate HTTP listener redirects to the configured HTTPS port.
-Current implementation note: `server.tls.enabled` exists in configuration, but
-the entry point always starts the main server with `ListenAndServeTLS`.
+
+The YAML file is strict: unknown fields, retired fields, trailing documents,
+invalid ports, unreadable TLS material, unsafe path overlap, and contradictory
+redirect settings fail before runtime directories are created or traffic is
+served. Its supported surface is:
+
+| Field | Runtime effect |
+| --- | --- |
+| `storage.path` | SQLite state path; `MICROC2_STORAGE_PATH` overrides it when set. |
+| `server.port` | Sole operator HTTPS port; defaults to `8443`. |
+| `server.uploadDir` | Operator file-drop root. |
+| `server.staticDir` | Static UI root and private listener/payload parent. |
+| `server.tls.certFile`, `server.tls.keyFile` | Mandatory operator TLS certificate and key, both outside `server.staticDir`; HTTPS agent listeners inherit them unless an explicit listener override is supplied. |
+| `server.redirect.enabled`, `server.redirect.httpPort` | Optional HTTP-to-HTTPS redirect; the HTTP port must be empty when disabled. |
+| `security.enableServerTerminal` | Explicitly enables the lab-only server shell. |
+| `security.agentTransport.allowInsecureIsolatedLab` | Permits plain HTTP agent listeners only for an isolated lab. |
+| `security.corsOrigins` | Agent-listener CORS allow list; empty disables cross-origin access. |
+| `security.operatorToken` | Shared remote-operator token; `MICROC2_OPERATOR_TOKEN` supplies it when YAML is empty. |
+| `security.operatorAllowedOrigins` | Origin allow list for remote operator HTTP/WebSocket access. |
+| `logging.file` | Server log path; defaults to `server.log`. |
 
 The operator server uses an explicit `http.ServeMux`. Unknown `/api/*` paths
 return `404`, so unsupported operator calls and accidental agent endpoint calls
@@ -79,7 +97,7 @@ are visible during development.
 | Surface | Served by | Route families |
 | --- | --- | --- |
 | Operator UI | operator web/API port | `/`, `/home/`, `/static/` |
-| Operator API | operator web/API port | `/api/agents/*`, `/api/listeners/*`, `/api/payload/*`, `/api/file_drop/*`, `/api/socks5/*` |
+| Operator API | operator web/API port | `/api/agents/*`, `/api/listeners/*`, `/api/payload/*`, `/api/file_drop/*` |
 | Operator WebSockets | operator web/API port | `/ws/logs`, `/ws/terminal` |
 | Agent listener API | listener ports | `/api/agent/{agent_id}/heartbeat`, `/tasks`, `/tasks/{task_id}/status`, `/results`, plus deprecated `/command` and `/result` adapters |
 
@@ -239,6 +257,16 @@ isolated-lab policy is enabled, and generated payloads always verify HTTPS
 servers through the system trust store. `requireClientCert` is rejected until
 CA-backed mTLS verification exists.
 
+The authoritative listener request surface is intentionally smaller than its
+legacy persistence struct. Name, HTTP(S) protocol, bind host, port, at most one
+validated advertised DNS name or IP, and an optional HTTPS certificate/key
+override are effective. Without an advertised host, the bind host must itself
+be a specific advertiseable address. HTTPS listeners otherwise inherit the
+operator server TLS pair. Caller-selected IDs, multiple hosts/host rotation,
+custom URIs/headers/user-agents, listener-side proxy or SOCKS5 configuration,
+and DNS-over-HTTPS are rejected before persistence or socket creation. Unknown
+and trailing JSON input is also rejected.
+
 ### Payload Builder
 
 The payload generator is a server-side wrapper around the Rust agent build
@@ -281,7 +309,8 @@ filesystem artifacts:
 - Operator uploads: configured server upload directory, default `uploads`.
 - Payload artifacts:
   `{server.staticDir}/payloads/{debug,release}/{payload_id}`.
-- Server logs: `server.log`, streamed to `/ws/logs`.
+- Server logs: configured by `logging.file`, default `server.log`, and streamed
+  to `/ws/logs`.
 
 The database must be outside the web-served static root. Embedded, checksummed
 migrations are applied transactionally and startup refuses a modified or future
@@ -292,13 +321,13 @@ restore, and upgrade guidance.
 
 ## Agent
 
-The Rust agent loads an embedded build-time config generated by `agent/build.rs`.
-If no valid embedded config exists, it falls back to `.config/config.json`
-beside the executable. Config includes the server URL, listener and payload IDs,
-the embedded bootstrap credential, protocol, sleep and jitter settings, SOCKS5
-settings, TLS verification behavior, user-agent, and OPSEC threshold
-parameters. Secret-aware debug formatting redacts the bootstrap. Sidecar
-configs deliberately contain an empty enrollment field.
+The Rust agent loads one embedded build-time config generated by
+`agent/build.rs`; it does not accept a runtime sidecar or command-line C2
+override. Config includes the server URL, listener and payload IDs, the embedded
+bootstrap credential, protocol, sleep and jitter settings, optional outbound
+SOCKS5 proxy settings, TLS verification behavior, user-agent, mutation-seed
+metadata, and OPSEC threshold parameters. Unknown or contradictory fields fail
+startup. Secret-aware debug formatting redacts the bootstrap.
 
 At runtime the agent:
 
@@ -306,7 +335,7 @@ At runtime the agent:
 2. Loads config and creates the HTTP client.
 3. Resolves its runtime ID and loads a matching tuple-bound session from the
    current user's platform state directory, if present.
-4. Starts SOCKS5/pivot background tasks when configured.
+4. Configures direct or outbound-SOCKS5-proxied HTTP transport.
 5. Enters an OPSEC assessment loop and, when allowed, sends an authenticated
    heartbeat with the stored session or embedded bootstrap.
 6. Persists a returned session credential atomically and uses it on all
@@ -350,11 +379,10 @@ currently implement window title checks.
 ### File Transfer And Pivot Modules
 
 File upload/download helpers exist under `agent/src/file_handling/`, and
-SOCKS5/pivot types exist under `agent/src/networking/`. The active task loop
-does not yet expose typed file transfer or pivot operations. `pivot_start` and
-`pivot_stop` helper functions exist but are not wired into the typed dispatch
-path. Issue #88 tracks extending the v1 foundation after #98, and #71 tracks
-SOCKS5/pivot maturity.
+SOCKS5/pivot types exist under `agent/src/networking/`. The active agent can use
+an existing SOCKS5 proxy for outbound HTTP(S), but does not expose a supported
+SOCKS5 listener or typed pivot operation. Issue #88 tracks extending the v1
+foundation after #98, and #71 tracks SOCKS5/pivot maturity.
 
 ## Static UI
 
