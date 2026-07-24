@@ -544,11 +544,12 @@ fn protect_session_credential(
             "DPAPI returned an empty protected credential",
         ));
     }
-    // SAFETY: successful DPAPI output is valid for output.cbData bytes until
-    // released with LocalFree.
-    // foxguard: ignore[rs/unsafe-block]
-    let protected =
-        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    let protected = {
+        // SAFETY: successful DPAPI output is valid for output.cbData bytes until
+        // released with LocalFree.
+        // foxguard: ignore[rs/unsafe-block]
+        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() }
+    };
     // SAFETY: DPAPI allocated output.pbData with LocalAlloc.
     // foxguard: ignore[rs/unsafe-block]
     unsafe {
@@ -725,6 +726,10 @@ fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
+    // SAFETY: source and destination are live, NUL-terminated UTF-16 buffers
+    // for this synchronous call; both paths are generated inside the private
+    // session-state directory and the return value is checked before success.
+    // foxguard: ignore[rs/unsafe-block]
     let result = unsafe {
         MoveFileExW(
             source.as_ptr(),

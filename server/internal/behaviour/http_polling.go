@@ -357,6 +357,9 @@ func (p *HTTPPollingProtocol) handleAgentHeartbeat(
 	}
 
 	if r.Method != http.MethodPost {
+		// net/http rejects methods that are not RFC tokens before dispatch, so
+		// r.Method cannot contain the control characters needed to forge a log.
+		// foxguard: ignore[go/taint-log-injection]
 		log.Printf("[ERROR] Invalid method %s for agent heartbeat", r.Method)
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -374,6 +377,9 @@ func (p *HTTPPollingProtocol) handleAgentHeartbeat(
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxAgentHeartbeatBodyBytes))
 	if err != nil {
+		// The server-owned request reader returns fixed net/http or I/O errors;
+		// request body bytes are never included in this error string.
+		// foxguard: ignore[go/taint-log-injection]
 		log.Printf("[ERROR] Failed to read bounded agent heartbeat body: %v", err)
 		var maxBytesError *http.MaxBytesError
 		if errors.As(err, &maxBytesError) {
@@ -438,6 +444,9 @@ func (p *HTTPPollingProtocol) handleAgentHeartbeat(
 	}
 
 	if err := p.recordAgentHeartbeat(agent); err != nil {
+		// recordAgentHeartbeat returns only fixed validation or persistence
+		// errors; decoded heartbeat field values are never formatted into err.
+		// foxguard: ignore[go/taint-log-injection]
 		log.Printf("[ERROR] Failed to record authenticated agent heartbeat: %v", err)
 		if errors.Is(err, errAgentHeartbeatPersistence) {
 			http.Error(w, "Failed to persist agent heartbeat", http.StatusInternalServerError)

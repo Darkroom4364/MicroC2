@@ -695,6 +695,9 @@ func (h *PayloadHandler) HandleRevokePayloadEnrollment(
 				http.StatusBadRequest,
 			)
 		default:
+			// parsePayloadEnrollmentRevokePath restricts payloadID to the
+			// log-safe identifier alphabet [A-Za-z0-9_.:-].
+			// foxguard: ignore[go/taint-log-injection]
 			log.Printf(
 				"[ERROR] Failed to revoke payload enrollment credential %s: %v",
 				payloadID,

@@ -256,6 +256,9 @@ func (s *Store) Enroll(ctx context.Context, request EnrollRequest) (Enrollment, 
 		buildListener      string
 		buildState         string
 	)
+	// The statement is static and PayloadBuildID is supplied separately as a
+	// SQLite parameter; no request-derived data is part of the SQL text.
+	// foxguard: ignore[go/taint-sql-injection]
 	err = tx.QueryRowContext(
 		ctx,
 		`SELECT
@@ -349,6 +352,9 @@ func (s *Store) Enroll(ctx context.Context, request EnrollRequest) (Enrollment, 
 	}
 
 	if found {
+		// The statement is static and every request-derived value is bound
+		// through SQLite parameters.
+		// foxguard: ignore[go/taint-sql-injection]
 		result, err := tx.ExecContext(
 			ctx,
 			`UPDATE agent_enrollment_sessions
@@ -379,6 +385,9 @@ func (s *Store) Enroll(ctx context.Context, request EnrollRequest) (Enrollment, 
 			return Enrollment{}, errors.New("agent enrollment session disappeared")
 		}
 	} else {
+		// The statement is static and every request-derived value is bound
+		// through SQLite parameters.
+		// foxguard: ignore[go/taint-sql-injection]
 		if _, err := tx.ExecContext(
 			ctx,
 			`INSERT INTO agent_enrollment_sessions (

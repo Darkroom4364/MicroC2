@@ -111,6 +111,11 @@ fn platform_state_root() -> io::Result<PathBuf> {
 }
 
 fn absolute_environment_path(name: &str) -> Option<PathBuf> {
+    // The selected variables are OS-defined per-user state roots
+    // (XDG_STATE_HOME/HOME/LOCALAPPDATA/USERPROFILE), not network input. We
+    // require an absolute root, append only constant or base64url components,
+    // and reject symlink state directories before use.
+    // foxguard: ignore[rs/no-path-traversal]
     let path = PathBuf::from(env::var_os(name)?);
     path.is_absolute().then_some(path)
 }
