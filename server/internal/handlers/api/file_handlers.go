@@ -11,7 +11,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"time"
 
 	"microc2/server/internal/audit"
 	"microc2/server/internal/common"
@@ -196,7 +195,7 @@ func (h *FileHandlers) HandleFileDownload(w http.ResponseWriter, r *http.Request
 		return
 	}
 	defer file.Close()
-	modified, err := time.Parse(time.RFC3339, info.Modified)
+	fileStat, err := file.Stat()
 	if err != nil {
 		http.Error(w, "File metadata is invalid", http.StatusInternalServerError)
 		return
@@ -219,7 +218,13 @@ func (h *FileHandlers) HandleFileDownload(w http.ResponseWriter, r *http.Request
 	w.Header().Set("Content-Disposition", disposition)
 	w.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))
 	trackedWriter := &fileDownloadResponseWriter{ResponseWriter: w}
-	http.ServeContent(trackedWriter, r, info.Name, modified, file)
+	http.ServeContent(
+		trackedWriter,
+		r,
+		info.Name,
+		fileStat.ModTime(),
+		file,
+	)
 
 	outcome := audit.OutcomeSucceeded
 	reasonCode := ""

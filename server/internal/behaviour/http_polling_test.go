@@ -826,6 +826,9 @@ func (s *contextCapturingTaskStore) CreateContext(
 	request tasks.CreateRequest,
 ) (tasks.Task, error) {
 	s.createActor, _ = audit.ActorFromContext(ctx)
+	// Store.Create inserts a typed task into this test's in-memory map; it
+	// never creates or opens a filesystem path.
+	// foxguard: ignore[go/taint-path-traversal]
 	return s.Store.Create(agentID, request)
 }
 
