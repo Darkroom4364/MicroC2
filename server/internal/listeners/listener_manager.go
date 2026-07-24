@@ -1,13 +1,17 @@
 package listeners
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+
+	"microc2/server/internal/audit"
 	"microc2/server/internal/behaviour"
 	"microc2/server/internal/common"
 	"microc2/server/internal/persistence"
+
 	"os"
 	"path/filepath"
 	"sort"
@@ -27,6 +31,7 @@ type ListenerManager struct {
 	protocol         common.Protocol
 	listenersDir     string
 	database         *persistence.Database
+	auditStore       *audit.Store
 	transportPolicy  common.AgentTransportPolicy
 	requireAgentAuth bool
 	now              func() time.Time
@@ -160,11 +165,20 @@ func newListenerManager(
 	if now == nil {
 		now = time.Now
 	}
+	var auditStore *audit.Store
+	if database != nil {
+		var err error
+		auditStore, err = audit.NewStore(database)
+		if err != nil {
+			return nil, fmt.Errorf("initialize listener audit store: %w", err)
+		}
+	}
 	manager := &ListenerManager{
 		listeners:        make(map[string]*Listener),
 		protocol:         proto,
 		listenersDir:     listenersDir,
 		database:         database,
+		auditStore:       auditStore,
 		transportPolicy:  transportPolicy,
 		requireAgentAuth: requireAgentAuth,
 		now:              now,
@@ -318,7 +332,10 @@ func newListenerManager(
 			continue
 		}
 		if database != nil {
-			if err := manager.recordListenerImported(config); err != nil {
+			if err := manager.recordListenerImported(
+				context.Background(),
+				config,
+			); err != nil {
 				return nil, fmt.Errorf("import listener %s: %w", config.ID, err)
 			}
 			if err := writeListenerConfigProjection(
@@ -357,6 +374,21 @@ func (m *ListenerManager) GetProtocol() common.Protocol {
 //   - A new listener is created, started, and added to the manager
 //   - Returns error if the configuration is invalid or the port is already in use
 func (m *ListenerManager) CreateListener(config ListenerConfig) (*Listener, error) {
+	return m.CreateListenerWithContext(
+		audit.WithActor(
+			context.Background(),
+			audit.DefaultOperatorActor(),
+		),
+		config,
+	)
+}
+
+// CreateListenerWithContext preserves the authenticated operator actor for
+// the listener creation and automatic-start audit records.
+func (m *ListenerManager) CreateListenerWithContext(
+	ctx context.Context,
+	config ListenerConfig,
+) (*Listener, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -387,7 +419,7 @@ func (m *ListenerManager) CreateListener(config ListenerConfig) (*Listener, erro
 		return nil, err
 	}
 	m.attachListenerCallbacks(listener)
-	if err := m.recordListenerCreated(config); err != nil {
+	if err := m.recordListenerCreated(ctx, config); err != nil {
 		m.cleanupListenerConfig(config.Name)
 		return nil, fmt.Errorf("persist listener creation: %w", err)
 	}
@@ -403,19 +435,28 @@ func (m *ListenerManager) CreateListener(config ListenerConfig) (*Listener, erro
 			true,
 		); err != nil {
 			return nil, m.failCreatedListener(
+				ctx,
 				listener,
 				fmt.Errorf("write listener compatibility projection: %w", err),
 			)
 		}
 	}
 	if err := listener.Start(); err != nil {
-		return nil, m.failCreatedListener(listener, err)
+		return nil, m.failCreatedListener(ctx, listener, err)
 	}
-	if err := m.recordListenerState(config.ID, StatusActive, "started", "", false); err != nil {
+	if err := m.recordListenerState(
+		ctx,
+		config.ID,
+		StatusActive,
+		"started",
+		"",
+		false,
+	); err != nil {
 		if stopErr := listener.Stop(); stopErr != nil {
 			log.Printf("[WARNING] Failed to stop listener after persistence error: %v", stopErr)
 		}
 		return nil, m.failCreatedListener(
+			ctx,
 			listener,
 			fmt.Errorf("persist listener start: %w", err),
 		)
@@ -430,6 +471,7 @@ func (m *ListenerManager) CreateListener(config ListenerConfig) (*Listener, erro
 //
 // The caller must hold m.mu.
 func (m *ListenerManager) failCreatedListener(
+	ctx context.Context,
 	listener *Listener,
 	cause error,
 ) error {
@@ -439,6 +481,7 @@ func (m *ListenerManager) failCreatedListener(
 
 	if m.database != nil {
 		if err := m.recordListenerState(
+			ctx,
 			listener.Config.ID,
 			StatusError,
 			"creation_failed",
@@ -574,7 +617,14 @@ func (m *ListenerManager) RemoveListener(id string) error {
 	if listener.GetStatus() == StatusActive || listener.GetStatus() == StatusError {
 		if err := listener.Stop(); err != nil {
 			log.Printf("[WARNING] Failed to stop listener %s: %v", id, err)
-		} else if err := m.recordListenerState(id, StatusStopped, "stopped", "", false); err != nil {
+		} else if err := m.recordListenerState(
+			context.Background(),
+			id,
+			StatusStopped,
+			"stopped",
+			"",
+			false,
+		); err != nil {
 			return fmt.Errorf("persist stopped listener: %w", err)
 		}
 	}
@@ -594,6 +644,20 @@ func (m *ListenerManager) RemoveListener(id string) error {
 //   - Listener remains in the registry but with stopped status
 //   - Returns error if the listener doesn't exist or can't be stopped
 func (m *ListenerManager) StopListener(id string) error {
+	return m.StopListenerWithContext(
+		audit.WithActor(
+			context.Background(),
+			audit.DefaultOperatorActor(),
+		),
+		id,
+	)
+}
+
+// StopListenerWithContext stops a listener as the authenticated operator.
+func (m *ListenerManager) StopListenerWithContext(
+	ctx context.Context,
+	id string,
+) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -610,7 +674,14 @@ func (m *ListenerManager) StopListener(id string) error {
 	if err := listener.Stop(); err != nil {
 		return fmt.Errorf("failed to stop listener: %w", err)
 	}
-	if err := m.recordListenerState(id, StatusStopped, "stopped", "", false); err != nil {
+	if err := m.recordListenerState(
+		ctx,
+		id,
+		StatusStopped,
+		"stopped",
+		"",
+		false,
+	); err != nil {
 		return fmt.Errorf("persist stopped listener: %w", err)
 	}
 
@@ -627,6 +698,20 @@ func (m *ListenerManager) StopListener(id string) error {
 //   - Listener is started and its status updated to active
 //   - Returns error if the listener doesn't exist or can't be started
 func (m *ListenerManager) StartListener(id string) error {
+	return m.StartListenerWithContext(
+		audit.WithActor(
+			context.Background(),
+			audit.DefaultOperatorActor(),
+		),
+		id,
+	)
+}
+
+// StartListenerWithContext starts a listener as the authenticated operator.
+func (m *ListenerManager) StartListenerWithContext(
+	ctx context.Context,
+	id string,
+) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -654,6 +739,7 @@ func (m *ListenerManager) StartListener(id string) error {
 	// Start the listener
 	if err := listener.Start(); err != nil {
 		if persistErr := m.recordListenerState(
+			ctx,
 			id,
 			StatusError,
 			"error",
@@ -664,7 +750,14 @@ func (m *ListenerManager) StartListener(id string) error {
 		}
 		return fmt.Errorf("failed to start listener: %w", err)
 	}
-	if err := m.recordListenerState(id, StatusActive, "started", "", false); err != nil {
+	if err := m.recordListenerState(
+		ctx,
+		id,
+		StatusActive,
+		"started",
+		"",
+		false,
+	); err != nil {
 		if stopErr := listener.Stop(); stopErr != nil {
 			log.Printf("[WARNING] Failed to stop listener after persistence error: %v", stopErr)
 		}
@@ -685,6 +778,20 @@ func (m *ListenerManager) StartListener(id string) error {
 //   - Listener is stopped if it was running
 //   - Returns error if the listener doesn't exist
 func (m *ListenerManager) DeleteListener(id string) error {
+	return m.DeleteListenerWithContext(
+		audit.WithActor(
+			context.Background(),
+			audit.DefaultOperatorActor(),
+		),
+		id,
+	)
+}
+
+// DeleteListenerWithContext deletes a listener as the authenticated operator.
+func (m *ListenerManager) DeleteListenerWithContext(
+	ctx context.Context,
+	id string,
+) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -698,12 +805,26 @@ func (m *ListenerManager) DeleteListener(id string) error {
 		if err := listener.Stop(); err != nil {
 			return fmt.Errorf("failed to stop listener before deletion: %v", err)
 		}
-		if err := m.recordListenerState(id, StatusStopped, "stopped", "", false); err != nil {
+		if err := m.recordListenerState(
+			ctx,
+			id,
+			StatusStopped,
+			"stopped",
+			"",
+			false,
+		); err != nil {
 			return fmt.Errorf("persist stopped listener before deletion: %w", err)
 		}
 	}
 
-	if err := m.recordListenerState(id, StatusStopped, "deleted", "", true); err != nil {
+	if err := m.recordListenerState(
+		ctx,
+		id,
+		StatusStopped,
+		"deleted",
+		"",
+		true,
+	); err != nil {
 		return fmt.Errorf("persist deleted listener: %w", err)
 	}
 	// Clean up listener directory after the tombstone commits. If filesystem
@@ -736,7 +857,14 @@ func (m *ListenerManager) StopAll() []error {
 		if listener.GetStatus() == StatusActive || listener.GetStatus() == StatusError {
 			if err := listener.Stop(); err != nil {
 				errors = append(errors, fmt.Errorf("failed to stop listener %s: %v", id, err))
-			} else if err := m.recordListenerState(id, StatusStopped, "stopped", "", false); err != nil {
+			} else if err := m.recordListenerState(
+				context.Background(),
+				id,
+				StatusStopped,
+				"stopped",
+				"",
+				false,
+			); err != nil {
 				errors = append(errors, fmt.Errorf("persist stopped listener %s: %v", id, err))
 			}
 		}
@@ -764,12 +892,26 @@ func (m *ListenerManager) DeleteAll() []error {
 				errors = append(errors, fmt.Errorf("failed to stop listener %s: %v", id, err))
 				continue // Skip deletion if stopping fails
 			}
-			if err := m.recordListenerState(id, StatusStopped, "stopped", "", false); err != nil {
+			if err := m.recordListenerState(
+				context.Background(),
+				id,
+				StatusStopped,
+				"stopped",
+				"",
+				false,
+			); err != nil {
 				errors = append(errors, fmt.Errorf("persist stopped listener %s: %v", id, err))
 				continue
 			}
 		}
-		if err := m.recordListenerState(id, StatusStopped, "deleted", "", true); err != nil {
+		if err := m.recordListenerState(
+			context.Background(),
+			id,
+			StatusStopped,
+			"deleted",
+			"",
+			true,
+		); err != nil {
 			errors = append(errors, fmt.Errorf("persist deleted listener %s: %v", id, err))
 			continue
 		}
@@ -930,6 +1072,7 @@ func (m *ListenerManager) attachListenerCallbacks(listener *Listener) {
 			message = listenerErr.Error()
 		}
 		if err := m.recordListenerState(
+			context.Background(),
 			listenerID,
 			StatusError,
 			"error",

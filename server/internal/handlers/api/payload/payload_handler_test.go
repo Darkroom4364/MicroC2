@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"microc2/server/internal/audit"
 	"microc2/server/internal/common"
 	"microc2/server/internal/enrollment"
 	"microc2/server/internal/listeners"
@@ -525,8 +526,8 @@ func TestPersistentPayloadEnrollmentCredentialIsHashOnlyAndNotProjected(
 			t.Fatalf("%s exposed the bootstrap credential", name)
 		}
 	}
-	if !bytes.Contains(logOutput.Bytes(), []byte("[REDACTED]")) {
-		t.Fatal("server logs did not retain a redacted build diagnostic")
+	if bytes.Contains(logOutput.Bytes(), []byte("hook build complete")) {
+		t.Fatal("server logs exposed untrusted child build output")
 	}
 	if bytes.Contains(configBytes, []byte("enrollment_credential")) {
 		t.Fatal("ordinary payload config contains an enrollment credential field")
@@ -609,8 +610,61 @@ func TestPayloadBuildFailureRedactsEnrollmentCredentialFromLogsAndResponse(
 		if strings.Contains(content, bootstrapCredential) {
 			t.Fatalf("%s exposed the bootstrap credential", name)
 		}
-		if !strings.Contains(content, "[REDACTED]") {
-			t.Fatalf("%s omitted the redaction marker: %q", name, content)
+		for _, forbidden := range []string{
+			"child output leaked",
+			"compiler error leaked",
+		} {
+			if strings.Contains(content, forbidden) {
+				t.Fatalf("%s exposed untrusted build diagnostic %q", name, forbidden)
+			}
+		}
+	}
+	if !strings.Contains(response.Body.String(), "Payload generation failed") {
+		t.Fatalf("operator response omitted generic build failure: %q", response.Body.String())
+	}
+
+	page, err := handler.audit.Page(
+		context.Background(),
+		audit.PageOptions{Limit: 10},
+	)
+	if err != nil {
+		t.Fatalf("page failed-build audit events: %v", err)
+	}
+	if page.Total != 2 || len(page.Events) != 2 {
+		t.Fatalf(
+			"failed-build audit event count = %d/%d, want 2/2: %#v",
+			page.Total,
+			len(page.Events),
+			page.Events,
+		)
+	}
+	failed := page.Events[0]
+	requested := page.Events[1]
+	if requested.Action != "payload.build.requested" ||
+		requested.CausationSequence != nil ||
+		failed.Action != "payload.build.failed" ||
+		failed.Outcome != audit.OutcomeFailed ||
+		failed.ReasonCode != "build_failed" ||
+		failed.CausationSequence == nil ||
+		*failed.CausationSequence != requested.Sequence ||
+		failed.PayloadBuildID != requested.PayloadBuildID {
+		t.Fatalf(
+			"failed payload audit chain is not causal: requested=%#v failed=%#v",
+			requested,
+			failed,
+		)
+	}
+	serialized, err := json.Marshal(page.Events)
+	if err != nil {
+		t.Fatalf("marshal failed-build audit events: %v", err)
+	}
+	for name, forbidden := range map[string]string{
+		"bootstrap credential": bootstrapCredential,
+		"child build output":   "child output leaked",
+		"child build error":    "compiler error leaked",
+	} {
+		if bytes.Contains(serialized, []byte(forbidden)) {
+			t.Fatalf("failed-build audit events exposed %s: %s", name, serialized)
 		}
 	}
 }
@@ -1167,6 +1221,10 @@ func TestPayloadEnrollmentRevokeOperatorRoute(t *testing.T) {
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
 	revokePath := "/api/payload/" + result.ID + "/enrollment/revoke"
+	operator := audit.Actor{
+		Kind: audit.ActorOperator,
+		ID:   "payload-revocation-test",
+	}
 	serve := func(
 		t *testing.T,
 		method string,
@@ -1175,6 +1233,9 @@ func TestPayloadEnrollmentRevokeOperatorRoute(t *testing.T) {
 	) *httptest.ResponseRecorder {
 		t.Helper()
 		request := httptest.NewRequest(method, path, strings.NewReader(body))
+		request = request.WithContext(
+			audit.WithActor(request.Context(), operator),
+		)
 		response := httptest.NewRecorder()
 		mux.ServeHTTP(response, request)
 		if response.Header().Get("Cache-Control") != "no-store" {
@@ -1268,6 +1329,70 @@ func TestPayloadEnrollmentRevokeOperatorRoute(t *testing.T) {
 			}
 		})
 	}
+	var rejectedBeforeMutation int
+	if err := database.SQL().QueryRow(
+		`SELECT COUNT(*)
+		 FROM audit_events
+		 WHERE action = 'payload.enrollment.revoke.rejected'`,
+	).Scan(&rejectedBeforeMutation); err != nil {
+		t.Fatalf("count rejected payload revocation events: %v", err)
+	}
+	if rejectedBeforeMutation != 6 {
+		t.Fatalf(
+			"rejected payload revocation event count = %d, want 6",
+			rejectedBeforeMutation,
+		)
+	}
+
+	if _, err := database.SQL().Exec(
+		`CREATE TRIGGER reject_payload_enrollment_revoke_audit
+		 BEFORE INSERT ON audit_events
+		 WHEN NEW.action = 'payload.enrollment.revoke'
+		 BEGIN
+		     SELECT RAISE(ABORT, 'injected payload revocation audit failure');
+		 END`,
+	); err != nil {
+		t.Fatalf("create payload revocation audit failure trigger: %v", err)
+	}
+	response := serve(t, http.MethodPost, revokePath, "")
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf(
+			"audit-failed revocation status = %d, want 500: %s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	var revokedCount int
+	if err := database.SQL().QueryRow(
+		`SELECT COUNT(*)
+		 FROM payload_bootstrap_credentials
+		 WHERE payload_build_id = ? AND revoked_at IS NOT NULL`,
+		result.ID,
+	).Scan(&revokedCount); err != nil {
+		t.Fatalf("inspect rolled-back payload revocation: %v", err)
+	}
+	if revokedCount != 0 {
+		t.Fatal("payload credential revocation survived failed audit append")
+	}
+	var rejectedAfterAuditFailure int
+	if err := database.SQL().QueryRow(
+		`SELECT COUNT(*)
+		 FROM audit_events
+		 WHERE action = 'payload.enrollment.revoke.rejected'`,
+	).Scan(&rejectedAfterAuditFailure); err != nil {
+		t.Fatalf("count audit-failed payload revocation event: %v", err)
+	}
+	if rejectedAfterAuditFailure != 7 {
+		t.Fatalf(
+			"rejected payload revocation event count after audit failure = %d, want 7",
+			rejectedAfterAuditFailure,
+		)
+	}
+	if _, err := database.SQL().Exec(
+		`DROP TRIGGER reject_payload_enrollment_revoke_audit`,
+	); err != nil {
+		t.Fatalf("drop payload revocation audit failure trigger: %v", err)
+	}
 
 	for attempt := 0; attempt < 2; attempt++ {
 		response := serve(t, http.MethodPost, revokePath, "")
@@ -1286,6 +1411,69 @@ func TestPayloadEnrollmentRevokeOperatorRoute(t *testing.T) {
 				response.Body.String(),
 			)
 		}
+	}
+
+	var rootSequence int64
+	if err := database.SQL().QueryRow(
+		`SELECT created_audit_event_seq
+		 FROM payload_builds
+		 WHERE id = ?`,
+		result.ID,
+	).Scan(&rootSequence); err != nil {
+		t.Fatalf("read revoked payload audit root: %v", err)
+	}
+	rows, err := database.SQL().Query(
+		`SELECT
+		     actor_kind, actor_id, outcome, causation_sequence,
+		     listener_id, payload_build_id
+		 FROM audit_events
+		 WHERE action = 'payload.enrollment.revoke'
+		 ORDER BY seq`,
+	)
+	if err != nil {
+		t.Fatalf("query payload revocation audit events: %v", err)
+	}
+	defer rows.Close()
+	revocationEvents := 0
+	for rows.Next() {
+		var actorKind, actorID, outcome, listenerID, payloadBuildID string
+		var causation int64
+		if err := rows.Scan(
+			&actorKind,
+			&actorID,
+			&outcome,
+			&causation,
+			&listenerID,
+			&payloadBuildID,
+		); err != nil {
+			t.Fatalf("scan payload revocation audit event: %v", err)
+		}
+		revocationEvents++
+		if actorKind != string(operator.Kind) ||
+			actorID != operator.ID ||
+			outcome != string(audit.OutcomeSucceeded) ||
+			causation != rootSequence ||
+			listenerID != "listener-one" ||
+			payloadBuildID != result.ID {
+			t.Fatalf(
+				"unexpected payload revocation audit event: actor=%s/%s outcome=%s cause=%d listener=%s payload=%s",
+				actorKind,
+				actorID,
+				outcome,
+				causation,
+				listenerID,
+				payloadBuildID,
+			)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate payload revocation audit events: %v", err)
+	}
+	if revocationEvents != 2 {
+		t.Fatalf(
+			"payload revocation audit event count = %d, want 2",
+			revocationEvents,
+		)
 	}
 
 	for _, agentID := range []string{"agent-one", "agent-two"} {
@@ -1409,6 +1597,334 @@ func TestGeneratePayloadHonoursSuppliedMutationSeed(t *testing.T) {
 	if _, err := handler.GeneratePayload(config); err == nil {
 		t.Fatalf("invalid mutation seed should be rejected")
 	}
+}
+
+func TestPayloadBuildAuditRootPrecedesBuildFilesystemSideEffects(t *testing.T) {
+	tempDir := t.TempDir()
+	payloadsDir := filepath.Join(tempDir, "payload-root")
+	agentDir := filepath.Join(tempDir, "agent")
+	writePlaceholderBuildScript(t, agentDir)
+	database, err := persistence.Open(filepath.Join(tempDir, "state.db"))
+	if err != nil {
+		t.Fatalf("open persistence database: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close persistence database: %v", err)
+		}
+	})
+	handler, err := NewPayloadHandlerWithPersistenceForIsolatedLab(
+		payloadsDir,
+		agentDir,
+		testListenerLookup(),
+		database,
+	)
+	if err != nil {
+		t.Fatalf("create persistent payload handler: %v", err)
+	}
+	if _, err := database.SQL().Exec(
+		`CREATE TRIGGER reject_payload_build_requested_audit
+		 BEFORE INSERT ON audit_events
+		 WHEN NEW.action = 'payload.build.requested'
+		 BEGIN
+		     SELECT RAISE(ABORT, 'injected requested audit failure');
+		 END`,
+	); err != nil {
+		t.Fatalf("create requested audit failure trigger: %v", err)
+	}
+	buildInvoked := false
+	handler.runBuild = func(*exec.Cmd) ([]byte, error) {
+		buildInvoked = true
+		return nil, errors.New("build must not run")
+	}
+
+	if _, err := handler.GeneratePayload(testPayloadConfig()); err == nil {
+		t.Fatal("payload generation succeeded despite rejected audit root")
+	}
+	if buildInvoked {
+		t.Fatal("payload build ran before its durable audit root")
+	}
+	var buildCount int
+	if err := database.SQL().QueryRow(
+		`SELECT COUNT(*) FROM payload_builds`,
+	).Scan(&buildCount); err != nil {
+		t.Fatalf("count payload builds: %v", err)
+	}
+	if buildCount != 0 {
+		t.Fatalf("rejected audit root retained %d payload build rows", buildCount)
+	}
+	entries, err := os.ReadDir(filepath.Join(payloadsDir, "debug"))
+	if err != nil {
+		t.Fatalf("read debug payload root: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("rejected audit root created build filesystem entries: %v", entries)
+	}
+}
+
+func TestPayloadCompletionAuditFailureRollsBackCredentialActivation(t *testing.T) {
+	tempDir := t.TempDir()
+	payloadsDir := filepath.Join(tempDir, "payload-root")
+	agentDir := filepath.Join(tempDir, "agent")
+	writePlaceholderBuildScript(t, agentDir)
+	database, err := persistence.Open(filepath.Join(tempDir, "state.db"))
+	if err != nil {
+		t.Fatalf("open persistence database: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close persistence database: %v", err)
+		}
+	})
+	handler, err := NewPayloadHandlerWithPersistenceForIsolatedLab(
+		payloadsDir,
+		agentDir,
+		testListenerLookup(),
+		database,
+	)
+	if err != nil {
+		t.Fatalf("create persistent payload handler: %v", err)
+	}
+	if _, err := database.SQL().Exec(
+		`CREATE TRIGGER reject_payload_build_completed_audit
+		 BEFORE INSERT ON audit_events
+		 WHEN NEW.action = 'payload.build.completed'
+		 BEGIN
+		     SELECT RAISE(ABORT, 'injected completed audit failure');
+		 END`,
+	); err != nil {
+		t.Fatalf("create completed audit failure trigger: %v", err)
+	}
+	handler.runBuild = func(command *exec.Cmd) ([]byte, error) {
+		for index := 0; index+1 < len(command.Args); index++ {
+			if command.Args[index] != "--output" {
+				continue
+			}
+			return []byte("untrusted compiler output"), os.WriteFile(
+				filepath.Join(command.Args[index+1], "agent"),
+				[]byte("fake agent"),
+				0o600,
+			)
+		}
+		return nil, errors.New("build command omitted --output")
+	}
+
+	if _, err := handler.GeneratePayload(testPayloadConfig()); err == nil {
+		t.Fatal("payload generation succeeded despite rejected completion audit")
+	}
+	var buildID, state string
+	if err := database.SQL().QueryRow(
+		`SELECT id, state
+		 FROM payload_builds
+		 ORDER BY rowid DESC
+		 LIMIT 1`,
+	).Scan(&buildID, &state); err != nil {
+		t.Fatalf("read failed payload build: %v", err)
+	}
+	if state != payloadStateFailed {
+		t.Fatalf("payload state = %q, want %q", state, payloadStateFailed)
+	}
+	var credentialCount int
+	if err := database.SQL().QueryRow(
+		`SELECT COUNT(*)
+		 FROM payload_bootstrap_credentials
+		 WHERE payload_build_id = ?`,
+		buildID,
+	).Scan(&credentialCount); err != nil {
+		t.Fatalf("count payload credentials: %v", err)
+	}
+	if credentialCount != 0 {
+		t.Fatalf(
+			"failed completion retained %d activated payload credentials",
+			credentialCount,
+		)
+	}
+	page, err := handler.audit.Page(
+		context.Background(),
+		audit.PageOptions{Limit: 10},
+	)
+	if err != nil {
+		t.Fatalf("page completion failure audit: %v", err)
+	}
+	if page.Total != 2 ||
+		page.Events[0].Action != "payload.build.failed" ||
+		page.Events[1].Action != "payload.build.requested" ||
+		page.Events[0].CausationSequence == nil ||
+		*page.Events[0].CausationSequence != page.Events[1].Sequence {
+		t.Fatalf("unexpected completion failure audit chain: %#v", page.Events)
+	}
+}
+
+func TestPayloadBuildAuditRootCompletionAndRedactionSurviveRestart(
+	t *testing.T,
+) {
+	tempDir := t.TempDir()
+	payloadsDir := filepath.Join(tempDir, "payload-root")
+	agentDir := filepath.Join(tempDir, "agent")
+	writePlaceholderBuildScript(t, agentDir)
+	databasePath := filepath.Join(tempDir, "state.db")
+	firstDatabase, err := persistence.Open(databasePath)
+	if err != nil {
+		t.Fatalf("open first persistence database: %v", err)
+	}
+	firstHandler, err := NewPayloadHandlerWithPersistenceForIsolatedLab(
+		payloadsDir,
+		agentDir,
+		testListenerLookup(),
+		firstDatabase,
+	)
+	if err != nil {
+		_ = firstDatabase.Close()
+		t.Fatalf("create first persistent handler: %v", err)
+	}
+
+	const buildOutputMarker = "sensitive-build-output-marker"
+	var bootstrapCredential string
+	var buildOutput []byte
+	firstHandler.runBuild = func(command *exec.Cmd) ([]byte, error) {
+		outputDir := ""
+		for _, entry := range command.Env {
+			name, value, found := strings.Cut(entry, "=")
+			if found && name == "ENROLLMENT_CREDENTIAL" {
+				bootstrapCredential = value
+			}
+		}
+		for index := 0; index+1 < len(command.Args); index++ {
+			if command.Args[index] == "--output" {
+				outputDir = command.Args[index+1]
+				break
+			}
+		}
+		if outputDir == "" {
+			return nil, errors.New("build command omitted --output")
+		}
+		if err := os.WriteFile(
+			filepath.Join(outputDir, "agent"),
+			[]byte("fake agent"),
+			0o600,
+		); err != nil {
+			return nil, fmt.Errorf("write hooked payload artifact: %w", err)
+		}
+		buildOutput = []byte(
+			buildOutputMarker + "; credential=" + bootstrapCredential,
+		)
+		return buildOutput, nil
+	}
+
+	operator := audit.Actor{
+		Kind: audit.ActorOperator,
+		ID:   "payload-audit-test-operator",
+	}
+	result, err := firstHandler.GeneratePayloadWithContext(
+		audit.WithActor(context.Background(), operator),
+		testPayloadConfig(),
+	)
+	if err != nil {
+		_ = firstDatabase.Close()
+		t.Fatalf("generate persistent payload: %v", err)
+	}
+	if bootstrapCredential == "" ||
+		!bytes.Contains(buildOutput, []byte(bootstrapCredential)) {
+		_ = firstDatabase.Close()
+		t.Fatal("test build did not exercise secret-bearing build output")
+	}
+
+	var rootSequence int64
+	if err := firstDatabase.SQL().QueryRow(
+		`SELECT created_audit_event_seq
+		 FROM payload_builds
+		 WHERE id = ?`,
+		result.ID,
+	).Scan(&rootSequence); err != nil {
+		_ = firstDatabase.Close()
+		t.Fatalf("read payload audit root: %v", err)
+	}
+	if rootSequence <= 0 {
+		_ = firstDatabase.Close()
+		t.Fatalf("payload audit root sequence = %d, want positive", rootSequence)
+	}
+
+	assertLifecycle := func(t *testing.T, store *audit.Store) {
+		t.Helper()
+		page, err := store.Page(
+			context.Background(),
+			audit.PageOptions{Limit: 10},
+		)
+		if err != nil {
+			t.Fatalf("page payload audit events: %v", err)
+		}
+		if page.Total != 2 || len(page.Events) != 2 {
+			t.Fatalf(
+				"payload audit event count = %d/%d, want 2/2: %#v",
+				page.Total,
+				len(page.Events),
+				page.Events,
+			)
+		}
+		completed := page.Events[0]
+		requested := page.Events[1]
+		wantTarget := audit.Target{Kind: "payload_build", ID: result.ID}
+		if requested.Sequence != rootSequence ||
+			requested.Actor != operator ||
+			requested.Action != "payload.build.requested" ||
+			requested.Route != "POST /api/payload/generate" ||
+			requested.Target != wantTarget ||
+			requested.Outcome != audit.OutcomeSucceeded ||
+			requested.CausationSequence != nil ||
+			requested.ListenerID != "listener-one" ||
+			requested.PayloadBuildID != result.ID {
+			t.Fatalf("unexpected requested payload audit root: %#v", requested)
+		}
+		if completed.Sequence <= requested.Sequence ||
+			completed.Actor != operator ||
+			completed.Action != "payload.build.completed" ||
+			completed.Route != "POST /api/payload/generate" ||
+			completed.Target != wantTarget ||
+			completed.Outcome != audit.OutcomeSucceeded ||
+			completed.CausationSequence == nil ||
+			*completed.CausationSequence != rootSequence ||
+			completed.ListenerID != "listener-one" ||
+			completed.PayloadBuildID != result.ID {
+			t.Fatalf("unexpected completed payload audit event: %#v", completed)
+		}
+
+		serialized, err := json.Marshal(page.Events)
+		if err != nil {
+			t.Fatalf("marshal payload audit events: %v", err)
+		}
+		for name, forbidden := range map[string]string{
+			"build output":         buildOutputMarker,
+			"bootstrap credential": bootstrapCredential,
+		} {
+			if bytes.Contains(serialized, []byte(forbidden)) {
+				t.Fatalf("payload audit events exposed %s: %s", name, serialized)
+			}
+		}
+	}
+	assertLifecycle(t, firstHandler.audit)
+
+	if err := firstDatabase.Close(); err != nil {
+		t.Fatalf("close first persistence database: %v", err)
+	}
+	secondDatabase, err := persistence.Open(databasePath)
+	if err != nil {
+		t.Fatalf("reopen persistence database: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := secondDatabase.Close(); err != nil {
+			t.Errorf("close restarted persistence database: %v", err)
+		}
+	})
+	secondHandler, err := NewPayloadHandlerWithPersistenceForIsolatedLab(
+		payloadsDir,
+		agentDir,
+		testListenerLookup(),
+		secondDatabase,
+	)
+	if err != nil {
+		t.Fatalf("create restarted persistent handler: %v", err)
+	}
+	assertLifecycle(t, secondHandler.audit)
 }
 
 func TestPayloadMetadataAndDownloadSurviveRestartWithCustomRoot(t *testing.T) {
@@ -1845,12 +2361,13 @@ func TestBuildingPayloadBecomesInterruptedExactlyOnceOnRestart(t *testing.T) {
 		t.Fatalf("insert building payload metadata: %v", err)
 	}
 
-	if _, err := NewPayloadHandlerWithPersistenceForIsolatedLab(
+	firstRestartHandler, err := NewPayloadHandlerWithPersistenceForIsolatedLab(
 		payloadsDir,
 		filepath.Join(tempDir, "agent"),
 		testListenerLookup(),
 		database,
-	); err != nil {
+	)
+	if err != nil {
 		t.Fatalf("reconcile first restart: %v", err)
 	}
 	var state, detail string
@@ -1869,6 +2386,60 @@ func TestBuildingPayloadBecomesInterruptedExactlyOnceOnRestart(t *testing.T) {
 			payloadInterruptedDetail,
 		)
 	}
+	var rootSequence int64
+	if err := database.SQL().QueryRow(
+		`SELECT created_audit_event_seq
+		 FROM payload_builds
+		 WHERE id = ?`,
+		payloadID,
+	).Scan(&rootSequence); err != nil {
+		t.Fatalf("read recovered payload audit root: %v", err)
+	}
+	firstPage, err := firstRestartHandler.audit.Page(
+		context.Background(),
+		audit.PageOptions{Limit: 10},
+	)
+	if err != nil {
+		t.Fatalf("page first-restart payload audit events: %v", err)
+	}
+	if firstPage.Total != 2 || len(firstPage.Events) != 2 {
+		t.Fatalf(
+			"first-restart audit event count = %d/%d, want 2/2: %#v",
+			firstPage.Total,
+			len(firstPage.Events),
+			firstPage.Events,
+		)
+	}
+	interrupted := firstPage.Events[0]
+	recovered := firstPage.Events[1]
+	systemActor := audit.DefaultSystemActor()
+	wantTarget := audit.Target{Kind: "payload_build", ID: payloadID}
+	if rootSequence <= 0 ||
+		recovered.Sequence != rootSequence ||
+		recovered.Actor != systemActor ||
+		recovered.Action != "payload.build.recovered" ||
+		recovered.Route != "internal:payload_recovery" ||
+		recovered.Target != wantTarget ||
+		recovered.Outcome != audit.OutcomeSucceeded ||
+		recovered.ReasonCode != "missing_audit_root" ||
+		recovered.CausationSequence != nil ||
+		recovered.ListenerID != "listener-one" ||
+		recovered.PayloadBuildID != payloadID {
+		t.Fatalf("unexpected recovered payload audit root: %#v", recovered)
+	}
+	if interrupted.Sequence <= recovered.Sequence ||
+		interrupted.Actor != systemActor ||
+		interrupted.Action != "payload.build.interrupted" ||
+		interrupted.Route != "internal:payload_recovery" ||
+		interrupted.Target != wantTarget ||
+		interrupted.Outcome != audit.OutcomeFailed ||
+		interrupted.ReasonCode != "server_restart" ||
+		interrupted.CausationSequence == nil ||
+		*interrupted.CausationSequence != rootSequence ||
+		interrupted.ListenerID != "listener-one" ||
+		interrupted.PayloadBuildID != payloadID {
+		t.Fatalf("unexpected interrupted payload audit event: %#v", interrupted)
+	}
 
 	const sentinelDetail = "already reconciled"
 	if _, err := database.SQL().Exec(
@@ -1878,12 +2449,13 @@ func TestBuildingPayloadBecomesInterruptedExactlyOnceOnRestart(t *testing.T) {
 	); err != nil {
 		t.Fatalf("set interrupted sentinel detail: %v", err)
 	}
-	if _, err := NewPayloadHandlerWithPersistenceForIsolatedLab(
+	secondRestartHandler, err := NewPayloadHandlerWithPersistenceForIsolatedLab(
 		payloadsDir,
 		filepath.Join(tempDir, "agent"),
 		testListenerLookup(),
 		database,
-	); err != nil {
+	)
+	if err != nil {
 		t.Fatalf("reconcile second restart: %v", err)
 	}
 	if err := database.SQL().QueryRow(
@@ -1897,6 +2469,22 @@ func TestBuildingPayloadBecomesInterruptedExactlyOnceOnRestart(t *testing.T) {
 			"second restart changed terminal state/detail to %q/%q",
 			state,
 			detail,
+		)
+	}
+	secondPage, err := secondRestartHandler.audit.Page(
+		context.Background(),
+		audit.PageOptions{Limit: 10},
+	)
+	if err != nil {
+		t.Fatalf("page second-restart payload audit events: %v", err)
+	}
+	if secondPage.Total != 2 ||
+		len(secondPage.Events) != 2 ||
+		secondPage.Events[0].Sequence != interrupted.Sequence ||
+		secondPage.Events[1].Sequence != recovered.Sequence {
+		t.Fatalf(
+			"second restart duplicated or changed payload audit events: %#v",
+			secondPage,
 		)
 	}
 }

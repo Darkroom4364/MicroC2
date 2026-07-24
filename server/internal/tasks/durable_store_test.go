@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"microc2/server/internal/audit"
 	"microc2/server/internal/persistence"
 )
 
@@ -55,6 +56,286 @@ func TestDurableStoreRestartPreservesDispatchLease(t *testing.T) {
 			redelivered.DispatchedAt,
 			originalDispatchedAt,
 		)
+	}
+}
+
+func TestDurableStoreAuditLifecycleIsCausalAndIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "microc2.db")
+	now := time.Date(2026, 7, 24, 9, 0, 0, 0, time.UTC)
+	db, store := openDurableTestStore(
+		t,
+		path,
+		"listener-one",
+		&now,
+		10*time.Second,
+		10,
+	)
+	defer closeDurableTestDatabase(t, db)
+
+	operator := audit.Actor{Kind: audit.ActorOperator, ID: "operator-test"}
+	operatorContext := audit.WithActor(context.Background(), operator)
+	secretCommand := "printf super-secret-command"
+	task, err := store.CreateContext(
+		operatorContext,
+		"agent-one",
+		validCreateRequest(secretCommand, 300),
+	)
+	if err != nil {
+		t.Fatalf("create audited task: %v", err)
+	}
+	var taskRootSequence int64
+	if err := db.SQL().QueryRow(
+		`SELECT created_audit_event_seq
+		 FROM tasks
+		 WHERE listener_id = ? AND task_id = ?`,
+		"listener-one",
+		task.ID,
+	).Scan(&taskRootSequence); err != nil {
+		t.Fatalf("read task causal audit sequence: %v", err)
+	}
+	if taskRootSequence <= 0 {
+		t.Fatalf("task has invalid causal audit sequence %d", taskRootSequence)
+	}
+	encodedTask, err := json.Marshal(task)
+	if err != nil {
+		t.Fatalf("encode public task: %v", err)
+	}
+	if strings.Contains(string(encodedTask), "audit") {
+		t.Fatalf("public Task JSON exposed audit internals: %s", encodedTask)
+	}
+
+	if _, ok, err := store.DispatchNext("agent-one"); err != nil || !ok {
+		t.Fatalf("dispatch audited task: ok=%t err=%v", ok, err)
+	}
+	if _, ok, err := store.DispatchNext("agent-one"); err != nil || ok {
+		t.Fatalf("dispatch inside lease: ok=%t err=%v", ok, err)
+	}
+	now = now.Add(10 * time.Second)
+	if _, ok, err := store.DispatchNext("agent-one"); err != nil || !ok {
+		t.Fatalf("redeliver audited task: ok=%t err=%v", ok, err)
+	}
+
+	startedAt := now.Add(-time.Second)
+	runningUpdate := StatusUpdate{
+		SchemaVersion: SchemaVersion,
+		TaskID:        task.ID,
+		AgentID:       "agent-one",
+		Status:        StatusRunning,
+		Timestamp:     startedAt,
+	}
+	if _, err := store.MarkRunning("agent-one", task.ID, runningUpdate); err != nil {
+		t.Fatalf("mark audited task running: %v", err)
+	}
+	if _, err := store.MarkRunning("agent-one", task.ID, runningUpdate); err != nil {
+		t.Fatalf("replay audited running update: %v", err)
+	}
+
+	exitCode := 0
+	secretOutput := "super-secret-result"
+	result := Result{
+		SchemaVersion: SchemaVersion,
+		TaskID:        task.ID,
+		AgentID:       "agent-one",
+		Outcome:       OutcomeCompleted,
+		StartedAt:     startedAt,
+		CompletedAt:   now,
+		ExitCode:      &exitCode,
+		Output:        Output{Stdout: secretOutput},
+	}
+	if _, info, err := store.CompleteWithInfo("agent-one", result); err != nil || !info.Applied {
+		t.Fatalf("complete audited task: info=%#v err=%v", info, err)
+	}
+	if _, info, err := store.CompleteWithInfo("agent-one", result); err != nil || info.Applied {
+		t.Fatalf("replay audited completion: info=%#v err=%v", info, err)
+	}
+
+	cancelled, err := store.CreateContext(
+		operatorContext,
+		"agent-one",
+		validCreateRequest("another-secret-command", 300),
+	)
+	if err != nil {
+		t.Fatalf("create task for audited cancellation: %v", err)
+	}
+	var cancelledRootSequence int64
+	if err := db.SQL().QueryRow(
+		`SELECT created_audit_event_seq
+		 FROM tasks
+		 WHERE listener_id = ? AND task_id = ?`,
+		"listener-one",
+		cancelled.ID,
+	).Scan(&cancelledRootSequence); err != nil {
+		t.Fatalf("read cancelled task causal sequence: %v", err)
+	}
+	if _, err := store.CancelContext(
+		operatorContext,
+		"agent-one",
+		cancelled.ID,
+	); err != nil {
+		t.Fatalf("cancel audited task: %v", err)
+	}
+	if _, err := store.CancelContext(
+		operatorContext,
+		"agent-one",
+		cancelled.ID,
+	); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("repeated cancellation returned %v", err)
+	}
+
+	auditStore, err := audit.NewStore(db)
+	if err != nil {
+		t.Fatalf("open audit store: %v", err)
+	}
+	page, err := auditStore.Page(context.Background(), audit.PageOptions{
+		Limit:  50,
+		Offset: 0,
+	})
+	if err != nil {
+		t.Fatalf("page task audit events: %v", err)
+	}
+	if page.Total != 7 || len(page.Events) != 7 {
+		t.Fatalf("unexpected task audit event count: total=%d events=%#v", page.Total, page.Events)
+	}
+	events := make([]audit.Event, len(page.Events))
+	for index := range page.Events {
+		events[index] = page.Events[len(page.Events)-1-index]
+	}
+	expectedActions := []string{
+		"task.queued",
+		"task.dispatched",
+		"task.redelivered",
+		"task.running",
+		"task.result_received",
+		"task.queued",
+		"task.cancelled",
+	}
+	for index, expectedAction := range expectedActions {
+		event := events[index]
+		if event.Action != expectedAction ||
+			event.Target.Kind != "task" ||
+			event.ListenerID != "listener-one" ||
+			event.AgentID != "agent-one" {
+			t.Fatalf("unexpected audit event %d: %#v", index, event)
+		}
+		expectedTaskID := task.ID
+		expectedRoot := taskRootSequence
+		if index >= 5 {
+			expectedTaskID = cancelled.ID
+			expectedRoot = cancelledRootSequence
+		}
+		if event.TaskID != expectedTaskID || event.Target.ID != expectedTaskID {
+			t.Fatalf("audit event %d targeted the wrong task: %#v", index, event)
+		}
+		if expectedAction == "task.queued" {
+			if event.CausationSequence != nil || event.Actor != operator {
+				t.Fatalf("unexpected task root event %d: %#v", index, event)
+			}
+			if event.Sequence != expectedRoot {
+				t.Fatalf(
+					"task root event %d sequence=%d, linked row=%d",
+					index,
+					event.Sequence,
+					expectedRoot,
+				)
+			}
+			continue
+		}
+		if event.CausationSequence == nil ||
+			*event.CausationSequence != expectedRoot {
+			t.Fatalf("audit event %d lost causation: %#v", index, event)
+		}
+		expectedActor := audit.Actor{Kind: audit.ActorAgent, ID: "agent-one"}
+		if expectedAction == "task.cancelled" {
+			expectedActor = operator
+		}
+		if event.Actor != expectedActor {
+			t.Fatalf("audit event %d has actor %#v, want %#v", index, event.Actor, expectedActor)
+		}
+	}
+	encodedAudit, err := json.Marshal(page)
+	if err != nil {
+		t.Fatalf("encode task audit page: %v", err)
+	}
+	for _, secret := range []string{
+		secretCommand,
+		"another-secret-command",
+		secretOutput,
+	} {
+		if strings.Contains(string(encodedAudit), secret) {
+			t.Fatalf("task audit page retained secret %q: %s", secret, encodedAudit)
+		}
+	}
+}
+
+func TestDurableStoreAuditFailureRollsBackTaskMutation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "microc2.db")
+	now := time.Date(2026, 7, 24, 10, 0, 0, 0, time.UTC)
+	db, store := openDurableTestStore(
+		t,
+		path,
+		"listener-one",
+		&now,
+		time.Second,
+		10,
+	)
+	defer closeDurableTestDatabase(t, db)
+
+	if _, err := db.SQL().Exec(`
+		CREATE TRIGGER reject_task_queue_audit
+		BEFORE INSERT ON audit_events
+		WHEN NEW.action = 'task.queued'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected task queue audit failure');
+		END
+	`); err != nil {
+		t.Fatalf("create task queue audit failure trigger: %v", err)
+	}
+	if _, err := store.Create(
+		"agent-one",
+		validCreateRequest("must-not-persist", 300),
+	); err == nil {
+		t.Fatal("task creation unexpectedly survived audit failure")
+	}
+	var taskCount int
+	if err := db.SQL().QueryRow(
+		`SELECT COUNT(*) FROM tasks WHERE listener_id = ?`,
+		"listener-one",
+	).Scan(&taskCount); err != nil {
+		t.Fatalf("count tasks after audit failure: %v", err)
+	}
+	if taskCount != 0 {
+		t.Fatalf("audit failure left %d queued tasks", taskCount)
+	}
+	if _, err := db.SQL().Exec(`DROP TRIGGER reject_task_queue_audit`); err != nil {
+		t.Fatalf("drop task queue audit failure trigger: %v", err)
+	}
+
+	task, err := store.Create(
+		"agent-one",
+		validCreateRequest("dispatch-must-roll-back", 300),
+	)
+	if err != nil {
+		t.Fatalf("create dispatch rollback fixture: %v", err)
+	}
+	if _, err := db.SQL().Exec(`
+		CREATE TRIGGER reject_task_dispatch_audit
+		BEFORE INSERT ON audit_events
+		WHEN NEW.action = 'task.dispatched'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected task dispatch audit failure');
+		END
+	`); err != nil {
+		t.Fatalf("create task dispatch audit failure trigger: %v", err)
+	}
+	if _, ok, err := store.DispatchNext("agent-one"); err == nil || ok {
+		t.Fatalf("task dispatch survived audit failure: ok=%t err=%v", ok, err)
+	}
+	persisted, err := store.Get("agent-one", task.ID)
+	if err != nil {
+		t.Fatalf("get task after rolled-back dispatch: %v", err)
+	}
+	if persisted.Status != StatusQueued || persisted.DispatchedAt != nil {
+		t.Fatalf("audit failure left partial dispatch state: %#v", persisted)
 	}
 }
 
@@ -489,6 +770,43 @@ func TestDurableStoreLegacyCompletionAndPagingSurviveRestart(t *testing.T) {
 	}
 	if _, matched, err := store.CompleteLegacy("agent-one", "whoami", "operator\n"); err != nil || matched {
 		t.Fatalf("repeated legacy completion: matched=%t err=%v", matched, err)
+	}
+	auditStore, err := audit.NewStore(db)
+	if err != nil {
+		t.Fatalf("open legacy task audit store: %v", err)
+	}
+	auditPage, err := auditStore.Page(context.Background(), audit.PageOptions{
+		Limit:  10,
+		Offset: 0,
+	})
+	if err != nil {
+		t.Fatalf("page legacy task audit events: %v", err)
+	}
+	actionCounts := make(map[string]int)
+	for _, event := range auditPage.Events {
+		actionCounts[event.Action]++
+		if event.TaskID != task.ID ||
+			event.ListenerID != "listener-one" ||
+			event.AgentID != "agent-one" {
+			t.Fatalf("legacy task audit event lost scope: %#v", event)
+		}
+	}
+	for _, action := range []string{
+		"task.queued",
+		"task.dispatched",
+		"task.result_received",
+	} {
+		if actionCounts[action] != 1 {
+			t.Fatalf(
+				"legacy task audit action %q count=%d, events=%#v",
+				action,
+				actionCounts[action],
+				auditPage.Events,
+			)
+		}
+	}
+	if auditPage.Total != 3 {
+		t.Fatalf("legacy result retry duplicated audit history: %#v", auditPage)
 	}
 	page, total, _, err = store.GetLegacyResultsPage(
 		"agent-one",

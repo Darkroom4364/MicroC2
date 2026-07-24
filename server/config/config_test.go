@@ -38,6 +38,48 @@ func TestLoadConfigDefaultsAgentTransportToSecure(t *testing.T) {
 	}
 }
 
+func TestLoadConfigDisablesServerTerminalByDefault(t *testing.T) {
+	t.Setenv("MICROC2_STORAGE_PATH", "")
+	root := t.TempDir()
+	configPath := filepath.Join(root, "settings.yaml")
+	writeTestConfig(t, configPath, "", filepath.Join(root, "static"))
+
+	loaded, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if loaded.Security.EnableServerTerminal {
+		t.Fatal("server terminal was enabled by default")
+	}
+}
+
+func TestLoadConfigAllowsExplicitServerTerminalEnablement(t *testing.T) {
+	t.Setenv("MICROC2_STORAGE_PATH", "")
+	root := t.TempDir()
+	configPath := filepath.Join(root, "settings.yaml")
+	writeTestConfig(t, configPath, "", filepath.Join(root, "static"))
+
+	content, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read test config: %v", err)
+	}
+	content = append(
+		content,
+		[]byte("security:\n  enableServerTerminal: true\n")...,
+	)
+	if err := os.WriteFile(configPath, content, 0o600); err != nil {
+		t.Fatalf("write terminal override: %v", err)
+	}
+
+	loaded, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if !loaded.Security.EnableServerTerminal {
+		t.Fatal("explicit server terminal enablement was ignored")
+	}
+}
+
 func TestLoadConfigAllowsExplicitInsecureIsolatedLabOverride(t *testing.T) {
 	t.Setenv("MICROC2_STORAGE_PATH", "")
 	root := t.TempDir()

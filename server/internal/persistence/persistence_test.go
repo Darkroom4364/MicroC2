@@ -43,6 +43,7 @@ func TestOpenBootstrapsAndReopensFileDatabase(t *testing.T) {
 		"payload_bootstrap_credentials",
 		"agent_enrollment_sessions",
 		"payload_enrollment_allocations",
+		"audit_events",
 	}
 	for _, table := range requiredTables {
 		var count int
@@ -68,12 +69,12 @@ func TestOpenBootstrapsAndReopensFileDatabase(t *testing.T) {
 	if err := database.SQL().QueryRow(
 		`SELECT name, checksum_sha256
 		 FROM schema_migrations
-		 WHERE version = 3`,
+		 WHERE version = 4`,
 	).Scan(&migrationName, &checksum); err != nil {
 		t.Fatalf("read latest migration ledger entry: %v", err)
 	}
-	if migrationCount != 3 ||
-		migrationName != "0003_payload_enrollment_allocations.sql" ||
+	if migrationCount != 4 ||
+		migrationName != "0004_structured_audit_events.sql" ||
 		len(checksum) != 64 {
 		t.Fatalf(
 			"unexpected migration ledger: count=%d name=%q checksum=%q",
@@ -124,6 +125,206 @@ func TestOpenBootstrapsAndReopensFileDatabase(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		assertPermissions(t, filepath.Dir(databasePath), databaseDirectoryMode)
 		assertPermissions(t, databasePath, databaseFileMode)
+	}
+}
+
+func TestAuditMigrationBackfillsExistingDurableObjectsAndLinks(t *testing.T) {
+	migrations, err := loadMigrations(embeddedMigrations)
+	if err != nil {
+		t.Fatalf("load migrations: %v", err)
+	}
+	if len(migrations) < 4 {
+		t.Fatalf("loaded %d migrations, want at least 4", len(migrations))
+	}
+
+	databasePath := filepath.Join(t.TempDir(), "microc2.db")
+	legacy, err := open(databasePath, migrations[:3])
+	if err != nil {
+		t.Fatalf("open version-3 database: %v", err)
+	}
+	now := "2026-07-24T12:00:00Z"
+	if _, err := legacy.SQL().Exec(
+		`INSERT INTO listeners (
+			id, name, config_json, config_sha256, status, last_error,
+			created_at, updated_at, deleted_at
+		) VALUES (?, ?, ?, ?, ?, '', ?, ?, NULL)`,
+		"listener-one",
+		"listener",
+		[]byte(`{"id":"listener-one","name":"listener"}`),
+		strings.Repeat("a", 64),
+		"STOPPED",
+		now,
+		now,
+	); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("insert version-3 listener: %v", err)
+	}
+	if _, err := legacy.SQL().Exec(
+		`INSERT INTO listener_events (
+			listener_id, event_type, status, message, occurred_at
+		) VALUES (?, ?, ?, '', ?)`,
+		"listener-one",
+		"created",
+		"STOPPED",
+		now,
+	); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("insert version-3 listener event: %v", err)
+	}
+	if _, err := legacy.SQL().Exec(
+		`INSERT INTO tasks (
+			listener_id, task_id, agent_id, schema_version, task_type,
+			command, timeout_seconds, status, created_at, queued_at,
+			expires_at, legacy_origin
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"listener-one",
+		"task-one",
+		"agent-one",
+		1,
+		"shell",
+		"whoami",
+		30,
+		"queued",
+		now,
+		now,
+		"2026-07-24T12:05:00Z",
+		0,
+	); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("insert version-3 task: %v", err)
+	}
+	if _, err := legacy.SQL().Exec(
+		`INSERT INTO payload_builds (
+			id, payload_id, listener_id, mutation_seed, filename,
+			relative_path, size, sha256, created_at, state,
+			state_detail, provenance_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?)`,
+		"payload-one",
+		"payload-one",
+		"listener-one",
+		"0000000000000001",
+		"agent.bin",
+		"release/payload-one/agent.bin",
+		7,
+		strings.Repeat("b", 64),
+		now,
+		"completed",
+		[]byte(`{}`),
+	); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("insert version-3 payload: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close version-3 database: %v", err)
+	}
+
+	upgraded, err := Open(databasePath)
+	if err != nil {
+		t.Fatalf("upgrade database through audit migration: %v", err)
+	}
+	defer upgraded.Close()
+
+	for table, column := range map[string]string{
+		"tasks":           "created_audit_event_seq",
+		"payload_builds":  "created_audit_event_seq",
+		"listener_events": "audit_event_seq",
+	} {
+		if !tableHasColumn(t, upgraded.SQL(), table, column) {
+			t.Fatalf("table %s is missing audit-link column %s", table, column)
+		}
+	}
+
+	type expectedLink struct {
+		query      string
+		action     string
+		targetKind string
+		targetID   string
+	}
+	for name, expected := range map[string]expectedLink{
+		"task": {
+			query: `SELECT
+					event.action, event.target_kind, event.target_id,
+					event.actor_kind, event.actor_id, event.outcome,
+					event.reason_code
+				FROM tasks AS object
+				JOIN audit_events AS event
+				  ON event.seq = object.created_audit_event_seq
+				WHERE object.listener_id = 'listener-one'
+				  AND object.task_id = 'task-one'`,
+			action:     "task.migrated",
+			targetKind: "task",
+			targetID:   "task-one",
+		},
+		"payload": {
+			query: `SELECT
+					event.action, event.target_kind, event.target_id,
+					event.actor_kind, event.actor_id, event.outcome,
+					event.reason_code
+				FROM payload_builds AS object
+				JOIN audit_events AS event
+				  ON event.seq = object.created_audit_event_seq
+				WHERE object.id = 'payload-one'`,
+			action:     "payload_build.migrated",
+			targetKind: "payload_build",
+			targetID:   "payload-one",
+		},
+		"listener event": {
+			query: `SELECT
+					event.action, event.target_kind, event.target_id,
+					event.actor_kind, event.actor_id, event.outcome,
+					event.reason_code
+				FROM listener_events AS object
+				JOIN audit_events AS event
+				  ON event.seq = object.audit_event_seq
+				WHERE object.listener_id = 'listener-one'`,
+			action:     "listener_event.migrated",
+			targetKind: "listener_event",
+			targetID:   "1",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var action, targetKind, targetID string
+			var actorKind, actorID, outcome, reasonCode string
+			if err := upgraded.SQL().QueryRow(expected.query).Scan(
+				&action,
+				&targetKind,
+				&targetID,
+				&actorKind,
+				&actorID,
+				&outcome,
+				&reasonCode,
+			); err != nil {
+				t.Fatalf("read backfilled audit link: %v", err)
+			}
+			if action != expected.action ||
+				targetKind != expected.targetKind ||
+				targetID != expected.targetID ||
+				actorKind != "system" ||
+				actorID != "migration:0004" ||
+				outcome != "succeeded" ||
+				reasonCode != "pre_audit_state" {
+				t.Fatalf(
+					"backfilled event = (%q, %q, %q, %q, %q, %q, %q)",
+					action,
+					targetKind,
+					targetID,
+					actorKind,
+					actorID,
+					outcome,
+					reasonCode,
+				)
+			}
+		})
+	}
+
+	var auditCount int
+	if err := upgraded.SQL().QueryRow(
+		`SELECT COUNT(*) FROM audit_events`,
+	).Scan(&auditCount); err != nil {
+		t.Fatalf("count backfilled events: %v", err)
+	}
+	if auditCount != 3 {
+		t.Fatalf("backfilled audit event count = %d, want 3", auditCount)
 	}
 }
 
@@ -366,6 +567,47 @@ func newTestMigration(version int, name, statement string) migration {
 
 func sha256ForTest(value string) [32]byte {
 	return sha256.Sum256([]byte(value))
+}
+
+func tableHasColumn(
+	t *testing.T,
+	database *sql.DB,
+	table string,
+	column string,
+) bool {
+	t.Helper()
+	rows, err := database.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		t.Fatalf("inspect table %s: %v", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			columnID     int
+			name         string
+			columnType   string
+			notNull      int
+			defaultValue sql.NullString
+			primaryKey   int
+		)
+		if err := rows.Scan(
+			&columnID,
+			&name,
+			&columnType,
+			&notNull,
+			&defaultValue,
+			&primaryKey,
+		); err != nil {
+			t.Fatalf("scan table %s metadata: %v", table, err)
+		}
+		if name == column {
+			return true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate table %s metadata: %v", table, err)
+	}
+	return false
 }
 
 func assertPermissions(t *testing.T, path string, want os.FileMode) {

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"microc2/server/config"
+	"microc2/server/internal/audit"
 	"microc2/server/internal/behaviour"
 	"microc2/server/internal/common"
 	"microc2/server/internal/filestore"
@@ -59,6 +60,10 @@ func main() {
 	}
 	defer stateDatabase.Close()
 	log.Printf("[CONFIG] Durable state database: %s", stateDatabase.Path())
+	auditStore, err := audit.NewStore(stateDatabase)
+	if err != nil {
+		log.Fatalf("Failed to initialize structured audit store: %v", err)
+	}
 
 	// Set up the operator guard: loopback clients always pass; non-loopback
 	// clients need the configured operator token. Also enforces the origin
@@ -69,6 +74,11 @@ func main() {
 		log.Printf("[SECURITY] No operator token configured: operator API and terminal are restricted to loopback clients")
 	} else {
 		log.Printf("[SECURITY] Operator token configured: non-loopback operator access requires the %s header", handlers.OperatorTokenHeader)
+	}
+	if cfg.Security.EnableServerTerminal {
+		log.Printf("[SECURITY WARNING] Browser-accessible server terminal is explicitly enabled")
+	} else {
+		log.Printf("[SECURITY] Browser-accessible server terminal is disabled")
 	}
 
 	// Configure CORS origins for agent polling routes (wildcard only when
@@ -121,12 +131,17 @@ func main() {
 	}
 
 	// Initialize handlers
-	fileHandlers := api.NewFileHandlers(fileStore)
+	fileHandlers := api.NewAuditedFileHandlers(fileStore, auditStore)
 	staticHandlers, err := web.New(cfg.Server.StaticDir)
 	if err != nil {
 		log.Fatalf("Failed to initialize static handlers: %v", err)
 	}
-	wsHandlers := ws.New(logStreamer, operatorGuard.CheckOrigin)
+	wsHandlers := ws.NewWithTerminalPolicy(
+		logStreamer,
+		operatorGuard.CheckOrigin,
+		cfg.Security.EnableServerTerminal,
+		auditStore,
+	)
 	listenerHandlers := api.NewListenerHandlers(serverManager.GetListenerManager())
 
 	// Initialize payload handler

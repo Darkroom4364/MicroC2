@@ -2,11 +2,13 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"microc2/server/internal/audit"
 	"microc2/server/internal/behaviour"
 	"microc2/server/internal/common"
 	"microc2/server/internal/listeners"
@@ -156,6 +158,104 @@ func TestOperatorAPITypedTaskCreateListAndCancel(t *testing.T) {
 	}
 	if cancelled.Status != tasks.StatusCancelled || cancelled.CompletedAt == nil {
 		t.Fatalf("unexpected cancelled task: %#v", cancelled)
+	}
+}
+
+func TestOperatorAPITaskMutationsPreserveRequestAuditActor(t *testing.T) {
+	handler, _ := newTestAPIHandler(t, "agent-one")
+	listenersInManager := handler.serverManager.GetListenerManager().ListListeners()
+	if len(listenersInManager) != 1 {
+		t.Fatalf("initial listener count = %d, want 1", len(listenersInManager))
+	}
+	protocol := &actorCapturingTaskProtocol{
+		staticTaskProtocol: staticTaskProtocol{
+			agentID:  "agent-one",
+			lastSeen: time.Now().UTC(),
+			tasks:    make(map[string]tasks.Task),
+		},
+	}
+	listenersInManager[0].Protocol = protocol
+
+	operator := audit.Actor{
+		Kind: audit.ActorOperator,
+		ID:   "shared-token:test-operator",
+	}
+	withOperator := func(request *http.Request) *http.Request {
+		t.Helper()
+		return request.WithContext(audit.WithActor(request.Context(), operator))
+	}
+
+	createRecorder := httptest.NewRecorder()
+	createRequest := withOperator(jsonRequest(
+		t,
+		http.MethodPost,
+		"/api/agents/agent-one/tasks",
+		validTaskRequestBody("typed-secret"),
+	))
+	handler.HandleRequest(createRecorder, createRequest)
+	if createRecorder.Code != http.StatusAccepted {
+		t.Fatalf(
+			"typed create: expected 202, got %d: %s",
+			createRecorder.Code,
+			createRecorder.Body.String(),
+		)
+	}
+	var created tasks.Task
+	if err := json.Unmarshal(createRecorder.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode typed task: %v", err)
+	}
+
+	legacyRecorder := httptest.NewRecorder()
+	legacyRequest := withOperator(jsonRequest(
+		t,
+		http.MethodPost,
+		"/api/agents/command",
+		map[string]string{
+			"agent_id": "agent-one",
+			"command":  "legacy-secret",
+		},
+	))
+	handler.HandleRequest(legacyRecorder, legacyRequest)
+	if legacyRecorder.Code != http.StatusOK {
+		t.Fatalf(
+			"legacy queue: expected 200, got %d: %s",
+			legacyRecorder.Code,
+			legacyRecorder.Body.String(),
+		)
+	}
+
+	cancelRecorder := httptest.NewRecorder()
+	cancelRequest := withOperator(httptest.NewRequest(
+		http.MethodPost,
+		"/api/agents/agent-one/tasks/"+created.ID+"/cancel",
+		nil,
+	))
+	handler.HandleRequest(cancelRecorder, cancelRequest)
+	if cancelRecorder.Code != http.StatusOK {
+		t.Fatalf(
+			"cancel: expected 200, got %d: %s",
+			cancelRecorder.Code,
+			cancelRecorder.Body.String(),
+		)
+	}
+
+	for operation, captured := range map[string][]audit.Actor{
+		"typed create": protocol.createActors,
+		"legacy queue": protocol.legacyActors,
+		"cancellation": protocol.cancelActors,
+	} {
+		if len(captured) != 1 {
+			t.Fatalf("%s captured %d actors, want 1: %#v", operation, len(captured), captured)
+		}
+		if captured[0] != operator {
+			t.Fatalf("%s actor = %#v, want %#v", operation, captured[0], operator)
+		}
+	}
+	if protocol.fallbackCalls != 0 {
+		t.Fatalf(
+			"context-aware protocol used %d context-free fallbacks, want 0",
+			protocol.fallbackCalls,
+		)
 	}
 }
 
@@ -1804,6 +1904,110 @@ func (p *staticTaskProtocol) QueueLegacyShellTask(string, string) (tasks.Task, e
 
 func (p *staticTaskProtocol) AgentLastSeen(agentID string) (time.Time, bool) {
 	return p.lastSeen, agentID == p.agentID
+}
+
+type actorCapturingTaskProtocol struct {
+	staticTaskProtocol
+	createActors  []audit.Actor
+	legacyActors  []audit.Actor
+	cancelActors  []audit.Actor
+	fallbackCalls int
+	nextID        int
+}
+
+func (p *actorCapturingTaskProtocol) CreateTask(
+	string,
+	tasks.CreateRequest,
+) (tasks.Task, error) {
+	p.fallbackCalls++
+	return tasks.Task{}, errors.New("context-free typed task creation used")
+}
+
+func (p *actorCapturingTaskProtocol) CreateTaskContext(
+	ctx context.Context,
+	agentID string,
+	request tasks.CreateRequest,
+) (tasks.Task, error) {
+	actor, ok := audit.ActorFromContext(ctx)
+	if !ok {
+		return tasks.Task{}, errors.New("typed task creation lost audit actor")
+	}
+	p.createActors = append(p.createActors, actor)
+	return p.captureTask(agentID, request), nil
+}
+
+func (p *actorCapturingTaskProtocol) QueueLegacyShellTask(
+	string,
+	string,
+) (tasks.Task, error) {
+	p.fallbackCalls++
+	return tasks.Task{}, errors.New("context-free legacy task queue used")
+}
+
+func (p *actorCapturingTaskProtocol) QueueLegacyShellTaskContext(
+	ctx context.Context,
+	agentID, command string,
+) (tasks.Task, error) {
+	actor, ok := audit.ActorFromContext(ctx)
+	if !ok {
+		return tasks.Task{}, errors.New("legacy task queue lost audit actor")
+	}
+	p.legacyActors = append(p.legacyActors, actor)
+	return p.captureTask(agentID, tasks.CreateRequest{
+		SchemaVersion:  tasks.SchemaVersion,
+		Type:           tasks.TypeShell,
+		Arguments:      tasks.ShellArguments{Command: command},
+		TimeoutSeconds: tasks.DefaultTimeoutSeconds,
+	}), nil
+}
+
+func (p *actorCapturingTaskProtocol) CancelTask(
+	string,
+	string,
+) (tasks.Task, error) {
+	p.fallbackCalls++
+	return tasks.Task{}, errors.New("context-free task cancellation used")
+}
+
+func (p *actorCapturingTaskProtocol) CancelTaskContext(
+	ctx context.Context,
+	agentID, taskID string,
+) (tasks.Task, error) {
+	actor, ok := audit.ActorFromContext(ctx)
+	if !ok {
+		return tasks.Task{}, errors.New("task cancellation lost audit actor")
+	}
+	task, err := p.GetTask(agentID, taskID)
+	if err != nil {
+		return tasks.Task{}, err
+	}
+	p.cancelActors = append(p.cancelActors, actor)
+	completedAt := time.Now().UTC()
+	task.Status = tasks.StatusCancelled
+	task.CompletedAt = &completedAt
+	p.tasks[taskID] = task
+	return task, nil
+}
+
+func (p *actorCapturingTaskProtocol) captureTask(
+	agentID string,
+	request tasks.CreateRequest,
+) tasks.Task {
+	p.nextID++
+	now := time.Now().UTC()
+	task := tasks.Task{
+		SchemaVersion:  tasks.SchemaVersion,
+		ID:             fmt.Sprintf("captured-task-%d", p.nextID),
+		AgentID:        agentID,
+		Type:           request.Type,
+		Arguments:      request.Arguments,
+		TimeoutSeconds: request.TimeoutSeconds,
+		Status:         tasks.StatusQueued,
+		CreatedAt:      now,
+		QueuedAt:       now,
+	}
+	p.tasks[task.ID] = task
+	return task
 }
 
 func xorHex(data, key string) string {

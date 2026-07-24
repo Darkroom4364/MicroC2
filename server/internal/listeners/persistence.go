@@ -6,17 +6,19 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"microc2/server/internal/audit"
 )
 
-// ListenerEvent is an append-only record of a listener lifecycle transition.
-// Operator identity and causal audit metadata are intentionally deferred to
-// issue #100.
+// ListenerEvent is the compatibility lifecycle projection. Each new durable
+// row is linked to the richer actor-aware audit event committed with it.
 type ListenerEvent struct {
 	Sequence   int64          `json:"sequence"`
 	ListenerID string         `json:"listener_id"`
@@ -26,16 +28,24 @@ type ListenerEvent struct {
 	OccurredAt time.Time      `json:"occurred_at"`
 }
 
-func (m *ListenerManager) recordListenerCreated(config ListenerConfig) error {
+func (m *ListenerManager) recordListenerCreated(
+	ctx context.Context,
+	config ListenerConfig,
+) error {
 	return m.insertDurableListener(
+		ctx,
 		config,
 		"created",
 		"",
 	)
 }
 
-func (m *ListenerManager) recordListenerImported(config ListenerConfig) error {
+func (m *ListenerManager) recordListenerImported(
+	ctx context.Context,
+	config ListenerConfig,
+) error {
 	return m.insertDurableListener(
+		ctx,
 		config,
 		"imported",
 		"imported saved listener configuration",
@@ -43,6 +53,7 @@ func (m *ListenerManager) recordListenerImported(config ListenerConfig) error {
 }
 
 func (m *ListenerManager) insertDurableListener(
+	ctx context.Context,
 	config ListenerConfig,
 	eventType string,
 	message string,
@@ -55,7 +66,10 @@ func (m *ListenerManager) insertDurableListener(
 		return err
 	}
 	now := m.timestamp()
-	tx, err := m.database.SQL().BeginTx(context.Background(), nil)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	tx, err := m.database.SQL().BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -76,6 +90,15 @@ func (m *ListenerManager) insertDurableListener(
 	); err != nil {
 		return err
 	}
+	auditEvent, err := m.appendListenerAuditTx(
+		ctx,
+		tx,
+		config.ID,
+		eventType,
+	)
+	if err != nil {
+		return err
+	}
 	if err := insertListenerEvent(
 		tx,
 		config.ID,
@@ -83,6 +106,7 @@ func (m *ListenerManager) insertDurableListener(
 		StatusStopped,
 		message,
 		now,
+		auditEvent.Sequence,
 	); err != nil {
 		return err
 	}
@@ -254,6 +278,19 @@ func (m *ListenerManager) loadAndRecoverDurableListeners() (
 				record.id,
 			)
 		}
+		auditEvent, err := m.appendListenerAuditTx(
+			context.Background(),
+			tx,
+			record.id,
+			"recovered_stopped",
+		)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf(
+				"audit durable listener %s recovery: %w",
+				record.id,
+				err,
+			)
+		}
 		if err := insertListenerEvent(
 			tx,
 			record.id,
@@ -261,6 +298,7 @@ func (m *ListenerManager) loadAndRecoverDurableListeners() (
 			StatusStopped,
 			"listener recovered as stopped after server restart",
 			now,
+			auditEvent.Sequence,
 		); err != nil {
 			return nil, nil, nil, fmt.Errorf(
 				"record durable listener %s recovery: %w",
@@ -282,6 +320,7 @@ func (m *ListenerManager) loadAndRecoverDurableListeners() (
 }
 
 func (m *ListenerManager) recordListenerState(
+	ctx context.Context,
 	listenerID string,
 	status ListenerStatus,
 	eventType string,
@@ -291,8 +330,11 @@ func (m *ListenerManager) recordListenerState(
 	if m.database == nil {
 		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	now := m.timestamp()
-	tx, err := m.database.SQL().BeginTx(context.Background(), nil)
+	tx, err := m.database.SQL().BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -331,6 +373,15 @@ func (m *ListenerManager) recordListenerState(
 	if affected != 1 {
 		return fmt.Errorf("listener %s has no durable record", listenerID)
 	}
+	auditEvent, err := m.appendListenerAuditTx(
+		ctx,
+		tx,
+		listenerID,
+		eventType,
+	)
+	if err != nil {
+		return err
+	}
 	if err := insertListenerEvent(
 		tx,
 		listenerID,
@@ -338,6 +389,7 @@ func (m *ListenerManager) recordListenerState(
 		status,
 		message,
 		now,
+		auditEvent.Sequence,
 	); err != nil {
 		return err
 	}
@@ -432,16 +484,79 @@ func insertListenerEvent(
 	status ListenerStatus,
 	message string,
 	occurredAt string,
+	auditEventSequence int64,
 ) error {
 	_, err := executor.Exec(
 		`INSERT INTO listener_events (
-			listener_id, event_type, status, message, occurred_at
-		) VALUES (?, ?, ?, ?, ?)`,
+			listener_id, event_type, status, message, occurred_at,
+			audit_event_seq
+		) VALUES (?, ?, ?, ?, ?, ?)`,
 		listenerID,
 		eventType,
 		string(status),
 		message,
 		occurredAt,
+		auditEventSequence,
 	)
 	return err
+}
+
+func (m *ListenerManager) appendListenerAuditTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	listenerID string,
+	eventType string,
+) (audit.Event, error) {
+	if m.auditStore == nil {
+		return audit.Event{}, errors.New("listener audit store is unavailable")
+	}
+	actor := audit.ActorOr(ctx, audit.DefaultSystemActor())
+	action, outcome, reasonCode := listenerAuditDescriptor(eventType)
+	route := "internal:listener"
+	if actor.Kind == audit.ActorOperator {
+		switch eventType {
+		case "created":
+			route = "POST /api/listeners/create"
+		case "started":
+			route = "POST /api/listeners/{listener_id}/start"
+		case "stopped":
+			route = "POST /api/listeners/{listener_id}/stop"
+		case "deleted":
+			route = "DELETE /api/listeners/{listener_id}"
+		}
+	}
+	return m.auditStore.AppendTx(ctx, tx, audit.Input{
+		Actor:      actor,
+		Action:     action,
+		Route:      route,
+		Target:     audit.Target{Kind: "listener", ID: listenerID},
+		Outcome:    outcome,
+		ReasonCode: reasonCode,
+		ListenerID: listenerID,
+	})
+}
+
+func listenerAuditDescriptor(
+	eventType string,
+) (string, audit.Outcome, string) {
+	switch eventType {
+	case "created":
+		return "listener.create", audit.OutcomeSucceeded, ""
+	case "imported":
+		return "listener.import", audit.OutcomeSucceeded, ""
+	case "started":
+		return "listener.start", audit.OutcomeSucceeded, ""
+	case "stopped":
+		return "listener.stop", audit.OutcomeSucceeded, ""
+	case "deleted":
+		return "listener.delete", audit.OutcomeSucceeded, ""
+	case "creation_failed":
+		return "listener.create", audit.OutcomeFailed, "creation_failed"
+	case "recovered_stopped":
+		return "listener.recover", audit.OutcomeSucceeded, "server_restart"
+	case "error":
+		return "listener.error", audit.OutcomeFailed, "runtime_error"
+	default:
+		return "listener.lifecycle", audit.OutcomeSucceeded, ""
+	}
 }

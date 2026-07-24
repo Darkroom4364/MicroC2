@@ -69,11 +69,32 @@ func NewTerminalHandler(checkOrigin func(*http.Request) bool) *TerminalHandler {
 //   - Terminal session started and commands processed until disconnection
 //   - Resources properly cleaned up when the connection is closed
 func (h *TerminalHandler) HandleConnection(w http.ResponseWriter, r *http.Request) {
+	h.HandleConnectionWithLifecycle(w, r, nil, nil)
+}
+
+// HandleConnectionWithLifecycle handles a terminal connection while allowing
+// the guarded operator layer to durably record the point at which the
+// WebSocket has actually opened and the point at which it closes. If onOpen
+// fails, the connection closes before any terminal command is read.
+func (h *TerminalHandler) HandleConnectionWithLifecycle(
+	w http.ResponseWriter,
+	r *http.Request,
+	onOpen func() error,
+	onClose func(),
+) {
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
 	defer conn.Close()
+	if onOpen != nil {
+		if err := onOpen(); err != nil {
+			return
+		}
+	}
+	if onClose != nil {
+		defer onClose()
+	}
 
 	session := &TerminalSession{
 		WorkingDir: os.Getenv("HOME"),

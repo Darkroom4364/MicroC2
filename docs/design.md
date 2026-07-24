@@ -14,7 +14,7 @@ sequencing, see [roadmap.md](roadmap.md).
 
 - Keep the core small enough to understand, test, and extend.
 - Prefer stable lifecycle behavior over adding more protocols too early.
-- Make risky operator actions explicit, scoped, and eventually audited.
+- Make risky operator actions explicit, scoped, and auditable.
 - Use asynchronous polling and structured server-side queues as the baseline
   communication model.
 - Treat OPSEC as contextual behavior instead of relying only on binary
@@ -128,10 +128,11 @@ Current constraints:
   production multi-user authentication and authorization.
 - Authenticated agent enrollment from #104 is part of the `dev` integration
   line; bearer possession remains the trust boundary.
-- Listener lifecycle history is durable operational state, but structured,
-  actor-aware audit events are not implemented (#100).
-- The server terminal remains a powerful lab-only capability even with the
-  operator guard and origin checks.
+- Structured, actor-aware audit events cover listener, payload, file, terminal,
+  and task lifecycles; shared-token attribution still does not identify an
+  individual human.
+- The server terminal remains a powerful lab-only capability, is disabled by
+  default, and is audited without recording commands or output when enabled.
 
 The server now keeps the route surfaces explicit so they can be hardened
 independently:
@@ -315,19 +316,19 @@ to provide mTLS without CA-backed client-certificate verification.
 The project must still be operated as a lab-only prototype. The Phase 0 safety
 baseline guards operator routes with loopback-or-token access, restricts
 operator WebSocket origins, makes listener CORS explicit, keeps insecure agent
-transport opt-in, validates file-store basenames, and binds agent lifecycle
-requests to durable enrollment sessions through #104. The remaining design
-direction is:
+transport opt-in, validates file-store basenames, binds agent lifecycle
+requests to durable enrollment sessions through #104, and records closed,
+redacted audit events through #100. The remaining design direction is:
 
 - Evolve the shared-token guard into actor-aware authentication and roles before
   multi-user operation.
-- Add audit events for listener, payload, file, terminal, and agent tasking.
+- Build reporting and evidence export on top of the durable audit API.
 - Add target scoping and explicit confirmation metadata for risky future task
   types.
 - Add clear docs for isolated lab deployment.
 
-The Phase 0 route split and lab-safety work are complete in #75 and #78;
-structured governance continues in #100.
+The Phase 0 route split and lab-safety work are complete in #75 and #78; #100
+adds the first structured governance layer on the `dev` integration line.
 
 ## Documentation And Testing Expectations
 
@@ -343,13 +344,15 @@ paths.
 
 ## Near-Term Design Priorities
 
-1. Add causal structured audit events on top of the durable model (#100).
-2. Extend the typed task registry with file transfer and pivot operations now
+1. Extend the typed task registry with file transfer and pivot operations now
    that the v1 shell contract in #98 is stable (#88).
-3. Complete payload profile validation and full build manifests; current #99
+2. Complete payload profile validation and full build manifests; current #99
    provenance is partial P1 work.
+3. Add operator-facing evidence export and reporting on the structured audit
+   foundation.
 
-The data path remains #98 → #97 → #100; #98 is complete and #97 is merged into
-`dev`. Issue #104 closes the authenticated-enrollment boundary for the `dev`
-integration line. This sequence contains no `dev` to `main` promotion, and the
-feature work does not imply that one is ready.
+The data path #98 → #97 → #100 is complete on the `dev` integration line.
+Issue #104 closes the authenticated-enrollment boundary there as well. This
+sequence contains no `dev` to `main` promotion, and the feature work does not
+imply that one is ready. Cross-platform payload-path containment in #108 is an
+explicit promotion gate.

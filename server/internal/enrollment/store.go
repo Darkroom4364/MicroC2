@@ -11,14 +11,24 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strings"
 	"time"
+	"unicode"
 
+	"microc2/server/internal/audit"
 	"microc2/server/internal/persistence"
 )
 
 const maximumIdentifierBytes = 512
+const maximumAuditIdentifierBytes = 128
 
 const sessionIDGenerationAttempts = 8
+
+const (
+	agentSessionRotateAction   = "agent.session.rotate"
+	agentSessionRevokeAction   = "agent.session.revoke"
+	agentSessionReenrollAction = "agent.session.require_reenrollment"
+)
 
 var dummyVerificationValue = sha256.Sum256([]byte("microc2 enrollment dummy verification"))
 
@@ -26,6 +36,7 @@ var dummyVerificationValue = sha256.Sum256([]byte("microc2 enrollment dummy veri
 // persisted HMAC key.
 type Store struct {
 	db     *sql.DB
+	audit  *audit.Store
 	key    [sha256.Size]byte
 	random io.Reader
 	now    func() time.Time
@@ -41,8 +52,13 @@ func NewStore(ctx context.Context, database *persistence.Database) (*Store, erro
 	if err != nil {
 		return nil, err
 	}
+	auditStore, err := audit.NewStore(database)
+	if err != nil {
+		return nil, fmt.Errorf("initialize enrollment audit store: %w", err)
+	}
 	return &Store{
 		db:     database.SQL(),
+		audit:  auditStore,
 		key:    key,
 		random: rand.Reader,
 		now:    time.Now,
@@ -118,7 +134,29 @@ func (s *Store) ActivatePayloadCredential(
 		return fmt.Errorf("begin payload credential activation: %w", err)
 	}
 	defer rollback(tx)
+	if err := s.ActivatePayloadCredentialTx(ctx, tx, activation); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit payload credential activation: %w", err)
+	}
+	return nil
+}
 
+// ActivatePayloadCredentialTx applies bootstrap activation inside a
+// caller-owned transaction so payload completion metadata and its causal audit
+// event can commit atomically with the credential hash.
+func (s *Store) ActivatePayloadCredentialTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	activation PayloadCredentialActivation,
+) error {
+	if err := validateActivation(activation); err != nil {
+		return err
+	}
+	if tx == nil {
+		return ErrInvalidArgument
+	}
 	var listenerID, state string
 	if err := tx.QueryRowContext(
 		ctx,
@@ -145,7 +183,7 @@ func (s *Store) ActivatePayloadCredential(
 		storedMax      int
 		revokedAt      sql.NullString
 	)
-	err = tx.QueryRowContext(
+	err := tx.QueryRowContext(
 		ctx,
 		`SELECT listener_id, bootstrap_sha256, max_sessions, revoked_at
 		 FROM payload_bootstrap_credentials
@@ -159,9 +197,6 @@ func (s *Store) ActivatePayloadCredential(
 			storedMax != activation.MaxSessions ||
 			revokedAt.Valid {
 			return ErrConflict
-		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit idempotent payload credential activation: %w", err)
 		}
 		return nil
 	case !errors.Is(err, sql.ErrNoRows):
@@ -182,9 +217,6 @@ func (s *Store) ActivatePayloadCredential(
 	); err != nil {
 		return fmt.Errorf("activate payload credential: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit payload credential activation: %w", err)
-	}
 	return nil
 }
 
@@ -199,6 +231,30 @@ func (s *Store) RevokePayloadCredential(ctx context.Context, payloadBuildID stri
 		return fmt.Errorf("begin payload credential revocation: %w", err)
 	}
 	defer rollback(tx)
+	if err := s.RevokePayloadCredentialTx(ctx, tx, payloadBuildID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit payload credential revocation: %w", err)
+	}
+	return nil
+}
+
+// RevokePayloadCredentialTx applies payload bootstrap revocation inside a
+// caller-owned transaction. The caller remains responsible for commit or
+// rollback, allowing the revocation and its structured audit event to share
+// one atomic boundary.
+func (s *Store) RevokePayloadCredentialTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	payloadBuildID string,
+) error {
+	if err := validateIdentifier(payloadBuildID); err != nil {
+		return err
+	}
+	if tx == nil {
+		return ErrInvalidArgument
+	}
 
 	var exists int
 	if err := tx.QueryRowContext(
@@ -224,9 +280,6 @@ func (s *Store) RevokePayloadCredential(ctx context.Context, payloadBuildID stri
 		payloadBuildID,
 	); err != nil {
 		return fmt.Errorf("revoke payload credential: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit payload credential revocation: %w", err)
 	}
 	return nil
 }
@@ -550,7 +603,8 @@ func (s *Store) Rotate(
 	listenerID string,
 	agentID string,
 ) (Rotation, error) {
-	if validateIdentifier(listenerID) != nil || validateIdentifier(agentID) != nil {
+	if validateAuditIdentifier(listenerID) != nil ||
+		validateAuditIdentifier(agentID) != nil {
 		return Rotation{}, ErrInvalidArgument
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -570,6 +624,18 @@ func (s *Store) Rotate(
 		return Rotation{}, ErrConflict
 	}
 	if session.pendingGeneration.Valid {
+		if err := s.appendAgentSessionAuditTx(
+			ctx,
+			tx,
+			listenerID,
+			agentID,
+			agentSessionRotateAction,
+			"POST /api/listeners/{listener_id}/agents/{agent_id}/session/rotate",
+			audit.OutcomeNoop,
+			"rotation_already_pending",
+		); err != nil {
+			return Rotation{}, err
+		}
 		if err := tx.Commit(); err != nil {
 			return Rotation{}, fmt.Errorf("commit existing session rotation: %w", err)
 		}
@@ -594,6 +660,18 @@ func (s *Store) Rotate(
 	); err != nil {
 		return Rotation{}, fmt.Errorf("install pending session rotation: %w", err)
 	}
+	if err := s.appendAgentSessionAuditTx(
+		ctx,
+		tx,
+		listenerID,
+		agentID,
+		agentSessionRotateAction,
+		"POST /api/listeners/{listener_id}/agents/{agent_id}/session/rotate",
+		audit.OutcomeSucceeded,
+		"",
+	); err != nil {
+		return Rotation{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return Rotation{}, fmt.Errorf("commit session rotation: %w", err)
 	}
@@ -607,10 +685,16 @@ func (s *Store) RevokeSession(
 	listenerID string,
 	agentID string,
 ) error {
-	if validateIdentifier(listenerID) != nil || validateIdentifier(agentID) != nil {
+	if validateAuditIdentifier(listenerID) != nil ||
+		validateAuditIdentifier(agentID) != nil {
 		return ErrInvalidArgument
 	}
-	result, err := s.db.ExecContext(
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin agent session revocation: %w", err)
+	}
+	defer rollback(tx)
+	result, err := tx.ExecContext(
 		ctx,
 		`UPDATE agent_enrollment_sessions
 		 SET revoked_at = COALESCE(revoked_at, ?),
@@ -630,6 +714,21 @@ func (s *Store) RevokeSession(
 	if !affectedAny(result) {
 		return ErrNotFound
 	}
+	if err := s.appendAgentSessionAuditTx(
+		ctx,
+		tx,
+		listenerID,
+		agentID,
+		agentSessionRevokeAction,
+		"POST /api/listeners/{listener_id}/agents/{agent_id}/session/revoke",
+		audit.OutcomeSucceeded,
+		"",
+	); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit agent session revocation: %w", err)
+	}
 	return nil
 }
 
@@ -641,11 +740,17 @@ func (s *Store) RequireReenrollment(
 	listenerID string,
 	agentID string,
 ) error {
-	if validateIdentifier(listenerID) != nil || validateIdentifier(agentID) != nil {
+	if validateAuditIdentifier(listenerID) != nil ||
+		validateAuditIdentifier(agentID) != nil {
 		return ErrInvalidArgument
 	}
 	now := formatTimestamp(s.now())
-	result, err := s.db.ExecContext(
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin agent re-enrollment requirement: %w", err)
+	}
+	defer rollback(tx)
+	result, err := tx.ExecContext(
 		ctx,
 		`UPDATE agent_enrollment_sessions
 		 SET reenrollment_required_at = COALESCE(reenrollment_required_at, ?),
@@ -663,6 +768,50 @@ func (s *Store) RequireReenrollment(
 	}
 	if !affectedAny(result) {
 		return ErrNotFound
+	}
+	if err := s.appendAgentSessionAuditTx(
+		ctx,
+		tx,
+		listenerID,
+		agentID,
+		agentSessionReenrollAction,
+		"POST /api/listeners/{listener_id}/agents/{agent_id}/session/re-enroll",
+		audit.OutcomeSucceeded,
+		"",
+	); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit agent re-enrollment requirement: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) appendAgentSessionAuditTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	listenerID string,
+	agentID string,
+	action string,
+	route string,
+	outcome audit.Outcome,
+	reasonCode string,
+) error {
+	if s.audit == nil {
+		return errors.New("agent session audit store is unavailable")
+	}
+	_, err := s.audit.AppendTx(ctx, tx, audit.Input{
+		Actor:      audit.ActorOr(ctx, audit.DefaultOperatorActor()),
+		Action:     action,
+		Route:      route,
+		Target:     audit.Target{Kind: "agent", ID: agentID},
+		Outcome:    outcome,
+		ReasonCode: reasonCode,
+		ListenerID: listenerID,
+		AgentID:    agentID,
+	})
+	if err != nil {
+		return fmt.Errorf("record %s audit event: %w", action, err)
 	}
 	return nil
 }
@@ -958,6 +1107,20 @@ func validateActivation(activation PayloadCredentialActivation) error {
 func validateIdentifier(value string) error {
 	if len(value) == 0 || len(value) > maximumIdentifierBytes {
 		return ErrInvalidArgument
+	}
+	return nil
+}
+
+func validateAuditIdentifier(value string) error {
+	if validateIdentifier(value) != nil ||
+		len(value) > maximumAuditIdentifierBytes ||
+		value != strings.TrimSpace(value) {
+		return ErrInvalidArgument
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return ErrInvalidArgument
+		}
 	}
 	return nil
 }

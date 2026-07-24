@@ -2,9 +2,11 @@ package behaviour
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"microc2/server/internal/audit"
 	"microc2/server/internal/common"
 	"microc2/server/internal/tasks"
 	"net/http"
@@ -758,6 +760,89 @@ func TestHTTPPollingProtocolRejectsTraversalUploadFilename(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected traversal upload filename 400, got %d: %s", rec.Code, rec.Body.String())
 	}
+}
+
+func TestHTTPPollingProtocolContextTaskAdaptersPreserveOperatorActor(t *testing.T) {
+	store := &contextCapturingTaskStore{Store: tasks.NewStore()}
+	protocol := newHTTPPollingProtocol(
+		common.BaseProtocolConfig{UploadDir: t.TempDir(), Port: "0"},
+		store,
+		nil,
+		"",
+	)
+	operator := audit.Actor{Kind: audit.ActorOperator, ID: "operator-test"}
+	ctx := audit.WithActor(context.Background(), operator)
+	expiresIn := tasks.DefaultExpiresIn
+
+	typed, err := protocol.CreateTaskContext(
+		ctx,
+		"agent-one",
+		tasks.CreateRequest{
+			SchemaVersion:    tasks.SchemaVersion,
+			Type:             tasks.TypeShell,
+			Arguments:        tasks.ShellArguments{Command: "whoami"},
+			TimeoutSeconds:   tasks.DefaultTimeoutSeconds,
+			ExpiresInSeconds: &expiresIn,
+		},
+	)
+	if err != nil {
+		t.Fatalf("create context-aware typed task: %v", err)
+	}
+	if store.createActor != operator {
+		t.Fatalf("typed task actor=%#v, want %#v", store.createActor, operator)
+	}
+	if _, err := protocol.QueueLegacyShellTaskContext(
+		ctx,
+		"agent-one",
+		"hostname",
+	); err != nil {
+		t.Fatalf("create context-aware legacy task: %v", err)
+	}
+	if store.legacyActor != operator {
+		t.Fatalf("legacy task actor=%#v, want %#v", store.legacyActor, operator)
+	}
+	if _, err := protocol.CancelTaskContext(
+		ctx,
+		"agent-one",
+		typed.ID,
+	); err != nil {
+		t.Fatalf("cancel context-aware task: %v", err)
+	}
+	if store.cancelActor != operator {
+		t.Fatalf("cancel actor=%#v, want %#v", store.cancelActor, operator)
+	}
+}
+
+type contextCapturingTaskStore struct {
+	*tasks.Store
+	createActor audit.Actor
+	legacyActor audit.Actor
+	cancelActor audit.Actor
+}
+
+func (s *contextCapturingTaskStore) CreateContext(
+	ctx context.Context,
+	agentID string,
+	request tasks.CreateRequest,
+) (tasks.Task, error) {
+	s.createActor, _ = audit.ActorFromContext(ctx)
+	return s.Store.Create(agentID, request)
+}
+
+func (s *contextCapturingTaskStore) CreateLegacyShellContext(
+	ctx context.Context,
+	agentID, command string,
+) (tasks.Task, error) {
+	s.legacyActor, _ = audit.ActorFromContext(ctx)
+	return s.Store.CreateLegacyShell(agentID, command)
+}
+
+func (s *contextCapturingTaskStore) CancelContext(
+	ctx context.Context,
+	agentID, taskID string,
+) (tasks.Task, error) {
+	s.cancelActor, _ = audit.ActorFromContext(ctx)
+	return s.Store.Cancel(agentID, taskID)
 }
 
 func xorHex(data, key string) string {

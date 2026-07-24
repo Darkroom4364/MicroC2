@@ -31,15 +31,19 @@ type Config struct {
 	} `yaml:"communication"`
 
 	Security struct {
-		EnableCORS     bool     `yaml:"enableCORS"`
-		CORSOrigins    []string `yaml:"corsOrigins"`
-		AgentTransport struct {
+		EnableCORS bool `yaml:"enableCORS"`
+		// EnableServerTerminal permits the browser-accessible shell on the
+		// server host. Its secure default is false.
+		EnableServerTerminal bool     `yaml:"enableServerTerminal"`
+		CORSOrigins          []string `yaml:"corsOrigins"`
+		AgentTransport       struct {
 			// AllowInsecureIsolatedLab permits plaintext HTTP agent listeners.
 			// The secure production default is false.
 			AllowInsecureIsolatedLab bool `yaml:"allowInsecureIsolatedLab"`
 		} `yaml:"agentTransport"`
-		// OperatorToken protects the operator API and server terminal for
-		// non-loopback clients. Empty means loopback-only operator access.
+		// OperatorToken protects the operator API and, when explicitly enabled,
+		// the server terminal for non-loopback clients. Empty means
+		// loopback-only operator access.
 		// Can also be set via the MICROC2_OPERATOR_TOKEN environment variable.
 		OperatorToken string `yaml:"operatorToken"`
 		// OperatorAllowedOrigins lists origins allowed to call operator APIs

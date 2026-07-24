@@ -942,7 +942,44 @@ func (p *HTTPPollingProtocol) QueueLegacyShellTask(agentID, command string) (tas
 	return p.taskStore.CreateLegacyShell(agentID, command)
 }
 
+// QueueLegacyShellTaskContext preserves the authenticated operator actor for
+// durable audit records while retaining the legacy adapter surface.
+func (p *HTTPPollingProtocol) QueueLegacyShellTaskContext(
+	ctx context.Context,
+	agentID, command string,
+) (tasks.Task, error) {
+	if store, ok := p.taskStore.(interface {
+		CreateLegacyShellContext(
+			context.Context,
+			string,
+			string,
+		) (tasks.Task, error)
+	}); ok {
+		return store.CreateLegacyShellContext(ctx, agentID, command)
+	}
+	return p.taskStore.CreateLegacyShell(agentID, command)
+}
+
 func (p *HTTPPollingProtocol) CreateTask(agentID string, createRequest tasks.CreateRequest) (tasks.Task, error) {
+	return p.taskStore.Create(agentID, createRequest)
+}
+
+// CreateTaskContext preserves the authenticated operator actor for durable
+// task queue audit records.
+func (p *HTTPPollingProtocol) CreateTaskContext(
+	ctx context.Context,
+	agentID string,
+	createRequest tasks.CreateRequest,
+) (tasks.Task, error) {
+	if store, ok := p.taskStore.(interface {
+		CreateContext(
+			context.Context,
+			string,
+			tasks.CreateRequest,
+		) (tasks.Task, error)
+	}); ok {
+		return store.CreateContext(ctx, agentID, createRequest)
+	}
 	return p.taskStore.Create(agentID, createRequest)
 }
 
@@ -991,6 +1028,24 @@ func (p *HTTPPollingProtocol) ListTaskSummariesPage(
 }
 
 func (p *HTTPPollingProtocol) CancelTask(agentID, taskID string) (tasks.Task, error) {
+	return p.taskStore.Cancel(agentID, taskID)
+}
+
+// CancelTaskContext preserves the authenticated operator actor for durable
+// task cancellation audit records.
+func (p *HTTPPollingProtocol) CancelTaskContext(
+	ctx context.Context,
+	agentID, taskID string,
+) (tasks.Task, error) {
+	if store, ok := p.taskStore.(interface {
+		CancelContext(
+			context.Context,
+			string,
+			string,
+		) (tasks.Task, error)
+	}); ok {
+		return store.CancelContext(ctx, agentID, taskID)
+	}
 	return p.taskStore.Cancel(agentID, taskID)
 }
 

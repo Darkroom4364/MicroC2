@@ -1,6 +1,7 @@
 package api
 
 import (
+	"microc2/server/internal/audit"
 	"microc2/server/internal/enrollment"
 	"microc2/server/internal/filestore"
 	"microc2/server/internal/listeners" // Updated from `networking`
@@ -11,6 +12,8 @@ import (
 // APIHandler handles API requests and responses
 type APIHandler struct {
 	serverManager *communication.ServerManager
+	audit         *audit.Store
+	auditErr      error
 }
 
 // FileHandlers manages HTTP endpoints for file operations
@@ -18,6 +21,7 @@ type APIHandler struct {
 // using the underlying filestore system.
 type FileHandlers struct {
 	fileStore *filestore.FileStore
+	audit     *audit.Store
 }
 
 // ListenerHandlers manages HTTP handlers for listener operations

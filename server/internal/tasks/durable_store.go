@@ -11,6 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"microc2/server/internal/audit"
 	"microc2/server/internal/persistence"
 
 	"github.com/google/uuid"
@@ -32,6 +33,7 @@ type LegacyResult struct {
 type DurableStore struct {
 	mu               sync.Mutex
 	db               *persistence.Database
+	audit            *audit.Store
 	listenerID       string
 	now              func() time.Time
 	dispatchLease    time.Duration
@@ -75,8 +77,13 @@ func newDurableStoreWithOptions(
 	if maxTasksPerAgent <= 0 {
 		maxTasksPerAgent = MaxTaskHistoryPerAgent
 	}
+	auditStore, err := audit.NewStore(db)
+	if err != nil {
+		return nil, fmt.Errorf("initialize durable task audit store: %w", err)
+	}
 	return &DurableStore{
 		db:               db,
+		audit:            auditStore,
 		listenerID:       listenerID,
 		now:              now,
 		dispatchLease:    dispatchLease,
@@ -85,12 +92,32 @@ func newDurableStoreWithOptions(
 }
 
 func (s *DurableStore) Create(agentID string, request CreateRequest) (Task, error) {
-	return s.create(agentID, request, false)
+	return s.CreateContext(context.Background(), agentID, request)
+}
+
+// CreateContext creates a task with the trusted operator actor attached by the
+// operator authentication boundary. Create remains for compatibility and
+// records an explicit unspecified operator actor.
+func (s *DurableStore) CreateContext(
+	ctx context.Context,
+	agentID string,
+	request CreateRequest,
+) (Task, error) {
+	return s.create(ctx, agentID, request, false)
 }
 
 func (s *DurableStore) CreateLegacyShell(agentID, command string) (Task, error) {
+	return s.CreateLegacyShellContext(context.Background(), agentID, command)
+}
+
+// CreateLegacyShellContext is the actor-aware form of the deprecated shell
+// task adapter.
+func (s *DurableStore) CreateLegacyShellContext(
+	ctx context.Context,
+	agentID, command string,
+) (Task, error) {
 	expiresIn := DefaultExpiresIn
-	return s.create(agentID, CreateRequest{
+	return s.create(ctx, agentID, CreateRequest{
 		SchemaVersion:    SchemaVersion,
 		Type:             TypeShell,
 		Arguments:        ShellArguments{Command: command},
@@ -100,6 +127,7 @@ func (s *DurableStore) CreateLegacyShell(agentID, command string) (Task, error) 
 }
 
 func (s *DurableStore) create(
+	ctx context.Context,
 	agentID string,
 	request CreateRequest,
 	legacyOrigin bool,
@@ -114,7 +142,9 @@ func (s *DurableStore) create(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	ctx := context.Background()
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	tx, err := s.db.SQL().BeginTx(ctx, nil)
 	if err != nil {
 		return Task{}, fmt.Errorf("begin durable task create: %w", err)
@@ -135,6 +165,19 @@ func (s *DurableStore) create(
 	}
 	expiresAt := now.Add(time.Duration(expiresIn) * time.Second)
 	taskID := uuid.NewString()
+	queuedEvent, err := s.audit.AppendTx(ctx, tx, audit.Input{
+		Actor:      audit.ActorOr(ctx, audit.DefaultOperatorActor()),
+		Action:     "task.queued",
+		Route:      taskQueueAuditRoute(legacyOrigin),
+		Target:     audit.Target{Kind: "task", ID: taskID},
+		Outcome:    audit.OutcomeSucceeded,
+		ListenerID: s.listenerID,
+		AgentID:    agentID,
+		TaskID:     taskID,
+	})
+	if err != nil {
+		return Task{}, fmt.Errorf("record durable task queue audit event: %w", err)
+	}
 	// The statement is static and every request-derived value is bound through
 	// SQLite parameters.
 	// foxguard: ignore[go/taint-sql-injection]
@@ -142,8 +185,9 @@ func (s *DurableStore) create(
 		ctx,
 		`INSERT INTO tasks (
 			listener_id, task_id, agent_id, schema_version, task_type, command,
-			timeout_seconds, status, created_at, queued_at, expires_at, legacy_origin
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			timeout_seconds, status, created_at, queued_at, expires_at,
+			legacy_origin, created_audit_event_seq
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		s.listenerID,
 		taskID,
 		agentID,
@@ -156,6 +200,7 @@ func (s *DurableStore) create(
 		formatDurableTime(now),
 		formatDurableTime(expiresAt),
 		boolToSQLite(legacyOrigin),
+		queuedEvent.Sequence,
 	); err != nil {
 		return Task{}, fmt.Errorf("insert durable task: %w", err)
 	}
@@ -168,6 +213,58 @@ func (s *DurableStore) create(
 		return Task{}, fmt.Errorf("commit durable task create: %w", err)
 	}
 	return record.task, nil
+}
+
+func taskQueueAuditRoute(legacyOrigin bool) string {
+	if legacyOrigin {
+		return "/api/agents/{agent_id}/command"
+	}
+	return "/api/agents/{agent_id}/tasks"
+}
+
+func taskAgentAuditRoute(action string, legacyOrigin bool) string {
+	switch action {
+	case "task.dispatched", "task.redelivered":
+		if legacyOrigin {
+			return "/api/agent/{agent_id}/command"
+		}
+		return "/api/agent/{agent_id}/tasks"
+	case "task.running":
+		return "/api/agent/{agent_id}/tasks/{task_id}/status"
+	case "task.result_received":
+		if legacyOrigin {
+			return "/api/agent/{agent_id}/result"
+		}
+		return "/api/agent/{agent_id}/results"
+	default:
+		return "internal:task_store"
+	}
+}
+
+func (s *DurableStore) appendTaskAuditTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	actor audit.Actor,
+	action string,
+	route string,
+	record durableTaskRecord,
+) error {
+	causationSequence := record.createdAuditEventSeq
+	_, err := s.audit.AppendTx(ctx, tx, audit.Input{
+		Actor:             actor,
+		Action:            action,
+		Route:             route,
+		Target:            audit.Target{Kind: "task", ID: record.task.ID},
+		Outcome:           audit.OutcomeSucceeded,
+		CausationSequence: &causationSequence,
+		ListenerID:        s.listenerID,
+		AgentID:           record.task.AgentID,
+		TaskID:            record.task.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("record %s audit event: %w", action, err)
+	}
+	return nil
 }
 
 func (s *DurableStore) List(agentID string) ([]Task, error) {
@@ -380,6 +477,16 @@ func (s *DurableStore) dispatchNext(
 		if err != nil {
 			return Task{}, false, err
 		}
+		if err := s.appendTaskAuditTx(
+			ctx,
+			tx,
+			audit.Actor{Kind: audit.ActorAgent, ID: agentID},
+			"task.redelivered",
+			taskAgentAuditRoute("task.redelivered", record.legacyOrigin),
+			record,
+		); err != nil {
+			return Task{}, false, err
+		}
 		if err := tx.Commit(); err != nil {
 			return Task{}, false, fmt.Errorf("commit durable task redelivery: %w", err)
 		}
@@ -418,6 +525,16 @@ func (s *DurableStore) dispatchNext(
 	}
 	record, err = s.getTaskTx(ctx, tx, agentID, record.task.ID)
 	if err != nil {
+		return Task{}, false, err
+	}
+	if err := s.appendTaskAuditTx(
+		ctx,
+		tx,
+		audit.Actor{Kind: audit.ActorAgent, ID: agentID},
+		"task.dispatched",
+		taskAgentAuditRoute("task.dispatched", record.legacyOrigin),
+		record,
+	); err != nil {
 		return Task{}, false, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -501,6 +618,16 @@ func (s *DurableStore) MarkRunning(
 	}
 	record, err = s.getTaskTx(ctx, tx, agentID, taskID)
 	if err != nil {
+		return Task{}, err
+	}
+	if err := s.appendTaskAuditTx(
+		ctx,
+		tx,
+		audit.Actor{Kind: audit.ActorAgent, ID: agentID},
+		"task.running",
+		taskAgentAuditRoute("task.running", record.legacyOrigin),
+		record,
+	); err != nil {
 		return Task{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -621,6 +748,16 @@ func (s *DurableStore) CompleteWithInfo(
 			return Task{}, CompletionInfo{}, err
 		}
 	}
+	if err := s.appendTaskAuditTx(
+		ctx,
+		tx,
+		audit.Actor{Kind: audit.ActorAgent, ID: agentID},
+		"task.result_received",
+		taskAgentAuditRoute("task.result_received", record.legacyOrigin),
+		record,
+	); err != nil {
+		return Task{}, CompletionInfo{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return Task{}, CompletionInfo{}, fmt.Errorf("commit durable task completion: %w", err)
 	}
@@ -629,6 +766,15 @@ func (s *DurableStore) CompleteWithInfo(
 }
 
 func (s *DurableStore) Cancel(agentID, taskID string) (Task, error) {
+	return s.CancelContext(context.Background(), agentID, taskID)
+}
+
+// CancelContext cancels a task with the trusted operator actor attached by the
+// operator authentication boundary.
+func (s *DurableStore) CancelContext(
+	ctx context.Context,
+	agentID, taskID string,
+) (Task, error) {
 	if err := validateIDs(agentID, taskID); err != nil {
 		return Task{}, err
 	}
@@ -636,7 +782,9 @@ func (s *DurableStore) Cancel(agentID, taskID string) (Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	ctx := context.Background()
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	tx, err := s.db.SQL().BeginTx(ctx, nil)
 	if err != nil {
 		return Task{}, fmt.Errorf("begin durable task cancellation: %w", err)
@@ -675,6 +823,16 @@ func (s *DurableStore) Cancel(agentID, taskID string) (Task, error) {
 	}
 	record, err = s.getTaskTx(ctx, tx, agentID, taskID)
 	if err != nil {
+		return Task{}, err
+	}
+	if err := s.appendTaskAuditTx(
+		ctx,
+		tx,
+		audit.ActorOr(ctx, audit.DefaultOperatorActor()),
+		"task.cancelled",
+		"/api/agents/{agent_id}/tasks/{task_id}/cancel",
+		record,
+	); err != nil {
 		return Task{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -799,6 +957,16 @@ func (s *DurableStore) CompleteLegacy(
 
 	record, err = s.getTaskTx(ctx, tx, agentID, record.task.ID)
 	if err != nil {
+		return Task{}, false, err
+	}
+	if err := s.appendTaskAuditTx(
+		ctx,
+		tx,
+		audit.Actor{Kind: audit.ActorAgent, ID: agentID},
+		"task.result_received",
+		taskAgentAuditRoute("task.result_received", true),
+		record,
+	); err != nil {
 		return Task{}, false, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -926,11 +1094,12 @@ func (s *DurableStore) GetLegacyResultsPage(
 }
 
 type durableTaskRecord struct {
-	seq               int64
-	task              Task
-	lastDeliveryAt    *time.Time
-	acceptedRunningAt *time.Time
-	legacyOrigin      bool
+	seq                  int64
+	task                 Task
+	lastDeliveryAt       *time.Time
+	acceptedRunningAt    *time.Time
+	legacyOrigin         bool
+	createdAuditEventSeq int64
 }
 
 // durableTaskSummarySelect intentionally excludes r.stdout and r.stderr. Those
@@ -979,6 +1148,7 @@ const durableTaskSelect = `SELECT
 	t.server_completed_at,
 	t.expires_at,
 	t.legacy_origin,
+	t.created_audit_event_seq,
 	r.schema_version,
 	r.agent_id,
 	r.outcome,
@@ -1097,6 +1267,7 @@ func scanDurableTask(scanner durableRowScanner) (durableTaskRecord, error) {
 	var serverStartedAt, acceptedRunningAt sql.NullString
 	var serverCompletedAt, expiresAt sql.NullString
 	var legacyOrigin int
+	var createdAuditEventSeq sql.NullInt64
 	var resultSchema sql.NullInt64
 	var resultAgentID, resultOutcome sql.NullString
 	var resultStartedAt, resultCompletedAt sql.NullString
@@ -1121,6 +1292,7 @@ func scanDurableTask(scanner durableRowScanner) (durableTaskRecord, error) {
 		&serverCompletedAt,
 		&expiresAt,
 		&legacyOrigin,
+		&createdAuditEventSeq,
 		&resultSchema,
 		&resultAgentID,
 		&resultOutcome,
@@ -1138,6 +1310,12 @@ func scanDurableTask(scanner durableRowScanner) (durableTaskRecord, error) {
 	record.task.Type = Type(taskType)
 	record.task.Status = Status(status)
 	record.legacyOrigin = legacyOrigin != 0
+	if !createdAuditEventSeq.Valid || createdAuditEventSeq.Int64 <= 0 {
+		return durableTaskRecord{}, errors.New(
+			"durable task is missing its causal audit event",
+		)
+	}
+	record.createdAuditEventSeq = createdAuditEventSeq.Int64
 	if record.task.CreatedAt, err = parseDurableTime(createdAt); err != nil {
 		return durableTaskRecord{}, fmt.Errorf("parse task created_at: %w", err)
 	}

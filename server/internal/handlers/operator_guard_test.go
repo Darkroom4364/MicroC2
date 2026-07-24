@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"microc2/server/internal/audit"
 )
 
 const testOperatorToken = "test-token"
@@ -54,6 +56,81 @@ func TestOperatorGuardAllowsRemoteWithToken(t *testing.T) {
 
 	if !called || rec.Code != http.StatusOK {
 		t.Fatalf("expected remote request with valid token to pass, called=%v code=%d", called, rec.Code)
+	}
+}
+
+func TestOperatorGuardPropagatesTrustedLoopbackActor(t *testing.T) {
+	guard := NewOperatorGuard(testOperatorToken, nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/agents/list", nil)
+	req.RemoteAddr = "127.0.0.1:55555"
+	req.Header.Set(OperatorTokenHeader, "wrong-token")
+	req = req.WithContext(audit.WithActor(req.Context(), audit.Actor{
+		Kind: audit.ActorSystem,
+		ID:   "forged-caller-context",
+	}))
+
+	var got audit.Actor
+	guard.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var ok bool
+		got, ok = audit.ActorFromContext(r.Context())
+		if !ok {
+			t.Fatal("guard did not propagate an audit actor")
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})).ServeHTTP(httptest.NewRecorder(), req)
+
+	want := audit.Actor{
+		Kind: audit.ActorOperator,
+		ID:   loopbackOperatorActorID,
+	}
+	if got != want {
+		t.Fatalf("loopback audit actor = %#v, want %#v", got, want)
+	}
+}
+
+func TestOperatorGuardPropagatesTrustedSharedTokenActor(t *testing.T) {
+	guard := NewOperatorGuard(testOperatorToken, nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/agents/list", nil)
+	req.RemoteAddr = "192.168.1.20:55555"
+	req.Header.Set(OperatorTokenHeader, testOperatorToken)
+
+	var got audit.Actor
+	guard.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var ok bool
+		got, ok = audit.ActorFromContext(r.Context())
+		if !ok {
+			t.Fatal("guard did not propagate an audit actor")
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})).ServeHTTP(httptest.NewRecorder(), req)
+
+	want := audit.Actor{
+		Kind: audit.ActorOperator,
+		ID:   sharedTokenOperatorActorID,
+	}
+	if got != want {
+		t.Fatalf("shared-token audit actor = %#v, want %#v", got, want)
+	}
+	if got.ID == testOperatorToken {
+		t.Fatal("operator credential was reused as the audit actor ID")
+	}
+}
+
+func TestOperatorGuardDoesNotPropagateActorWhenAuthorizationFails(t *testing.T) {
+	guard := NewOperatorGuard(testOperatorToken, nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/agents/list", nil)
+	req.RemoteAddr = "192.168.1.20:55555"
+	req.Header.Set(OperatorTokenHeader, "wrong-token")
+
+	called := false
+	guard.Wrap(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		called = true
+	})).ServeHTTP(httptest.NewRecorder(), req)
+	if called {
+		t.Fatal("unauthorized request reached the guarded handler")
+	}
+	if actor, ok := guard.authorizedActor(req); ok || actor != (audit.Actor{}) {
+		t.Fatalf("unauthorized request resolved actor %#v, authorized=%v", actor, ok)
 	}
 }
 
