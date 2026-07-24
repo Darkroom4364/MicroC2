@@ -1,11 +1,13 @@
 package listeners
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	behaviour "microc2/server/internal/behaviour"
 	"microc2/server/internal/common"
@@ -16,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -53,6 +56,39 @@ type ListenerConfig struct {
 	Proxy        *ProxyConfig          `json:"proxy,omitempty"`
 	TLSConfig    *TLSConfig            `json:"tls_config,omitempty"`
 	SOCKS5Config *SOCKS5ListenerConfig `json:"socks5_config,omitempty"`
+}
+
+// ListenerConfigValidationError marks a listener setting that is unsupported
+// or internally inconsistent. API handlers use this type to distinguish a bad
+// operator request from bind, persistence, or other server failures.
+type ListenerConfigValidationError struct {
+	err error
+}
+
+func (err *ListenerConfigValidationError) Error() string {
+	return err.err.Error()
+}
+
+func (err *ListenerConfigValidationError) Unwrap() error {
+	return err.err
+}
+
+func invalidListenerConfig(err error) error {
+	if err == nil {
+		return nil
+	}
+	var validationError *ListenerConfigValidationError
+	if errors.As(err, &validationError) {
+		return err
+	}
+	return &ListenerConfigValidationError{err: err}
+}
+
+// IsListenerConfigValidationError reports whether err identifies a rejected
+// listener setting rather than an operational server failure.
+func IsListenerConfigValidationError(err error) bool {
+	var validationError *ListenerConfigValidationError
+	return errors.As(err, &validationError)
 }
 
 // ProxyConfig holds proxy-related configuration
@@ -98,6 +134,8 @@ type Listener struct {
 	Protocol         common.Protocol
 	transportPolicy  common.AgentTransportPolicy
 	requireAgentAuth bool
+	defaultTLSConfig *TLSConfig
+	staticRoot       string
 	onError          func(error)
 }
 
@@ -173,6 +211,7 @@ func NewListener(config ListenerConfig) (*Listener, error) {
 		nil,
 		common.AgentTransportPolicy{},
 		true,
+		nil,
 		true,
 	)
 }
@@ -187,6 +226,7 @@ func NewListenerForIsolatedLab(config ListenerConfig) (*Listener, error) {
 		nil,
 		common.IsolatedLabAgentTransportPolicy(),
 		false,
+		nil,
 		true,
 	)
 }
@@ -197,9 +237,19 @@ func newListener(
 	database *persistence.Database,
 	transportPolicy common.AgentTransportPolicy,
 	requireAgentAuth bool,
+	defaultTLSConfig *TLSConfig,
 	saveConfig bool,
 ) (*Listener, error) {
 	config.Protocol = strings.ToLower(config.Protocol)
+	if config.BindHost == "" {
+		config.BindHost = "0.0.0.0"
+	}
+	if listenersDir == "" {
+		listenersDir = filepath.Join("static", "listeners")
+	}
+	if err := normalizeAndValidateSupportedListenerSettings(&config); err != nil {
+		return nil, err
+	}
 	if err := validateListenerIdentity(config); err != nil {
 		return nil, err
 	}
@@ -209,11 +259,13 @@ func newListener(
 	); err != nil {
 		return nil, err
 	}
-	if err := validateListenerTLSProtocol(config.Protocol, config.TLSConfig); err != nil {
+	if err := validateListenerTLSProtocol(
+		config.Protocol,
+		config.TLSConfig,
+		defaultTLSConfig,
+		filepath.Dir(listenersDir),
+	); err != nil {
 		return nil, err
-	}
-	if listenersDir == "" {
-		listenersDir = filepath.Join("static", "listeners")
 	}
 	if err := ensurePrivateDirectory(listenersDir); err != nil {
 		return nil, fmt.Errorf("failed to prepare listeners directory: %v", err)
@@ -303,6 +355,8 @@ func newListener(
 		Protocol:         proto,
 		transportPolicy:  transportPolicy,
 		requireAgentAuth: requireAgentAuth,
+		defaultTLSConfig: cloneTLSConfig(defaultTLSConfig),
+		staticRoot:       filepath.Dir(listenersDir),
 	}
 	return l, nil
 }
@@ -412,6 +466,25 @@ func readListenerConfigProjection(path string) ([]byte, error) {
 	return os.ReadFile(path)
 }
 
+func decodeListenerConfigProjection(data []byte) (ListenerConfig, error) {
+	var config ListenerConfig
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&config); err != nil {
+		return ListenerConfig{}, err
+	}
+	var trailing interface{}
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return ListenerConfig{}, errors.New(
+				"listener config must contain exactly one JSON value",
+			)
+		}
+		return ListenerConfig{}, err
+	}
+	return config, nil
+}
+
 func redactedListenerConfig(config ListenerConfig) ListenerConfig {
 	if config.Proxy == nil {
 		return config
@@ -497,6 +570,8 @@ func (l *Listener) Start() error {
 	if err := validateListenerTLSProtocol(
 		l.Config.Protocol,
 		l.Config.TLSConfig,
+		l.defaultTLSConfig,
+		l.staticRoot,
 	); err != nil {
 		return err
 	}
@@ -519,11 +594,19 @@ func (l *Listener) Start() error {
 	if l.Config.BindHost == "" {
 		l.Config.BindHost = "0.0.0.0"
 	}
-	addr := fmt.Sprintf("%s:%d", l.Config.BindHost, l.Config.Port)
+	bindHost := l.Config.BindHost
+	if strings.HasPrefix(bindHost, "[") && strings.HasSuffix(bindHost, "]") {
+		bindHost = strings.TrimSuffix(strings.TrimPrefix(bindHost, "["), "]")
+	}
+	addr := net.JoinHostPort(bindHost, strconv.Itoa(l.Config.Port))
 
 	var tlsConfig *tls.Config
 	if l.usesTLS() {
-		certFile, keyFile := l.tlsCertFiles()
+		certFile, keyFile, err := l.tlsCertFiles()
+		if err != nil {
+			l.Error = err.Error()
+			return err
+		}
 		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 		if err != nil {
 			l.Error = err.Error()
@@ -581,21 +664,302 @@ func (l *Listener) usesTLS() bool {
 	return strings.EqualFold(strings.TrimSpace(l.Config.Protocol), "https")
 }
 
-func validateListenerTLSProtocol(protocol string, tlsConfig *TLSConfig) error {
+func validateListenerTLSProtocol(
+	protocol string,
+	tlsConfig *TLSConfig,
+	defaultTLSConfig *TLSConfig,
+	staticRoot string,
+) error {
 	if strings.EqualFold(strings.TrimSpace(protocol), "http") &&
 		tlsConfig != nil {
 		return errors.New(
 			`listener TLS configuration requires protocol "https"`,
 		)
 	}
+	if !strings.EqualFold(strings.TrimSpace(protocol), "https") {
+		return nil
+	}
+	effective := tlsConfig
+	if effective == nil {
+		effective = defaultTLSConfig
+	}
+	if effective == nil ||
+		strings.TrimSpace(effective.CertFile) == "" ||
+		strings.TrimSpace(effective.KeyFile) == "" {
+		return errors.New(
+			"HTTPS listener requires configured certificate and key files",
+		)
+	}
+	for _, candidate := range []struct {
+		name string
+		path string
+	}{
+		{name: "certificate", path: effective.CertFile},
+		{name: "private key", path: effective.KeyFile},
+	} {
+		within, err := pathWithinDirectory(staticRoot, candidate.path)
+		if err != nil {
+			return fmt.Errorf(
+				"validate HTTPS listener %s path: %w",
+				candidate.name,
+				err,
+			)
+		}
+		if within {
+			return fmt.Errorf(
+				"HTTPS listener %s must be outside the static directory",
+				candidate.name,
+			)
+		}
+	}
+	if _, err := tls.LoadX509KeyPair(
+		effective.CertFile,
+		effective.KeyFile,
+	); err != nil {
+		return fmt.Errorf(
+			"load HTTPS listener certificate and key: %w",
+			err,
+		)
+	}
 	return nil
 }
 
-func (l *Listener) tlsCertFiles() (string, string) {
-	if l.Config.TLSConfig != nil {
-		return l.Config.TLSConfig.CertFile, l.Config.TLSConfig.KeyFile
+func normalizeAndValidateSupportedListenerSettings(
+	config *ListenerConfig,
+) error {
+	if config == nil {
+		return invalidListenerConfig(errors.New("listener configuration is required"))
 	}
-	return "certs/server.crt", "certs/server.key"
+	if err := validateSupportedListenerSettings(*config); err != nil {
+		return err
+	}
+	bindHost, err := NormalizeBindHost(config.BindHost)
+	if err != nil {
+		return invalidListenerConfig(fmt.Errorf(
+			"invalid listener bind host: %w",
+			err,
+		))
+	}
+	config.BindHost = bindHost
+	if len(config.Hosts) == 1 {
+		host, err := NormalizeAdvertisedHost(config.Hosts[0])
+		if err != nil {
+			return invalidListenerConfig(fmt.Errorf(
+				"invalid listener advertised host: %w",
+				err,
+			))
+		}
+		config.Hosts = []string{host}
+	} else if _, err := NormalizeAdvertisedHost(config.BindHost); err != nil {
+		return invalidListenerConfig(fmt.Errorf(
+			"listener hosts[0] is required when bind host cannot be advertised: %w",
+			err,
+		))
+	}
+	return nil
+}
+
+func validateSupportedListenerSettings(config ListenerConfig) error {
+	switch {
+	case len(config.Hosts) > 1:
+		return invalidListenerConfig(errors.New(
+			"listener hosts supports one advertised host; host rotation is not implemented",
+		))
+	case config.HostRotation != "":
+		return invalidListenerConfig(errors.New(
+			"listener host_rotation is not implemented",
+		))
+	case len(config.URIs) != 0:
+		return invalidListenerConfig(errors.New(
+			"listener custom URIs are not implemented",
+		))
+	case len(config.Headers) != 0:
+		return invalidListenerConfig(errors.New(
+			"listener custom headers are not implemented",
+		))
+	case config.UserAgent != "":
+		return invalidListenerConfig(errors.New(
+			"listener user_agent is not implemented; payload builds select the effective user agent",
+		))
+	case config.Proxy != nil:
+		return invalidListenerConfig(errors.New(
+			"listener proxy configuration is not implemented",
+		))
+	case config.SOCKS5Config != nil:
+		return invalidListenerConfig(errors.New(
+			"listener SOCKS5 configuration is not implemented",
+		))
+	}
+	return nil
+}
+
+// NormalizeAdvertisedHost validates and canonicalizes the single endpoint host
+// embedded in payloads. It accepts DNS names and IPv4/IPv6 literals only; URL
+// components such as schemes, ports, paths, and user information are rejected.
+func NormalizeAdvertisedHost(value string) (string, error) {
+	return normalizeListenerHost(value, "advertised host", false)
+}
+
+// NormalizeBindHost validates and canonicalizes the local socket bind host.
+// Wildcard IP addresses are valid for binding, but cannot serve as the
+// listener's advertised endpoint.
+func NormalizeBindHost(value string) (string, error) {
+	return normalizeListenerHost(value, "bind host", true)
+}
+
+func normalizeListenerHost(
+	value string,
+	label string,
+	allowUnspecified bool,
+) (string, error) {
+	if value == "" {
+		return "", fmt.Errorf("%s is required", label)
+	}
+	if value != strings.TrimSpace(value) {
+		return "", fmt.Errorf(
+			"%s must not contain surrounding whitespace",
+			label,
+		)
+	}
+
+	host := value
+	bracketed := false
+	if strings.HasPrefix(host, "[") || strings.HasSuffix(host, "]") {
+		if !strings.HasPrefix(host, "[") || !strings.HasSuffix(host, "]") {
+			return "", fmt.Errorf("%s has mismatched IPv6 brackets", label)
+		}
+		bracketed = true
+		host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsUnspecified() && !allowUnspecified {
+			return "", fmt.Errorf(
+				"%s must not be an unspecified address",
+				label,
+			)
+		}
+		return ip.String(), nil
+	}
+	if bracketed {
+		return "", fmt.Errorf(
+			"only an IPv6 address may use %s brackets",
+			label,
+		)
+	}
+
+	name := strings.TrimSuffix(host, ".")
+	if name == "" || len(name) > 253 {
+		return "", fmt.Errorf(
+			"%s is not a valid DNS name or IP address",
+			label,
+		)
+	}
+	for _, segment := range strings.Split(name, ".") {
+		if len(segment) == 0 || len(segment) > 63 ||
+			!isASCIIAlphaNumeric(segment[0]) ||
+			!isASCIIAlphaNumeric(segment[len(segment)-1]) {
+			return "", fmt.Errorf(
+				"%s is not a valid DNS name or IP address",
+				label,
+			)
+		}
+		for index := 1; index < len(segment)-1; index++ {
+			if !isASCIIAlphaNumeric(segment[index]) && segment[index] != '-' {
+				return "", fmt.Errorf(
+					"%s is not a valid DNS name or IP address",
+					label,
+				)
+			}
+		}
+	}
+	return strings.ToLower(name), nil
+}
+
+func isASCIIAlphaNumeric(value byte) bool {
+	return value >= 'a' && value <= 'z' ||
+		value >= 'A' && value <= 'Z' ||
+		value >= '0' && value <= '9'
+}
+
+func cloneTLSConfig(config *TLSConfig) *TLSConfig {
+	if config == nil {
+		return nil
+	}
+	copy := *config
+	return &copy
+}
+
+func pathWithinDirectory(directory string, candidate string) (bool, error) {
+	if strings.TrimSpace(directory) == "" {
+		return false, nil
+	}
+	directoryPath, err := canonicalPathThroughExisting(directory)
+	if err != nil {
+		return false, err
+	}
+	candidatePath, err := canonicalPathThroughExisting(candidate)
+	if err != nil {
+		return false, err
+	}
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		directoryPath = strings.ToLower(directoryPath)
+		candidatePath = strings.ToLower(candidatePath)
+	}
+	relative, err := filepath.Rel(directoryPath, candidatePath)
+	if err != nil {
+		return false, nil
+	}
+	return relative == "." ||
+		(relative != ".." &&
+			!filepath.IsAbs(relative) &&
+			!strings.HasPrefix(
+				relative,
+				".."+string(filepath.Separator),
+			)), nil
+}
+
+func canonicalPathThroughExisting(path string) (string, error) {
+	absolute, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return "", err
+	}
+
+	current := absolute
+	suffix := make([]string, 0)
+	for {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			for index := len(suffix) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, suffix[index])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", err
+		}
+		suffix = append(suffix, filepath.Base(current))
+		current = parent
+	}
+}
+
+func (l *Listener) tlsCertFiles() (string, string, error) {
+	effective := l.Config.TLSConfig
+	if effective == nil {
+		effective = l.defaultTLSConfig
+	}
+	if effective == nil ||
+		strings.TrimSpace(effective.CertFile) == "" ||
+		strings.TrimSpace(effective.KeyFile) == "" {
+		return "", "", errors.New(
+			"HTTPS listener requires configured certificate and key files",
+		)
+	}
+	return effective.CertFile, effective.KeyFile, nil
 }
 
 // Stop halts the listener operation

@@ -1,11 +1,16 @@
 package main
 
 import (
+	"crypto/tls"
+	"errors"
 	"flag"
+	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"microc2/server/config"
@@ -18,7 +23,6 @@ import (
 	"microc2/server/internal/handlers/web"
 	"microc2/server/internal/handlers/ws"
 	"microc2/server/internal/persistence"
-	"microc2/server/internal/protocols" // Updated from `networking`
 	"microc2/server/internal/websocket"
 	"microc2/server/pkg/communication"
 )
@@ -34,26 +38,45 @@ import (
 //   - Server starts listening on the configured port
 //   - Log files are properly set up and streamed
 func main() {
-	// Set up logging
-	logFile, err := os.OpenFile("server.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	// Parse and validate configuration before opening configured outputs or
+	// creating runtime state.
+	configPath := flag.String("config", "config/settings.yaml", "Path to configuration file")
+	flag.Parse()
+	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to load configuration: %v", err)
+	}
+
+	// Set up logging only after logging.file has been resolved and validated.
+	logFile, err := os.OpenFile(cfg.Logging.File, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		log.Fatalf("Failed to open configured log file: %v", err)
 	}
 	defer logFile.Close()
+	if err := logFile.Chmod(0600); err != nil {
+		log.Fatalf("Failed to secure configured log file: %v", err)
+	}
 
 	// Create and configure log streamer
 	logStreamer := websocket.NewLogStreamer(logFile)
 	log.SetOutput(logStreamer)
 
-	// Parse command line flags
-	configPath := flag.String("config", "config/settings.yaml", "Path to configuration file")
-	flag.Parse()
-
-	// Load configuration
-	cfg, err := config.LoadConfig(*configPath)
-	if err != nil {
-		log.Fatalf("Failed to load configuration: %v", err)
+	httpsAddr := ":" + cfg.Server.Port
+	var httpAddr string
+	if cfg.Server.Redirect.Enabled {
+		httpAddr = ":" + cfg.Server.Redirect.HTTPPort
 	}
+	boundListeners, err := bindServerListeners(
+		httpsAddr,
+		httpAddr,
+		cfg.Server.Redirect.Enabled,
+		net.Listen,
+	)
+	if err != nil {
+		log.Fatalf("Failed to bind configured operator listeners: %v", err)
+	}
+	defer boundListeners.close()
+
 	stateDatabase, err := persistence.Open(cfg.Storage.Path)
 	if err != nil {
 		log.Fatalf("Failed to initialize durable state: %v", err)
@@ -81,12 +104,9 @@ func main() {
 		log.Printf("[SECURITY] Browser-accessible server terminal is disabled")
 	}
 
-	// Configure CORS origins for agent polling routes (wildcard only when
-	// explicitly configured).
-	var corsOrigins []string
-	if cfg.Security.EnableCORS {
-		corsOrigins = cfg.Security.CORSOrigins
-	}
+	// An empty origin list disables cross-origin browser access. The wildcard
+	// remains an explicit escape hatch in the configured list.
+	corsOrigins := cfg.Security.CORSOrigins
 	behaviour.SetDefaultAllowedOrigins(corsOrigins)
 
 	// Create required directories
@@ -107,7 +127,9 @@ func main() {
 		UploadDir:    cfg.Server.UploadDir,
 		Port:         cfg.Server.Port,
 		StaticDir:    cfg.Server.StaticDir,
-		ProtocolType: cfg.Communication.Protocol,
+		ProtocolType: "http",
+		TLSCertFile:  cfg.Server.TLS.CertFile,
+		TLSKeyFile:   cfg.Server.TLS.KeyFile,
 		CORSOrigins:  corsOrigins,
 		Database:     stateDatabase,
 	}
@@ -185,70 +207,38 @@ func main() {
 	apiHandler := api.NewAPIHandler(serverManager)
 	operatorMux.HandleFunc("/api/", apiHandler.HandleRequest)
 
-	// Set up SOCKS5 management routes if protocol is SOCKS5
-	if cfg.Communication.Protocol == "socks5" {
-		if socks5Protocol, ok := serverManager.GetProtocol().(*protocols.SOCKS5Protocol); ok {
-			socks5Handler := api.NewSOCKS5Handler(socks5Protocol)
-			for route, handler := range socks5Handler.RegisterRoutes() {
-				operatorMux.HandleFunc(route, handler)
-			}
-		}
-	}
-
 	// Start the server
-	log.Printf("[STARTUP] Starting server with %s protocol...", cfg.Communication.Protocol)
+	log.Printf("[STARTUP] Starting operator server with authenticated HTTP listener management...")
 	log.Printf("[CONFIG] Upload directory: %s", cfg.Server.UploadDir)
 	log.Printf("[CONFIG] Static directory: %s", cfg.Server.StaticDir)
 	log.Printf("[CONFIG] File Drop directory: %s/file_drop", cfg.Server.StaticDir)
 	log.Printf("[CONFIG] Payloads directory: %s", payloadDir)
-	log.Printf("[NETWORK] Port: %s", cfg.Server.Port)
+	log.Printf("[NETWORK] HTTPS port: %s", cfg.Server.Port)
 
 	// --- HTTPS Support ---
 	certFile := cfg.Server.TLS.CertFile
 	keyFile := cfg.Server.TLS.KeyFile
 
-	// Determine ports based on redirect configuration
-	var httpAddr, httpsAddr string
-	if cfg.Server.Redirect.Enabled {
-		httpAddr = ":" + cfg.Server.Redirect.HTTPPort
-		httpsAddr = ":" + cfg.Server.HTTPSPort
-	} else {
-		// If redirect is disabled, use main port for HTTPS
-		httpsAddr = ":" + cfg.Server.Port
-	}
-
 	// Start HTTP to HTTPS redirect server if enabled
 	if cfg.Server.Redirect.Enabled {
+		redirectHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			target := httpsRedirectTarget(r, cfg.Server.Port)
+			log.Printf("[REDIRECT] %s -> %s", r.URL.String(), target)
+			http.Redirect(w, r, target, http.StatusMovedPermanently)
+		})
+		redirectServer := &http.Server{
+			Addr:              httpAddr,
+			Handler:           redirectHandler,
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       15 * time.Second,
+			WriteTimeout:      15 * time.Second,
+			IdleTimeout:       60 * time.Second,
+		}
 		go func() {
 			log.Printf("[STARTUP] Starting HTTP redirect server on %s -> HTTPS %s", httpAddr, httpsAddr)
-
-			redirectHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				// Build target URL, handling both with and without port in Host header
-				host := r.Host
-				if host == "" {
-					host = "localhost" + httpsAddr
-				}
-
-				// Remove HTTP port and replace with HTTPS port
-				if host == "localhost:"+cfg.Server.Redirect.HTTPPort {
-					host = "localhost" + httpsAddr
-				}
-
-				target := "https://" + host + r.URL.RequestURI()
-				log.Printf("[REDIRECT] %s -> %s", r.URL.String(), target)
-				http.Redirect(w, r, target, http.StatusMovedPermanently)
-			})
-
-			redirectServer := &http.Server{
-				Addr:              httpAddr,
-				Handler:           redirectHandler,
-				ReadHeaderTimeout: 5 * time.Second,
-				ReadTimeout:       15 * time.Second,
-				WriteTimeout:      15 * time.Second,
-				IdleTimeout:       60 * time.Second,
-			}
-			if err := redirectServer.ListenAndServe(); err != nil {
-				log.Printf("[ERROR] HTTP redirect server error: %v", err)
+			if err := redirectServer.Serve(boundListeners.redirect); err != nil &&
+				!errors.Is(err, http.ErrServerClosed) {
+				log.Fatalf("[ERROR] HTTP redirect server error: %v", err)
 			}
 		}()
 	}
@@ -256,18 +246,104 @@ func main() {
 	// Start HTTPS server
 	log.Printf("[STARTUP] Starting HTTPS server on %s ...", httpsAddr)
 	operatorServer := &http.Server{
-		Addr:              httpsAddr,
-		Handler:           operatorGuard.Wrap(operatorMux),
+		Addr:    httpsAddr,
+		Handler: operatorGuard.Wrap(operatorMux),
+		TLSConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
-	if err := operatorServer.ListenAndServeTLS(certFile, keyFile); err != nil {
+	if err := operatorServer.ServeTLS(
+		boundListeners.https,
+		certFile,
+		keyFile,
+	); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("[ERROR] HTTPS server error: %v", err)
 	}
 	// Remove or comment out the old serverManager.Start() call:
 	// if err := serverManager.Start(); err != nil {
 	// 	log.Fatalf("[ERROR] Server error: %v", err)
 	// }
+}
+
+type operatorListeners struct {
+	https    net.Listener
+	redirect net.Listener
+}
+
+func (listeners operatorListeners) close() {
+	if listeners.redirect != nil {
+		_ = listeners.redirect.Close()
+	}
+	if listeners.https != nil {
+		_ = listeners.https.Close()
+	}
+}
+
+func bindServerListeners(
+	httpsAddr string,
+	redirectAddr string,
+	redirectEnabled bool,
+	listen func(network, address string) (net.Listener, error),
+) (operatorListeners, error) {
+	httpsListener, err := listen("tcp", httpsAddr)
+	if err != nil {
+		return operatorListeners{}, fmt.Errorf(
+			"bind HTTPS listener %s: %w",
+			httpsAddr,
+			err,
+		)
+	}
+	listeners := operatorListeners{https: httpsListener}
+	if !redirectEnabled {
+		return listeners, nil
+	}
+
+	redirectListener, err := listen("tcp", redirectAddr)
+	if err != nil {
+		_ = httpsListener.Close()
+		return operatorListeners{}, fmt.Errorf(
+			"bind HTTP redirect listener %s: %w",
+			redirectAddr,
+			err,
+		)
+	}
+	listeners.redirect = redirectListener
+	return listeners, nil
+}
+
+func httpsRedirectTarget(r *http.Request, httpsPort string) string {
+	host := "localhost"
+	if r != nil {
+		host = redirectHostname(r.Host)
+	}
+	requestURI := "/"
+	if r != nil && r.URL != nil {
+		if uri := r.URL.RequestURI(); uri != "" {
+			requestURI = uri
+		}
+	}
+	return "https://" + net.JoinHostPort(host, httpsPort) + requestURI
+}
+
+func redirectHostname(hostport string) string {
+	if hostport == "" {
+		return "localhost"
+	}
+	if host, _, err := net.SplitHostPort(hostport); err == nil {
+		return host
+	}
+	if strings.HasPrefix(hostport, "[") && strings.HasSuffix(hostport, "]") {
+		host := strings.TrimSuffix(strings.TrimPrefix(hostport, "["), "]")
+		if net.ParseIP(strings.SplitN(host, "%", 2)[0]) != nil {
+			return host
+		}
+	}
+	if net.ParseIP(hostport) != nil || !strings.Contains(hostport, ":") {
+		return hostport
+	}
+	return "localhost"
 }

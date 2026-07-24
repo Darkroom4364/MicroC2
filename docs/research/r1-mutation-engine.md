@@ -48,10 +48,9 @@ Resolution order:
   globally unique artifact.
 - **Surface strings** — a seed-selected user-agent from a curated pool is
   written into the embedded config (and used by the agent's HTTP client).
-  Randomized endpoint path segments are recorded in the embedded config as
-  `mutation_endpoint_segments` but are **not consumed by the v0 agent** —
-  server routes are fixed, so wiring them belongs to the Phase 2 transport
-  profiles. They are recorded now so the provenance story is complete.
+  Endpoint-path mutation is deferred until a transport profile can apply it
+  end to end; the former inactive `mutation_endpoint_segments` config field was
+  removed so provenance contains only settings that affect the artifact.
 
 The agent reports its own seed at startup (debug log) via
 `MUTATION_SEED_USED`, emitted by the build script.

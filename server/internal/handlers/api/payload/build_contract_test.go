@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -157,6 +160,14 @@ func TestValidateAndResolvePayloadConfigRejectsUnsupportedOptions(
 				config.Sleep = 0
 			},
 		},
+		{
+			name:  "reduced activity threshold reaches full OPSEC threshold",
+			field: "base_threshold_enter_reduced_activity",
+			mutate: func(config *PayloadConfig) {
+				config.BaseThresholdEnterReducedActivity =
+					config.BaseThresholdEnterFullOpsec
+			},
+		},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -175,6 +186,119 @@ func TestValidateAndResolvePayloadConfigRejectsUnsupportedOptions(
 				)
 			}
 		})
+	}
+}
+
+func TestValidateAndResolvePayloadConfigRejectsValuesOutsideAgentTypes(
+	t *testing.T,
+) {
+	testCases := []struct {
+		name   string
+		field  string
+		mutate func(*PayloadConfig)
+	}{
+		{
+			name:  "increase factor exceeds f32",
+			field: "c2_failure_threshold_increase_factor",
+			mutate: func(config *PayloadConfig) {
+				config.C2FailureThresholdIncreaseFactor = math.MaxFloat64
+			},
+		},
+		{
+			name:  "max multiplier exceeds f32",
+			field: "c2_dynamic_threshold_max_multiplier",
+			mutate: func(config *PayloadConfig) {
+				config.C2DynamicThresholdMaxMultiplier = math.MaxFloat64
+			},
+		},
+		{
+			name:  "positive factor underflows f32",
+			field: "c2_failure_threshold_decrease_factor",
+			mutate: func(config *PayloadConfig) {
+				config.C2FailureThresholdDecreaseFactor = math.SmallestNonzeroFloat64
+			},
+		},
+	}
+	if strconv.IntSize == 64 {
+		testCases = append(testCases, struct {
+			name   string
+			field  string
+			mutate func(*PayloadConfig)
+		}{
+			name:  "failure counter exceeds u32",
+			field: "base_max_consecutive_c2_failures",
+			mutate: func(config *PayloadConfig) {
+				config.BaseMaxConsecutiveC2Failures = int(maxRustU32 + 1)
+			},
+		})
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			config := validPayloadBuildConfig()
+			testCase.mutate(&config)
+			_, err := validateAndResolvePayloadConfig(config)
+			var validationError *payloadConfigValidationError
+			if !errors.As(err, &validationError) {
+				t.Fatalf("validation error = %v, want typed validation error", err)
+			}
+			if validationError.field != testCase.field {
+				t.Fatalf(
+					"validation field = %q, want %q",
+					validationError.field,
+					testCase.field,
+				)
+			}
+		})
+	}
+}
+
+func TestValidateAndResolvePayloadConfigNormalizesLosslesslyForRustF32(
+	t *testing.T,
+) {
+	config := validPayloadBuildConfig()
+	config.BaseThresholdEnterFullOpsec = 63.125
+	config.BaseThresholdEnterReducedActivity = 17.75
+	config.C2FailureThresholdIncreaseFactor = 1.234
+	config.C2FailureThresholdDecreaseFactor = 0.876
+	config.C2DynamicThresholdMaxMultiplier = 2.345
+
+	plan, err := validateAndResolvePayloadConfig(config)
+	if err != nil {
+		t.Fatalf("validate payload config: %v", err)
+	}
+	testCases := []struct {
+		name  string
+		got   float64
+		input float64
+	}{
+		{"full score", plan.config.BaseThresholdEnterFullOpsec, 63.125},
+		{"reduced score", plan.config.BaseThresholdEnterReducedActivity, 17.75},
+		{"increase", plan.config.C2FailureThresholdIncreaseFactor, 1.234},
+		{"decrease", plan.config.C2FailureThresholdDecreaseFactor, 0.876},
+		{"maximum", plan.config.C2DynamicThresholdMaxMultiplier, 2.345},
+	}
+	for _, testCase := range testCases {
+		want := float64(float32(testCase.input))
+		if testCase.got != want {
+			t.Fatalf("%s normalized value = %v, want %v", testCase.name, testCase.got, want)
+		}
+		formatted := formatRustF32(testCase.got)
+		parsed, err := strconv.ParseFloat(formatted, 32)
+		if err != nil {
+			t.Fatalf("parse formatted %s value %q: %v", testCase.name, formatted, err)
+		}
+		if float32(parsed) != float32(testCase.input) {
+			t.Fatalf(
+				"%s formatted value %q does not round-trip to %v",
+				testCase.name,
+				formatted,
+				float32(testCase.input),
+			)
+		}
+	}
+	if got := formatRustF32(plan.config.C2FailureThresholdIncreaseFactor); got != "1.234" {
+		t.Fatalf("increase factor was silently rounded: got %q, want 1.234", got)
 	}
 }
 
@@ -256,6 +380,13 @@ func TestManifestUsesExactCredentialFreeConfigExportedByBuild(t *testing.T) {
 		if !filepath.IsAbs(effectivePath) {
 			effectivePath = filepath.Join(command.Dir, effectivePath)
 		}
+		increaseFactor, err := strconv.ParseFloat(
+			values["C2_THRESH_INC_FACTOR"],
+			32,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("parse C2 threshold increase factor: %w", err)
+		}
 		effective := map[string]interface{}{
 			"server_url":                           values["SERVER_URL"],
 			"payload_id":                           values["PAYLOAD_ID"],
@@ -265,10 +396,9 @@ func TestManifestUsesExactCredentialFreeConfigExportedByBuild(t *testing.T) {
 			"protocol":                             values["PROTOCOL"],
 			"socks5_enabled":                       true,
 			"user_agent":                           "seed-selected-user-agent",
-			"mutation_endpoint_segments":           []string{"first-segment", "second-segment"},
 			"allow_invalid_certs":                  false,
 			"allow_insecure_isolated_lab":          true,
-			"c2_failure_threshold_increase_factor": 1.23,
+			"c2_failure_threshold_increase_factor": float32(increaseFactor),
 		}
 		data, err := json.Marshal(effective)
 		if err != nil {
@@ -297,7 +427,7 @@ func TestManifestUsesExactCredentialFreeConfigExportedByBuild(t *testing.T) {
 	if effective["protocol"] != "http" ||
 		effective["socks5_enabled"] != true ||
 		effective["user_agent"] != "seed-selected-user-agent" ||
-		effective["c2_failure_threshold_increase_factor"] != 1.23 {
+		effective["c2_failure_threshold_increase_factor"] != 1.234 {
 		t.Fatalf("manifest did not preserve exact build export: %#v", effective)
 	}
 	publishedConfig, err := os.ReadFile(
@@ -325,11 +455,11 @@ func TestManifestUsesExactCredentialFreeConfigExportedByBuild(t *testing.T) {
 }
 
 func validPayloadBuildConfig() PayloadConfig {
-	return PayloadConfig{
-		ListenerID:   "listener-one",
-		AgentType:    "debugAgent",
-		Architecture: "x64",
-		Format:       "linux_elf",
-		Sleep:        5,
-	}
+	config := defaultPayloadRequestConfig()
+	config.ListenerID = "listener-one"
+	config.AgentType = "debugAgent"
+	config.Architecture = "x64"
+	config.Format = "linux_elf"
+	config.Sleep = 5
+	return config
 }

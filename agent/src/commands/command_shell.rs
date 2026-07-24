@@ -1,8 +1,6 @@
 use crate::auth::{AgentAuth, CredentialSource, CredentialUse, SecretCredential};
 use crate::config::{validate_c2_base_url, AgentConfig};
 use crate::networking::egress::get_egress_ip;
-use crate::networking::socks5_pivot::Socks5PivotHandler;
-use crate::networking::socks5_pivot_server::Socks5PivotServer;
 use crate::opsec::{determine_agent_mode, AgentMode};
 use crate::tasks::{
     validate_identifier, Task, TaskOutcome, TaskOutput, TaskResult, TaskStatusUpdate, TaskType,
@@ -28,13 +26,8 @@ use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
-use tokio::sync::Mutex as TokioMutex;
-use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
-static PIVOT_SERVERS: Lazy<TokioMutex<HashMap<u16, JoinHandle<()>>>> =
-    Lazy::new(|| TokioMutex::new(HashMap::new()));
 static TASK_OUTBOX: Lazy<TaskOutbox> = Lazy::new(TaskOutbox::default);
 
 const MAX_CAPTURE_BYTES: usize = MAX_TASK_OUTPUT_CHARS;
@@ -1703,8 +1696,6 @@ pub async fn agent_loop(
     server_addr: &str,
     agent_id: &str,
     auth: Arc<AgentAuth>,
-    _pivot_handler: Arc<TokioMutex<Socks5PivotHandler>>, // Prefix with underscore
-    _pivot_tx: mpsc::Sender<crate::networking::socks5_pivot::PivotFrame>, // Prefix with underscore
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::load()?;
     info!("[SHELL] Entering agent_loop (BackgroundOpsec Active)");
@@ -1786,38 +1777,6 @@ pub async fn agent_loop(
     heartbeat_task.abort();
     let _ = heartbeat_task.await;
     Ok(())
-}
-
-// Start a pivot server on the specified port
-// This function is called when the command "pivot_start <port>" is received
-async fn start_pivot_server(
-    port: u16,
-    pivot_handler: Arc<TokioMutex<Socks5PivotHandler>>,
-    pivot_tx: mpsc::Sender<crate::networking::socks5_pivot::PivotFrame>,
-) -> Result<String, String> {
-    let mut servers = PIVOT_SERVERS.lock().await;
-    if servers.contains_key(&port) {
-        return Err(format!("Pivot server already running on port {}", port));
-    }
-    let server = Socks5PivotServer::new("127.0.0.1".to_string(), port, pivot_tx);
-    let handler = pivot_handler.clone();
-    let handle = tokio::spawn(async move {
-        server.run(handler).await;
-    });
-    servers.insert(port, handle);
-    Ok(format!("Started pivot server on port {}", port))
-}
-
-// Stop a pivot server on the specified port
-// This function is called when the command "pivot_stop <port>" is received
-async fn stop_pivot_server(port: u16) -> Result<String, String> {
-    let mut servers = PIVOT_SERVERS.lock().await;
-    if let Some(handle) = servers.remove(&port) {
-        handle.abort();
-        Ok(format!("Stopped pivot server on port {}", port))
-    } else {
-        Err(format!("No pivot server running on port {}", port))
-    }
 }
 
 #[cfg(test)]

@@ -40,6 +40,83 @@ C2_THRESH_ADJ_INTERVAL=${C2_THRESH_ADJ_INTERVAL:-3600} # 1 hour
 C2_THRESH_MAX_MULT=${C2_THRESH_MAX_MULT:-2.0}
 PROC_SCAN_INTERVAL_SECS=${PROC_SCAN_INTERVAL_SECS:-300}
 
+decimal_is_zero() {
+    [[ "$1" =~ ^0+([.]0+)?$ ]]
+}
+
+decimal_greater_than() {
+    local left="$1"
+    local right="$2"
+    local left_integer="${left%%.*}"
+    local right_integer="${right%%.*}"
+    local left_fraction=""
+    local right_fraction=""
+
+    if [[ "$left" == *.* ]]; then
+        left_fraction="${left#*.}"
+    fi
+    if [[ "$right" == *.* ]]; then
+        right_fraction="${right#*.}"
+    fi
+    while [[ ${#left_integer} -gt 1 && "$left_integer" == 0* ]]; do
+        left_integer="${left_integer#0}"
+    done
+    while [[ ${#right_integer} -gt 1 && "$right_integer" == 0* ]]; do
+        right_integer="${right_integer#0}"
+    done
+    if [[ ${#left_integer} -ne ${#right_integer} ]]; then
+        [[ ${#left_integer} -gt ${#right_integer} ]]
+        return
+    fi
+    if [[ "$left_integer" != "$right_integer" ]]; then
+        [[ "$left_integer" > "$right_integer" ]]
+        return
+    fi
+    while [[ ${#left_fraction} -lt ${#right_fraction} ]]; do
+        left_fraction="${left_fraction}0"
+    done
+    while [[ ${#right_fraction} -lt ${#left_fraction} ]]; do
+        right_fraction="${right_fraction}0"
+    done
+    [[ "$left_fraction" > "$right_fraction" ]]
+}
+
+decimal_less_than() {
+    decimal_greater_than "$2" "$1"
+}
+
+decimal_add_integers() {
+    local left="$1"
+    local right="$2"
+    local left_index=$((${#left} - 1))
+    local right_index=$((${#right} - 1))
+    local carry=0
+    local result=""
+    local left_digit
+    local right_digit
+    local total
+
+    while [[ $left_index -ge 0 || $right_index -ge 0 || $carry -ne 0 ]]; do
+        left_digit=0
+        right_digit=0
+        if [[ $left_index -ge 0 ]]; then
+            left_digit="${left:$left_index:1}"
+            left_index=$((left_index - 1))
+        fi
+        if [[ $right_index -ge 0 ]]; then
+            right_digit="${right:$right_index:1}"
+            right_index=$((right_index - 1))
+        fi
+        total=$((10#$left_digit + 10#$right_digit + carry))
+        result="$((total % 10))${result}"
+        carry=$((total / 10))
+    done
+    while [[ ${#result} -gt 1 && "$result" == 0* ]]; do
+        result="${result#0}"
+    done
+    printf '%s' "$result"
+}
+
 # --- Parse Command Line Arguments ---
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -150,8 +227,8 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     *)
-      echo "Unknown option: $1"
-      shift
+      echo "Error: unknown option: $1" >&2
+      exit 2
       ;;
   esac
 done
@@ -302,6 +379,71 @@ for decimal_value in \
         exit 1
     fi
 done
+U64_MAX_DECIMAL="18446744073709551615"
+U32_MAX_DECIMAL="4294967295"
+F32_MAX_DECIMAL="340282346638528859811704183484516925440"
+F32_MIN_NONZERO_DECIMAL="0.000000000000000000000000000000000000000000001"
+
+for unsigned_value in \
+    "$SLEEP_INTERVAL" "$JITTER" "$MIN_FULL_OPSEC_SECS" \
+    "$MIN_REDUCED_OPSEC_SECS" "$MIN_BG_OPSEC_SECS" \
+    "$REDUCED_ACTIVITY_SLEEP_SECS" "$C2_THRESH_ADJ_INTERVAL" \
+    "$PROC_SCAN_INTERVAL_SECS"; do
+    if decimal_greater_than "$unsigned_value" "$U64_MAX_DECIMAL"; then
+        echo "Error: unsigned build settings must fit an unsigned 64-bit integer." >&2
+        exit 1
+    fi
+done
+if decimal_is_zero "$SLEEP_INTERVAL"; then
+    echo "Error: SLEEP_INTERVAL must be at least one second." >&2
+    exit 1
+fi
+if decimal_greater_than \
+    "$(decimal_add_integers "$SLEEP_INTERVAL" "$JITTER")" \
+    "$U64_MAX_DECIMAL"; then
+    echo "Error: SLEEP_INTERVAL plus JITTER exceeds the supported u64 range." >&2
+    exit 1
+fi
+if decimal_greater_than "$BASE_MAX_C2_FAILS" "$U32_MAX_DECIMAL"; then
+    echo "Error: BASE_MAX_C2_FAILS must fit an unsigned 32-bit integer." >&2
+    exit 1
+fi
+for decimal_value in \
+    "$BASE_SCORE_THRESHOLD_BG_TO_REDUCED" \
+    "$BASE_SCORE_THRESHOLD_REDUCED_TO_FULL" \
+    "$C2_THRESH_INC_FACTOR" "$C2_THRESH_DEC_FACTOR" "$C2_THRESH_MAX_MULT"; do
+    if decimal_greater_than "$decimal_value" "$F32_MAX_DECIMAL" ||
+        { ! decimal_is_zero "$decimal_value" &&
+          decimal_less_than "$decimal_value" "$F32_MIN_NONZERO_DECIMAL"; }; then
+        echo "Error: decimal build settings must be zero or fit a finite non-zero f32." >&2
+        exit 1
+    fi
+done
+if decimal_greater_than "$BASE_SCORE_THRESHOLD_BG_TO_REDUCED" "100" ||
+    decimal_greater_than "$BASE_SCORE_THRESHOLD_REDUCED_TO_FULL" "100"; then
+    echo "Error: OPSEC score thresholds must each be within 0..=100." >&2
+    exit 1
+fi
+if ! decimal_less_than \
+    "$BASE_SCORE_THRESHOLD_BG_TO_REDUCED" \
+    "$BASE_SCORE_THRESHOLD_REDUCED_TO_FULL"; then
+    echo "Error: BASE_SCORE_THRESHOLD_BG_TO_REDUCED must be lower than BASE_SCORE_THRESHOLD_REDUCED_TO_FULL." >&2
+    exit 1
+fi
+if { ! decimal_is_zero "$C2_THRESH_INC_FACTOR" &&
+     decimal_less_than "$C2_THRESH_INC_FACTOR" "1"; }; then
+    echo "Error: C2_THRESH_INC_FACTOR must be zero or at least one." >&2
+    exit 1
+fi
+if decimal_greater_than "$C2_THRESH_DEC_FACTOR" "1"; then
+    echo "Error: C2_THRESH_DEC_FACTOR must be within 0..=1." >&2
+    exit 1
+fi
+if { ! decimal_is_zero "$C2_THRESH_MAX_MULT" &&
+     decimal_less_than "$C2_THRESH_MAX_MULT" "1"; }; then
+    echo "Error: C2_THRESH_MAX_MULT must be zero or at least one." >&2
+    exit 1
+fi
 if [ -n "$MUTATION_SEED" ] &&
     [[ ! "$MUTATION_SEED" =~ ^(0x)?[0-9A-Fa-f]{1,16}$ ]]; then
     echo "Error: MUTATION_SEED must be a hexadecimal u64." >&2
@@ -367,16 +509,8 @@ echo "  PROC_SCAN_INTERVAL_SECS: ${PROC_SCAN_INTERVAL_SECS}"
 
 echo "[DIAGNOSTIC] Protocol value before config generation: [$PROTOCOL]"
 
-# --- Generate Comprehensive Agent Config JSON --- 
-# This config.json is written by build.sh itself and is used if build.rs falls back to reading a file.
-# The primary method is for build.rs to use environment variables.
-AGENT_CONFIG_DIR_FOR_BUILD_RS=".config" # Relative to agent source root
-mkdir -p "$AGENT_CONFIG_DIR_FOR_BUILD_RS"
-CONFIG_JSON_PATH_FOR_BUILD_RS="${AGENT_CONFIG_DIR_FOR_BUILD_RS}/config.json"
-
-# Construct a canonical authority without ever interpolating unvalidated input
-# into JSON. Raw IPv6 literals are bracketed; already-bracketed literals stay
-# bracketed; hostnames and IPv4 addresses are unchanged.
+# Construct the canonical server URL passed to build.rs. Raw IPv6 literals are
+# bracketed; already-bracketed literals stay bracketed.
 if [[ "$LISTENER_HOST" == \[*\] ]]; then
     CONFIG_SERVER_AUTHORITY="${LISTENER_HOST}:${LISTENER_PORT}"
 elif [[ "$LISTENER_HOST" == *:* ]]; then
@@ -391,107 +525,37 @@ if [ -n "$SERVER_URL" ] && [ "$SERVER_URL" != "$CONFIG_SERVER_URL" ]; then
 fi
 SERVER_URL="$CONFIG_SERVER_URL"
 
-
-CONFIG_JSON_CONTENT=$(cat << EOF
-{
-    "server_url": "${CONFIG_SERVER_URL}",
-    "sleep_interval": ${SLEEP_INTERVAL},
-    "jitter": ${JITTER},
-    "payload_id": "${PAYLOAD_ID}",
-    "agent_id": "",
-    "listener_id": "${LISTENER_ID}",
-    "enrollment_credential": "",
-    "protocol": "${PROTOCOL}",
-    "socks5_enabled": ${SOCKS5_ENABLED},
-    "socks5_host": "${SOCKS5_HOST}",
-    "socks5_port": ${SOCKS5_PORT},
-    "allow_invalid_certs": ${ALLOW_INVALID_CERTS},
-    "allow_insecure_isolated_lab": ${ALLOW_INSECURE_ISOLATED_LAB},
-    "base_score_threshold_bg_to_reduced": ${BASE_SCORE_THRESHOLD_BG_TO_REDUCED},
-    "base_score_threshold_reduced_to_full": ${BASE_SCORE_THRESHOLD_REDUCED_TO_FULL},
-    "min_duration_full_opsec_secs": ${MIN_FULL_OPSEC_SECS},
-    "min_duration_reduced_activity_secs": ${MIN_REDUCED_OPSEC_SECS},
-    "min_duration_background_opsec_secs": ${MIN_BG_OPSEC_SECS},
-    "reduced_activity_sleep_secs": ${REDUCED_ACTIVITY_SLEEP_SECS},
-    "base_max_consecutive_c2_failures": ${BASE_MAX_C2_FAILS},
-    "c2_failure_threshold_increase_factor": ${C2_THRESH_INC_FACTOR},
-    "c2_failure_threshold_decrease_factor": ${C2_THRESH_DEC_FACTOR},
-    "c2_threshold_adjust_interval_secs": ${C2_THRESH_ADJ_INTERVAL},
-    "c2_dynamic_threshold_max_multiplier": ${C2_THRESH_MAX_MULT},
-    "proc_scan_interval_secs": ${PROC_SCAN_INTERVAL_SECS}
-}
-EOF
-)
-echo "$CONFIG_JSON_CONTENT" > "$CONFIG_JSON_PATH_FOR_BUILD_RS"
-chmod 600 "$CONFIG_JSON_PATH_FOR_BUILD_RS"
-echo "Created/Updated $CONFIG_JSON_PATH_FOR_BUILD_RS for build.rs fallback."
-
-# Also place it in the server-specified output directory for runtime fallback by the agent, if applicable
-if [ -n "$OUTPUT_DIR" ]; then
-    mkdir -p "$OUTPUT_DIR/.config"
-    chmod 700 "$OUTPUT_DIR/.config"
-    echo "$CONFIG_JSON_CONTENT" > "$OUTPUT_DIR/.config/config.json"
-    chmod 600 "$OUTPUT_DIR/.config/config.json"
-    echo "Copied comprehensive config to $OUTPUT_DIR/.config/config.json for agent runtime fallback."
-fi
-
 echo "Building agent..."
 
-# Determine output extension and artifact name based on --format
-case "$FORMAT" in
-    windows_exe)
-        BINARY_EXT=".exe"
+# Resolve an omitted format only for one of the two implemented target
+# profiles, then reject every unsupported target/format combination before
+# invoking Cargo.
+if [ -z "${FORMAT:-}" ]; then
+    case "$TARGET" in
+        x86_64-unknown-linux-gnu)
+            FORMAT="linux_elf"
+            ;;
+        x86_64-pc-windows-gnu)
+            FORMAT="windows_exe"
+            ;;
+        *)
+            echo "Error: unsupported target '$TARGET'; supported targets are x86_64-unknown-linux-gnu and x86_64-pc-windows-gnu." >&2
+            exit 2
+            ;;
+    esac
+fi
+case "$TARGET/$FORMAT" in
+    x86_64-unknown-linux-gnu/linux_elf)
+        AGENT_OUT="agent"
+        ;;
+    x86_64-pc-windows-gnu/windows_exe)
         AGENT_OUT="agent.exe"
         ;;
-    windows_dll)
-        BINARY_EXT=".dll"
-        AGENT_OUT="agent.dll"
-        ;;
-    windows_shellcode) # Added shellcode
-        BINARY_EXT=".bin"
-        AGENT_OUT="shellcode.bin"
-        ;;
-    windows_service) # Added service
-        BINARY_EXT=".exe"
-        AGENT_OUT="agent_service.exe"
-        ;;
-    linux_elf)
-        BINARY_EXT=""
-        AGENT_OUT="agent"
-        ;;
-    macos_dylib)
-        BINARY_EXT=".dylib"
-        AGENT_OUT="libagent.dylib"
-        ;;
-    linux_so)
-        BINARY_EXT=".so"
-        AGENT_OUT="libagent.so"
-        ;;
     *)
-        # Default based on TARGET if FORMAT is empty
-        if [[ "$TARGET" == *windows* ]]; then
-            echo "Warning: --format not specified for Windows target. Defaulting to windows_exe."
-            FORMAT="windows_exe"
-            BINARY_EXT=".exe"
-            AGENT_OUT="agent.exe"
-        elif [[ "$TARGET" == *linux* ]]; then
-            echo "Warning: --format not specified for Linux target. Defaulting to linux_elf."
-            FORMAT="linux_elf"
-            BINARY_EXT=""
-            AGENT_OUT="agent"
-        else # Generic fallback
-            echo "Warning: --format not specified and target is not Windows/Linux. Assuming 'agent' as output name."
-        BINARY_EXT=""
-        AGENT_OUT="agent"
-        fi
+        echo "Error: unsupported target/format '$TARGET/$FORMAT'; supported profiles are x86_64-unknown-linux-gnu/linux_elf and x86_64-pc-windows-gnu/windows_exe." >&2
+        exit 2
         ;;
 esac
-
-# Set cargo features only for DLL
-CARGO_FEATURES=""
-if [ "$FORMAT" == "windows_dll" ]; then
-    CARGO_FEATURES="--features dll"
-fi
 
 # Set build flags based on build type
 BUILD_FLAGS=""
@@ -500,9 +564,14 @@ if [ "$BUILD_TYPE" == "release" ]; then
 elif [ "$BUILD_TYPE" == "debug" ]; then
     BUILD_FLAGS="" # No extra flags for debug
 else
-    echo "Warning: Unknown BUILD_TYPE '$BUILD_TYPE'. Defaulting to release build flags." >&2
-    BUILD_FLAGS="--release"
+    echo "Error: BUILD_TYPE must be debug or release, got '$BUILD_TYPE'." >&2
+    exit 2
 fi
+
+# Cargo records rerun-if-env-changed values in plaintext fingerprint metadata.
+# Rotate a non-secret nonce on every wrapper invocation so build.rs reruns
+# without fingerprinting the embedded bootstrap credential itself.
+MICROC2_BUILD_NONCE="${PAYLOAD_ID}-$$-${SECONDS:-0}-${RANDOM:-0}-${RANDOM:-0}"
 
 # --- Export Environment Variables for build.rs ---
 # These ensure build.rs gets the final, resolved values.
@@ -511,12 +580,14 @@ export LISTENER_PORT="$LISTENER_PORT" # Actual port
 export SERVER_URL="$SERVER_URL"
 export LISTENER_ID="$LISTENER_ID"
 export SLEEP_INTERVAL="$SLEEP_INTERVAL"
+export JITTER="$JITTER"
 export PAYLOAD_ID="$PAYLOAD_ID"
 export PROTOCOL="$PROTOCOL" # Actual protocol
 export SOCKS5_ENABLED="$SOCKS5_ENABLED"
 export SOCKS5_HOST="$SOCKS5_HOST"
 export SOCKS5_PORT="$SOCKS5_PORT"
 export ENROLLMENT_CREDENTIAL="$ENROLLMENT_CREDENTIAL"
+export MICROC2_BUILD_NONCE="$MICROC2_BUILD_NONCE"
 export ALLOW_INSECURE_ISOLATED_LAB="$ALLOW_INSECURE_ISOLATED_LAB"
 export ALLOW_INVALID_CERTS="$ALLOW_INVALID_CERTS"
 
@@ -549,17 +620,17 @@ echo "  MIN_BG_OPSEC_SECS: $MIN_BG_OPSEC_SECS, REDUCED_ACTIVITY_SLEEP_SECS: $RED
 # Add more echos for other critical env vars if needed for debugging
 
 # Build the agent
-echo "Building for $TARGET (Format: $FORMAT) with flags: $BUILD_FLAGS $CARGO_FEATURES..."
+echo "Building for $TARGET (Format: $FORMAT) with flags: $BUILD_FLAGS..."
 if [[ "$TARGET" == *windows* ]]; then
     if command -v cross &> /dev/null; then
-        cross build --locked $BUILD_FLAGS $CARGO_FEATURES --target $TARGET
+        cross build --locked $BUILD_FLAGS --target "$TARGET"
     else
         echo "Warning: 'cross' command not found. Attempting with 'cargo build'. Make sure Rust target '$TARGET' is installed."
-        rustup target add $TARGET # Ensure target is installed
-        cargo build --locked $BUILD_FLAGS $CARGO_FEATURES --target $TARGET
+        rustup target add "$TARGET" # Ensure target is installed
+        cargo build --locked $BUILD_FLAGS --target "$TARGET"
     fi
 else # For Linux, macOS, etc.
-    cargo build --locked $BUILD_FLAGS $CARGO_FEATURES --target $TARGET
+    cargo build --locked $BUILD_FLAGS --target "$TARGET"
 fi
 
 BUILD_SUCCESS=$?
@@ -614,15 +685,6 @@ else
     exit 1
 fi
 
-# Copy config.json for agent to server's expected location
-# This config.json is the one generated by build.sh with the resolved values.
-if [ -n "$ORIGINAL_OUTPUT_DIR" ]; then
-mkdir -p "$ORIGINAL_OUTPUT_DIR/.config"
-    cp "$CONFIG_JSON_PATH_FOR_BUILD_RS" "$ORIGINAL_OUTPUT_DIR/.config/config.json"
-    echo "Copied $CONFIG_JSON_PATH_FOR_BUILD_RS to $ORIGINAL_OUTPUT_DIR/.config/config.json"
-fi
-
-
 # Strip and compress if possible (operate on the file in server's expected location)
 if [ -n "$ORIGINAL_OUTPUT_DIR" ] && [ -f "$FINAL_OUTPUT_PATH_FOR_SERVER" ]; then
     echo "Stripping binary at $FINAL_OUTPUT_PATH_FOR_SERVER..."
@@ -637,21 +699,7 @@ fi
 if [ -n "$ORIGINAL_OUTPUT_DIR" ]; then
   echo "Final contents of server's output directory ($ORIGINAL_OUTPUT_DIR):"
 ls -la "$ORIGINAL_OUTPUT_DIR"
-  if [ -d "$ORIGINAL_OUTPUT_DIR/.config" ]; then
-    echo "Contents of $ORIGINAL_OUTPUT_DIR/.config:"
-    ls -la "$ORIGINAL_OUTPUT_DIR/.config"
-  fi
 fi
 
-
-if [ "$FORMAT" == "windows_dll" ]; then
-    if [ -f "$FINAL_OUTPUT_PATH_FOR_SERVER" ]; then
-        echo "SUCCESS: agent.dll was found at $FINAL_OUTPUT_PATH_FOR_SERVER"
-        stat -c "File size: %s bytes" "$FINAL_OUTPUT_PATH_FOR_SERVER" || ls -l "$FINAL_OUTPUT_PATH_FOR_SERVER"
-    else
-        echo "ERROR: agent.dll was not found in the final output directory $FINAL_OUTPUT_PATH_FOR_SERVER"
-        exit 1
-    fi
-fi
 
 echo "Build process completed"

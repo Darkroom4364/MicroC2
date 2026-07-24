@@ -4,18 +4,6 @@ function safeParseJson(text) {
     catch (e) { console.error('JSON parse error:', e); return null; }
 }
 
-// Helper: parse headers lines (key:value) into an object
-function parseHeaderLines(raw) {
-    return raw.split('\n')
-      .map(l => l.trim())
-      .filter(l => l)
-      .reduce((obj, line) => {
-          const [key, ...vals] = line.split(':');
-          obj[key.trim()] = vals.join(':').trim();
-          return obj;
-      }, {});
-}
-
 class ListenerManager {
     constructor() {
         this.setupEventListeners();
@@ -24,34 +12,6 @@ class ListenerManager {
     }
 
     setupEventListeners() {
-        // Enable/disable proxy settings
-        document.getElementById('enableProxy').addEventListener('change', function() {
-            const proxySettings = document.getElementById('proxySettings');
-            proxySettings.classList.toggle('hidden', !this.checked);
-        });
-
-        // Input events to allow pressing Enter to add items
-        document.getElementById('hostInput').addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') {
-                e.preventDefault();
-                this.addListItem('hostInput', 'hostsList', 'hosts');
-            }
-        });
-
-        document.getElementById('headerInput').addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') {
-                e.preventDefault();
-                this.addListItem('headerInput', 'headersList', 'headers');
-            }
-        });
-        
-        document.getElementById('uriInput').addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') {
-                e.preventDefault();
-                this.addListItem('uriInput', 'urisList', 'uris');
-            }
-        });
-
         // Form submission
         document.getElementById('listenerForm').addEventListener('submit', async (e) => {
             e.preventDefault();
@@ -59,134 +19,33 @@ class ListenerManager {
         });
     }
 
-    addListItem(inputId, listId, hiddenFieldId) {
-        const input = document.getElementById(inputId);
-        const list = document.getElementById(listId);
-        const hiddenField = document.getElementById(hiddenFieldId);
-        if (!input.value.trim()) return;
-        
-        // Create list item element
-        const item = document.createElement('div');
-        item.className = 'list-item';
-        const itemText = document.createElement('span');
-        itemText.className = 'item-text';
-        itemText.textContent = input.value.trim();
-        item.appendChild(itemText);
-        
-        const removeBtn = document.createElement('button');
-        removeBtn.className = 'remove-item';
-        removeBtn.innerHTML = '×';
-        removeBtn.type = 'button';
-        removeBtn.onclick = () => {
-            list.removeChild(item);
-            this.updateHiddenField(listId, hiddenFieldId);
-        };
-        item.appendChild(removeBtn);
-        
-        list.appendChild(item);
-        input.value = '';
-        
-        this.updateHiddenField(listId, hiddenFieldId);
-    }
-
-    updateHiddenField(listId, hiddenFieldId) {
-        const list = document.getElementById(listId);
-        const hiddenField = document.getElementById(hiddenFieldId);
-        const items = Array.from(list.querySelectorAll('.item-text')).map(span => span.textContent);
-        hiddenField.value = items.join('\n');
-    }
-    
-    clearList(listId, hiddenFieldId) {
-        const list = document.getElementById(listId);
-        const hiddenField = document.getElementById(hiddenFieldId);
-        list.innerHTML = '';
-        hiddenField.value = '';
-    }
-
-    clearAllLists() {
-        this.clearList('hostsList', 'hosts');
-        this.clearList('headersList', 'headers');
-        this.clearList('urisList', 'uris');
-    }
-
     async handleFormSubmit(e) {
         const formData = new FormData(e.target);
         const formValues = Object.fromEntries(formData);
-        
+        const advertisedHost = String(formValues.advertisedHost || '').trim();
         
         const listenerConfig = {
-            name: formValues.listenerName,
+            name: String(formValues.listenerName || '').trim(),
             protocol: formValues.payloadType,
-            host: formValues.bindHost,
+            host: String(formValues.bindHost || '').trim(),
             port: parseInt(formValues.port, 10)
         };
 
         // Basic validation
-        if (!formValues.listenerName) {
+        if (!listenerConfig.name) {
             this.showError('Listener name is required');
             return;
         }
-
-        // Add arrays if they have non-empty values
-        if (formValues.hosts) {
-            const hosts = formValues.hosts.split('\n')
-                .map(h => h.trim())
-                .filter(h => h.length > 0);
-            if (hosts.length > 0) {
-                listenerConfig.hosts = hosts;
-            }
+        if (!Number.isInteger(listenerConfig.port) ||
+            listenerConfig.port < 1 ||
+            listenerConfig.port > 65535) {
+            this.showError('Listener port must be between 1 and 65535');
+            return;
+        }
+        if (advertisedHost) {
+            listenerConfig.hosts = [advertisedHost];
         }
 
-        if (formValues.hostRotation) {
-            listenerConfig.host_rotation = formValues.hostRotation;
-        }
-
-        if (formValues.userAgent) {
-            listenerConfig.user_agent = formValues.userAgent.trim();
-        }
-
-        // Parse and add headers if they exist
-        if (formValues.headers) {
-            const parsed = parseHeaderLines(formValues.headers);
-            if (Object.keys(parsed).length) listenerConfig.headers = parsed;
-        }
-
-        // Parse and add URIs if they exist
-        if (formValues.uris) {
-            const uris = formValues.uris.split('\n')
-                .map(u => u.trim())
-                .filter(u => u.length > 0);
-            if (uris.length > 0) {
-                listenerConfig.uris = uris;
-            }
-        }
-
-        if (formValues.hostHeader) {
-            listenerConfig.host_header = formValues.hostHeader.trim();
-        }
-
-        // Add proxy configuration if enabled
-        if (formValues.enableProxy === "on") {
-            if (!formValues.proxyHost || !formValues.proxyPort) {
-                this.showError('Proxy host and port are required when proxy is enabled');
-                return;
-            }
-            
-            listenerConfig.proxy = {
-                type: formValues.proxyType,
-                host: formValues.proxyHost.trim(),
-                port: parseInt(formValues.proxyPort, 10)
-            };
-
-            if (formValues.proxyUsername) {
-                listenerConfig.proxy.username = formValues.proxyUsername.trim();
-            }
-            if (formValues.proxyPassword) {
-                listenerConfig.proxy.password = formValues.proxyPassword.trim();
-            }
-        }
-
-        console.log('Sending listener config:', listenerConfig);
         this.showLoading('Creating listener...');
 
         try {
@@ -213,7 +72,6 @@ class ListenerManager {
 
             this.showSuccess('Listener created successfully');
             e.target.reset();
-            this.clearAllLists();
             await this.fetchListenerList();
         } catch (error) {
             console.error('Error creating listener:', error);

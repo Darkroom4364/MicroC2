@@ -4,28 +4,18 @@ storage:
   path: "data/microc2.db"
 
 server:
-  port: 8080
-  httpsPort: 8443
+  # Sole HTTPS port for the operator UI and API.
+  port: 8443
   uploadDir: "uploads"
   staticDir: "static"
   tls:
-    enabled: true
     certFile: "certs/server.crt"
     keyFile: "certs/server.key"
   redirect:
     enabled: true
     httpPort: 8080
-  
-communication:
-  # Available protocols: http
-  protocol: http
-  
-  # Protocol-specific settings
-  http:
-    heartbeatInterval: 60  # seconds
-    
+
 security:
-  enableCORS: true
   # The browser-accessible server shell is disabled by default. Enable it only
   # for an explicitly controlled lab after considering host-level impact.
   enableServerTerminal: false
@@ -42,9 +32,8 @@ security:
   # Can also be set via the MICROC2_OPERATOR_TOKEN environment variable.
   operatorToken: ""
   # Origins allowed to open operator WebSockets (log stream, terminal).
-  # Same-host and loopback origins are always allowed.
+  # The exact same origin is always allowed; other origins must be listed.
   operatorAllowedOrigins: ["https://localhost:8443", "http://localhost:8080"]
   
 logging:
-  level: info
   file: "server.log"

@@ -35,11 +35,13 @@ type PayloadConfig struct {
 	MutationSeed string `json:"mutation_seed,omitempty"`
 
 	// OPSEC Configuration
-	ProcScanIntervalSecs              int     `json:"proc_scan_interval_secs"`
-	BaseThresholdEnterFullOpsec       float64 `json:"base_threshold_enter_full_opsec"`
-	BaseThresholdExitFullOpsec        float64 `json:"base_threshold_exit_full_opsec"` // Will be mapped or ignored based on agent logic
+	ProcScanIntervalSecs        int     `json:"proc_scan_interval_secs"`
+	BaseThresholdEnterFullOpsec float64 `json:"base_threshold_enter_full_opsec"`
+	// Exit thresholds are reserved legacy request fields. The build contract
+	// rejects non-zero values until the agent implements them.
+	BaseThresholdExitFullOpsec        float64 `json:"base_threshold_exit_full_opsec"`
 	BaseThresholdEnterReducedActivity float64 `json:"base_threshold_enter_reduced_activity"`
-	BaseThresholdExitReducedActivity  float64 `json:"base_threshold_exit_reduced_activity"` // Will be mapped or ignored
+	BaseThresholdExitReducedActivity  float64 `json:"base_threshold_exit_reduced_activity"`
 	MinDurationFullOpsecSecs          int     `json:"min_duration_full_opsec_secs"`
 	MinDurationReducedActivitySecs    int     `json:"min_duration_reduced_activity_secs"`
 	MinDurationBackgroundOpsecSecs    int     `json:"min_duration_background_opsec_secs"`

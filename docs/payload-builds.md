@@ -36,9 +36,9 @@ The following options remain aspirational and are rejected when requested:
 Other fields are validated before the build. This includes a positive sleep
 interval, a valid SOCKS5 host and port, bounded enrollment sessions,
 non-negative duration and counter values, finite non-negative factors, and
-OPSEC entry thresholds from 0 through 100. An omitted SOCKS5 host and port
-resolve to `127.0.0.1:9050`; an omitted sleep technique resolves to
-`standard`.
+OPSEC entry thresholds from 0 through 100 with the Reduced Activity threshold
+strictly below the Full OPSEC threshold. An omitted SOCKS5 host and port resolve
+to `127.0.0.1:9050`; an omitted sleep technique resolves to `standard`.
 
 ## Deterministic Output
 
@@ -79,12 +79,13 @@ durable payload-build record. It contains:
 The artifact path is always root-relative. SHA-256 values are lowercase
 hexadecimal digests. The Rust build exports the sanitized effective
 configuration from the same JSON object it embeds, so SOCKS state, normalized
-numeric values, the mutation-selected user agent, and mutation endpoint
-segments cannot drift from the manifest. The server refuses a build if that
-export is missing, malformed, inconsistent with the build identity, or
-contains credential material. The manifest decoder verifies its schema,
-profile, relative path, effective-config digest, artifact digest shape, and
-creation timestamp before the API serves it.
+numeric values, the mutation-selected user agent, and compiled mutation seed
+cannot drift from the manifest. Mutation flags remain provenance metadata, not
+inactive runtime configuration fields. The server refuses a build if the
+effective-config export is missing, malformed, inconsistent with the build
+identity, or contains credential material. The manifest decoder verifies its
+schema, profile, relative path, effective-config digest, artifact digest shape,
+and creation timestamp before the API serves it.
 
 The successful generation response includes both an inline `manifest` and its
 root-relative `manifest_url`. A persisted manifest can be inspected later:

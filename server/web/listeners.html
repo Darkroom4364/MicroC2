@@ -30,36 +30,20 @@
                             </div>
                             
                             <div class="form-group">
-                                <label for="payloadType">Payload:</label>
+                                <label for="payloadType">Protocol:</label>
                                 <select id="payloadType" name="payloadType" required class="dark-select">
                                     <option value="https">HTTPS</option>
                                     <option value="http">HTTP</option>
-                                    <option value="dns">DNS over HTTPS (WIP)</option>
                                 </select>
                             </div>
                         </div>
 
                         <div class="form-section">
-                            <h3>Config Options</h3>
+                            <h3>Network Settings</h3>
                             <div class="form-group">
-                                <label for="hostInput">Hosts</label>
-                                <div class="input-with-buttons">
-                                    <input type="text" id="hostInput" placeholder="domain.com or IP address" class="dark-input">
-                                    <div class="button-group">
-                                        <button type="button" class="action-button purple">Add</button>
-                                        <button type="button" class="action-button purple">Clear</button>
-                                    </div>
-                                </div>
-                                <div id="hostsList" class="items-list"></div>
-                                <input type="hidden" id="hosts" name="hosts">
-                            </div>
-
-                            <div class="form-group">
-                                <label for="hostRotation">Host Rotation (WIP, not functional as of now):</label>
-                                <select id="hostRotation" name="hostRotation" class="dark-select">
-                                    <option value="round-robin">round-robin</option>
-                                    <option value="random">random</option>
-                                </select>
+                                <label for="advertisedHost">Advertised Host:</label>
+                                <input type="text" id="advertisedHost" name="advertisedHost" placeholder="127.0.0.1 or c2.lab.example" class="dark-input" value="127.0.0.1">
+                                <small class="form-text text-muted">Host embedded in generated payloads. Use an address reachable from the agent.</small>
                             </div>
 
                             <div class="form-group">
@@ -70,81 +54,8 @@
 
                             <div class="form-group">
                                 <label for="port">Port:</label>
-                                <input type="number" id="port" name="port" value="8443" class="dark-input" min="1024" max="65535">
+                                <input type="number" id="port" name="port" value="8443" class="dark-input" min="1" max="65535">
                                 <small class="form-text text-muted">Use ports above 1024 for non-root access</small>
-                            </div>
-
-                            <div class="form-group">
-                                <label for="userAgent">User Agent:</label>
-                                <input type="text" id="userAgent" name="userAgent" class="dark-input" 
-                                       value="Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36">
-                            </div>
-
-                            <div class="form-group">
-                                <label for="headerInput">Headers:</label>
-                                <div class="input-with-buttons">
-                                    <input type="text" id="headerInput" placeholder="X-Header: Value" class="dark-input">
-                                    <div class="button-group">
-                                        <button type="button" class="action-button purple">Add</button>
-                                        <button type="button" class="action-button purple">Clear</button>
-                                    </div>
-                                </div>
-                                <div id="headersList" class="items-list"></div>
-                                <input type="hidden" id="headers" name="headers">
-                            </div>
-
-                            <div class="form-group">
-                                <label for="uriInput">URIs:</label>
-                                <div class="input-with-buttons">
-                                    <input type="text" id="uriInput" placeholder="write /api/agent/ here for now" class="dark-input">
-                                    <div class="button-group">
-                                        <button type="button" class="action-button purple">Add</button>
-                                        <button type="button" class="action-button purple">Clear</button>
-                                    </div>
-                                </div>
-                                <div id="urisList" class="items-list"></div>
-                                <input type="hidden" id="uris" name="uris">
-                            </div>
-
-                            <div class="form-group">
-                                <label for="hostHeader">Host Header:</label>
-                                <input type="text" id="hostHeader" name="hostHeader" class="dark-input">
-                            </div>
-                        </div>
-
-                        <div class="form-section">
-                            <h3>Proxy Settings</h3>
-                            <div class="form-group">
-                                <label class="checkbox-label">
-                                    <input type="checkbox" id="enableProxy" name="enableProxy">
-                                    Enable Proxy connection
-                                </label>
-                            </div>
-
-                            <div id="proxySettings" class="proxy-settings hidden">
-                                <div class="form-group">
-                                    <label for="proxyType">Proxy Type:</label>
-                                    <select id="proxyType" name="proxyType" class="dark-select">
-                                        <option value="http">HTTP</option>
-                                        <option value="https">HTTPS</option>
-                                    </select>
-                                </div>
-                                <div class="form-group">
-                                    <label for="proxyHost">Proxy Host:</label>
-                                    <input type="text" id="proxyHost" name="proxyHost" class="dark-input">
-                                </div>
-                                <div class="form-group">
-                                    <label for="proxyPort">Proxy Port:</label>
-                                    <input type="number" id="proxyPort" name="proxyPort" class="dark-input">
-                                </div>
-                                <div class="form-group">
-                                    <label for="proxyUsername">Username (optional):</label>
-                                    <input type="text" id="proxyUsername" name="proxyUsername" class="dark-input">
-                                </div>
-                                <div class="form-group">
-                                    <label for="proxyPassword">Password (optional):</label>
-                                    <input type="password" id="proxyPassword" name="proxyPassword" class="dark-input">
-                                </div>
                             </div>
                         </div>
 

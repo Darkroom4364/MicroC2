@@ -44,7 +44,7 @@ func (g *OperatorGuard) Wrap(next http.Handler) http.Handler {
 			http.Error(w, "Forbidden: operator access requires a loopback client or a valid operator token", http.StatusForbidden)
 			return
 		}
-		if !common.IsOriginAllowed(r.Header.Get("Origin"), r.Host, g.allowedOrigins) {
+		if !common.IsOriginAllowed(r.Header.Get("Origin"), r, g.allowedOrigins) {
 			log.Printf("[SECURITY] Denied operator request from an untrusted origin")
 			http.Error(w, "Forbidden: operator origin is not allowed", http.StatusForbidden)
 			return
@@ -89,7 +89,7 @@ func (g *OperatorGuard) authorizedActor(r *http.Request) (audit.Actor, bool) {
 // (log stream and terminal), blocking cross-site WebSocket hijacking from
 // origins that are not configured or same-host.
 func (g *OperatorGuard) CheckOrigin(r *http.Request) bool {
-	allowed := common.IsOriginAllowed(r.Header.Get("Origin"), r.Host, g.allowedOrigins)
+	allowed := common.IsOriginAllowed(r.Header.Get("Origin"), r, g.allowedOrigins)
 	if !allowed {
 		log.Printf("[SECURITY] Denied WebSocket request from an untrusted origin")
 	}

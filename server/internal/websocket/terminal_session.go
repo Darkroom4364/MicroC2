@@ -43,7 +43,7 @@ type TerminalHandler struct {
 //
 // Pre-conditions:
 //   - checkOrigin validates the Origin header of upgrade requests; if nil,
-//     a same-host/loopback-only check is used
+//     a same-origin check is used
 //
 // Post-conditions:
 //   - Returns a properly initialized TerminalHandler with origin checking

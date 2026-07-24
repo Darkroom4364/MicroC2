@@ -25,7 +25,7 @@ const (
 // Pre-conditions:
 //   - logStreamer is a properly initialized LogStreamer instance
 //   - checkOrigin validates WebSocket upgrade origins; if nil, the default
-//     same-host/loopback-only policy is used
+//     same-origin policy is used
 //
 // Post-conditions:
 //   - Returns a configured websocket Handler instance

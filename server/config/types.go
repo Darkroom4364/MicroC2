@@ -8,12 +8,11 @@ type Config struct {
 	} `yaml:"storage"`
 
 	Server struct {
+		// Port is the sole HTTPS port for the operator UI and API.
 		Port      string `yaml:"port"`
-		HTTPSPort string `yaml:"httpsPort"`
 		UploadDir string `yaml:"uploadDir"`
 		StaticDir string `yaml:"staticDir"`
 		TLS       struct {
-			Enabled  bool   `yaml:"enabled"`
 			CertFile string `yaml:"certFile"`
 			KeyFile  string `yaml:"keyFile"`
 		} `yaml:"tls"`
@@ -23,15 +22,7 @@ type Config struct {
 		} `yaml:"redirect"`
 	} `yaml:"server"`
 
-	Communication struct {
-		Protocol    string `yaml:"protocol"`
-		HTTPPolling struct {
-			HeartbeatInterval int `yaml:"heartbeatInterval"`
-		} `yaml:"http"`
-	} `yaml:"communication"`
-
 	Security struct {
-		EnableCORS bool `yaml:"enableCORS"`
 		// EnableServerTerminal permits the browser-accessible shell on the
 		// server host. Its secure default is false.
 		EnableServerTerminal bool     `yaml:"enableServerTerminal"`
@@ -47,13 +38,12 @@ type Config struct {
 		// Can also be set via the MICROC2_OPERATOR_TOKEN environment variable.
 		OperatorToken string `yaml:"operatorToken"`
 		// OperatorAllowedOrigins lists origins allowed to call operator APIs
-		// and open operator WebSockets (log stream, terminal). Same-host and
-		// loopback origins are always allowed; "*" disables origin checks.
+		// and open operator WebSockets (log stream, terminal). The exact
+		// same origin is always allowed; "*" disables origin checks.
 		OperatorAllowedOrigins []string `yaml:"operatorAllowedOrigins"`
 	} `yaml:"security"`
 
 	Logging struct {
-		Level string `yaml:"level"`
-		File  string `yaml:"file"`
+		File string `yaml:"file"`
 	} `yaml:"logging"`
 }

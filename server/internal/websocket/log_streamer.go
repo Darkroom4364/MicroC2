@@ -54,7 +54,7 @@ func NewLogStreamer(logfile *os.File) *LogStreamer {
 }
 
 // SetCheckOrigin replaces the WebSocket origin policy used for upgrades.
-// Passing nil restores the default same-host/loopback-only policy.
+// Passing nil restores the default same-origin policy.
 func (ls *LogStreamer) SetCheckOrigin(checkOrigin func(*http.Request) bool) {
 	if checkOrigin == nil {
 		checkOrigin = DefaultOriginCheck

@@ -751,7 +751,7 @@ func (p *HTTPPollingProtocol) enableCors(w http.ResponseWriter, r *http.Request)
 	switch {
 	case wildcard:
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-	case common.IsOriginAllowed(origin, r.Host, allowed):
+	case common.IsOriginAllowed(origin, r, allowed):
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Add("Vary", "Origin")
 	default:

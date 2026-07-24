@@ -186,7 +186,8 @@ func (m *ListenerManager) loadAndRecoverDurableListeners() (
 				record.id,
 			)
 		}
-		if err := json.Unmarshal(record.configJSON, &record.config); err != nil {
+		record.config, err = decodeListenerConfigProjection(record.configJSON)
+		if err != nil {
 			_ = rows.Close()
 			return nil, nil, nil, fmt.Errorf(
 				"decode durable listener %s config: %w",
@@ -202,7 +203,7 @@ func (m *ListenerManager) loadAndRecoverDurableListeners() (
 				record.id,
 			)
 		}
-		if err := m.validateListenerConfig(record.config); err != nil {
+		if err := m.validateListenerConfig(&record.config); err != nil {
 			_ = rows.Close()
 			return nil, nil, nil, fmt.Errorf(
 				"validate durable listener %s config: %w",
