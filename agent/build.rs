@@ -190,7 +190,7 @@ fn export_effective_config(config_content: &str) {
         .join(payload_id)
         .join("output")
         .join("effective-config.json");
-    if Path::new(&requested_destination) != destination {
+    if requested_destination.as_os_str() != destination.as_os_str() {
         panic!("EFFECTIVE_CONFIG_PATH must be the private per-build effective-config path");
     }
     config.remove("enrollment_credential");
