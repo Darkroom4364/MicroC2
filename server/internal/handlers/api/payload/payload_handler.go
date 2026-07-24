@@ -2378,7 +2378,7 @@ func (h *PayloadHandler) openVerifiedPayload(
 		nativeRelativePath,
 	)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+		if isPayloadNotExistError(err) {
 			return nil, payloadStateMissing, "artifact is missing", ""
 		}
 		return nil, payloadStateCorrupt, "artifact cannot be opened", ""

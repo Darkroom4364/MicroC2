@@ -5,9 +5,14 @@ package payload
 import (
 	"errors"
 	"fmt"
+	"os"
 
 	"golang.org/x/sys/unix"
 )
+
+func isPayloadNotExistError(err error) bool {
+	return errors.Is(err, os.ErrNotExist)
+}
 
 func ensurePayloadClassDirectory(payloadRoot, class string) error {
 	if !validPayloadDirectorySegment(class) {
