@@ -173,15 +173,26 @@ fn canonical_server_url(raw: &str, protocol: &str, host: &str, port: &str) -> St
 }
 
 fn export_effective_config(config_content: &str) {
-    let Some(destination) = env::var_os("EFFECTIVE_CONFIG_PATH") else {
+    let Some(requested_destination) = env::var_os("EFFECTIVE_CONFIG_PATH") else {
         return;
     };
-    let destination = PathBuf::from(destination);
     let mut config: serde_json::Value = serde_json::from_str(config_content)
         .unwrap_or_else(|err| panic!("failed to parse embedded config for export: {err}"));
     let config = config
         .as_object_mut()
         .unwrap_or_else(|| panic!("embedded config must be a JSON object"));
+    let payload_id = config
+        .get("payload_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("embedded config payload_id must be a string"));
+    validate_identifier("PAYLOAD_ID", payload_id);
+    let destination = Path::new(".microc2-build")
+        .join(payload_id)
+        .join("output")
+        .join("effective-config.json");
+    if Path::new(&requested_destination) != destination {
+        panic!("EFFECTIVE_CONFIG_PATH must be the private per-build effective-config path");
+    }
     config.remove("enrollment_credential");
     let sanitized = serde_json::to_vec(config)
         .unwrap_or_else(|err| panic!("failed to serialize effective config: {err}"));
