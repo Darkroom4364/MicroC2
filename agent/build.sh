@@ -552,14 +552,14 @@ echo "  MIN_BG_OPSEC_SECS: $MIN_BG_OPSEC_SECS, REDUCED_ACTIVITY_SLEEP_SECS: $RED
 echo "Building for $TARGET (Format: $FORMAT) with flags: $BUILD_FLAGS $CARGO_FEATURES..."
 if [[ "$TARGET" == *windows* ]]; then
     if command -v cross &> /dev/null; then
-        cross build $BUILD_FLAGS $CARGO_FEATURES --target $TARGET
+        cross build --locked $BUILD_FLAGS $CARGO_FEATURES --target $TARGET
     else
         echo "Warning: 'cross' command not found. Attempting with 'cargo build'. Make sure Rust target '$TARGET' is installed."
         rustup target add $TARGET # Ensure target is installed
-        cargo build $BUILD_FLAGS $CARGO_FEATURES --target $TARGET
+        cargo build --locked $BUILD_FLAGS $CARGO_FEATURES --target $TARGET
     fi
 else # For Linux, macOS, etc.
-    cargo build $BUILD_FLAGS $CARGO_FEATURES --target $TARGET
+    cargo build --locked $BUILD_FLAGS $CARGO_FEATURES --target $TARGET
 fi
 
 BUILD_SUCCESS=$?

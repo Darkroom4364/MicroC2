@@ -211,9 +211,9 @@ Exit criteria:
 
 Candidate issues:
 
-- #99 `[Payload] Validate build options and record build provenance` — partial,
-  P1. Seed provenance landed, but the supported build matrix, fail-fast option
-  validation, canonical artifact path, and complete inspectable manifest remain.
+- #99 `[Payload] Validate build options and record build provenance` —
+  implemented. The bounded build matrix, fail-fast validation, canonical
+  artifact path, and versioned inspectable manifest form one explicit contract.
 - #79 `[Agent] Reduce dependencies as much as possible`
 - #67 `[Agent] - Source-Level Mutation Engine (Phase 1)` — v0 landed: seeded
   mutation (`MUTATION_SEED`) covering the config XOR key, a junk-code module,
@@ -382,13 +382,14 @@ Recommended next sequence:
 
 1. Tackle #88 after #98, adding file transfer and pivot operations as explicit
    task types instead of new string commands.
-2. Continue the bounded #99 payload-quality track alongside the data path.
+2. Preserve the implemented #99 payload-build contract while future profiles
+   remain separate, explicitly scoped work.
 3. Build evidence export and reporting views on the completed structured audit
    foundation.
 
 The data path **#98 → #97 → #100** is complete on the `dev` integration line,
 and #104 closes the authenticated-enrollment boundary there. No `dev` to
 `main` promotion is part of this sequence, and completion does not imply that
-one is ready. Issue #108 is an explicit promotion gate for cross-platform
-payload-path containment. Issue #99 remains a bounded P1 payload-quality track
-that can proceed alongside it.
+one is ready. Issue #108's cross-platform payload-path containment work is also
+complete on `dev`. Issue #99's bounded payload-quality contract is implemented;
+additional profiles remain future work.

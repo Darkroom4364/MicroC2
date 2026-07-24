@@ -253,12 +253,11 @@ payload root with owner-only directory and artifact permissions.
 
 Listener, payload/build, and runtime agent IDs are distinct. A selected listener
 provides connection configuration, each build receives its own payload ID, and
-each execution enrolls with a runtime agent ID. Build provenance is present but
-still partial; issue #99 tracks supported-profile validation, canonical output
-paths, and the complete inspectable manifest. A source revision and mutation
-seed reproduce mutation choices, but cannot recreate the exact production
-artifact without its deliberately unrecorded random bootstrap secret. The build
-row begins in
+each execution enrolls with a runtime agent ID. Issue #99 now defines the
+supported profiles, canonical output path, and complete versioned manifest; see
+[Payload build contract](payload-builds.md). A source revision and mutation seed
+reproduce mutation choices, but cannot recreate the exact production artifact
+without its deliberately unrecorded random bootstrap secret. The build row begins in
 `building`, then transitions to `completed` or `failed`; startup turns a
 leftover build into `interrupted` without resuming it. Startup and download-time
 revalidation keep a completed indexed artifact in `completed`, `missing`, or
@@ -389,11 +388,12 @@ The main remaining gaps are tracked as issues:
   line; it does not imply a `dev` to `main` promotion.
 - #100: structured, durable audit events are complete on the `dev` integration
   line; operator-facing evidence export is still future work.
-- #108: replace payload artifact check-then-use paths with cross-platform
-  open-beneath handles before any `dev` to `main` promotion.
+- #108: cross-platform open-beneath payload artifact handling is complete on
+  the `dev` integration line; no `dev` to `main` promotion was performed.
 - #88: add file transfer and pivot controls as typed task families after #98.
-- #99: finish payload validation and manifests; current provenance is partial.
+- #99: the bounded payload validation and manifest contract is implemented.
 - #65: finish the agent configuration system and optional OPSEC feature gating.
 
-Until those are complete, MicroC2 should be treated as a controlled lab research
-prototype rather than a hardened multi-user operations platform.
+Until the remaining production-hardening work is complete, MicroC2 should be
+treated as a controlled lab research prototype rather than a hardened
+multi-user operations platform.
