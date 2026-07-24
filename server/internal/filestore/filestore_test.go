@@ -144,6 +144,172 @@ func TestHandleUploadAcceptsBasename(t *testing.T) {
 	}
 }
 
+func TestHandleUploadWithInfoReportsCommittedFiles(t *testing.T) {
+	fs := newTestStore(t)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for name, content := range map[string]string{
+		"first.txt":  "one",
+		"second.txt": "second",
+	} {
+		part, err := writer.CreateFormFile("files", name)
+		if err != nil {
+			t.Fatalf("create form file %s: %v", name, err)
+		}
+		if _, err := part.Write([]byte(content)); err != nil {
+			t.Fatalf("write form file %s: %v", name, err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/file_drop/upload", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	uploaded, err := fs.HandleUploadWithInfo(req)
+	if err != nil {
+		t.Fatalf("upload with metadata: %v", err)
+	}
+	if len(uploaded) != 2 {
+		t.Fatalf("uploaded metadata count = %d, want 2", len(uploaded))
+	}
+	byName := make(map[string]FileInfo, len(uploaded))
+	for _, info := range uploaded {
+		byName[info.Name] = info
+	}
+	if byName["first.txt"].Size != 3 || byName["second.txt"].Size != 6 {
+		t.Fatalf("unexpected upload metadata: %#v", byName)
+	}
+	stagingFiles, err := filepath.Glob(
+		filepath.Join(fs.baseDir, ".microc2-upload-*"),
+	)
+	if err != nil {
+		t.Fatalf("glob upload staging files: %v", err)
+	}
+	if len(stagingFiles) != 0 {
+		t.Fatalf("upload left staging files behind: %v", stagingFiles)
+	}
+}
+
+func TestHandleUploadAtomicallyReplacesSymlinkWithoutFollowingIt(t *testing.T) {
+	fs := newTestStore(t)
+	outside := filepath.Join(t.TempDir(), "outside.txt")
+	if err := os.WriteFile(outside, []byte("keep outside"), 0o600); err != nil {
+		t.Fatalf("write outside file: %v", err)
+	}
+	destination := filepath.Join(fs.baseDir, "evidence.txt")
+	if err := os.Symlink(outside, destination); err != nil {
+		t.Skipf("symlinks are unavailable: %v", err)
+	}
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("files", "evidence.txt")
+	if err != nil {
+		t.Fatalf("create upload part: %v", err)
+	}
+	if _, err := part.Write([]byte("new evidence")); err != nil {
+		t.Fatalf("write upload part: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart body: %v", err)
+	}
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/file_drop/upload",
+		&body,
+	)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+
+	if _, err := fs.HandleUploadWithInfo(request); err != nil {
+		t.Fatalf("upload over destination symlink: %v", err)
+	}
+	outsideContent, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatalf("read outside file: %v", err)
+	}
+	if string(outsideContent) != "keep outside" {
+		t.Fatalf("outside file was overwritten: %q", outsideContent)
+	}
+	destinationInfo, err := os.Lstat(destination)
+	if err != nil {
+		t.Fatalf("inspect uploaded destination: %v", err)
+	}
+	if destinationInfo.Mode()&os.ModeSymlink != 0 ||
+		!destinationInfo.Mode().IsRegular() {
+		t.Fatalf("destination was not replaced by a regular file: %v", destinationInfo.Mode())
+	}
+	destinationContent, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatalf("read uploaded destination: %v", err)
+	}
+	if string(destinationContent) != "new evidence" {
+		t.Fatalf("uploaded destination content = %q", destinationContent)
+	}
+}
+
+func TestListFilesOmitsSymlinksAndNonRegularEntries(t *testing.T) {
+	fs := newTestStore(t)
+	if err := os.WriteFile(
+		filepath.Join(fs.baseDir, "regular.txt"),
+		[]byte("data"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write regular file: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(fs.baseDir, "directory"), 0o700); err != nil {
+		t.Fatalf("create directory: %v", err)
+	}
+	if err := os.Symlink(
+		filepath.Join(fs.baseDir, "regular.txt"),
+		filepath.Join(fs.baseDir, "linked.txt"),
+	); err != nil {
+		t.Skipf("symlinks are unavailable: %v", err)
+	}
+
+	files, err := fs.ListFiles()
+	if err != nil {
+		t.Fatalf("list files: %v", err)
+	}
+	if len(files) != 1 || files[0].Name != "regular.txt" {
+		t.Fatalf("listed unsafe filesystem entries: %#v", files)
+	}
+}
+
+func TestOpenFileReturnsVerifiedRegularFile(t *testing.T) {
+	fs := newTestStore(t)
+	path := filepath.Join(fs.baseDir, "loot.txt")
+	if err := os.WriteFile(path, []byte("data"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	file, info, err := fs.OpenFile("loot.txt")
+	if err != nil {
+		t.Fatalf("open regular file: %v", err)
+	}
+	defer file.Close()
+	if info.Name != "loot.txt" || info.Size != 4 {
+		t.Fatalf("unexpected file info: %#v", info)
+	}
+}
+
+func TestOpenFileRejectsSymlink(t *testing.T) {
+	fs := newTestStore(t)
+	outside := filepath.Join(t.TempDir(), "outside.txt")
+	if err := os.WriteFile(outside, []byte("secret"), 0o600); err != nil {
+		t.Fatalf("write outside file: %v", err)
+	}
+	link := filepath.Join(fs.baseDir, "linked.txt")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlinks are unavailable: %v", err)
+	}
+
+	if _, _, err := fs.OpenFile("linked.txt"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("open symlink error = %v, want os.ErrNotExist", err)
+	}
+}
+
 func newTestStore(t *testing.T) *FileStore {
 	t.Helper()
 	fs, err := New(t.TempDir())

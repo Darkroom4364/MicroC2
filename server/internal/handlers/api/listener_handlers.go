@@ -41,7 +41,7 @@ func (h *ListenerHandlers) HandleCreateListener(w http.ResponseWriter, r *http.R
 	// Trim whitespace from bind host to avoid invalid addresses
 	config.BindHost = strings.TrimSpace(config.BindHost)
 
-	listener, err := h.manager.CreateListener(config)
+	listener, err := h.manager.CreateListenerWithContext(r.Context(), config)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -130,7 +130,7 @@ func (h *ListenerHandlers) HandleStopListener(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if err := h.manager.StopListener(id); err != nil {
+	if err := h.manager.StopListenerWithContext(r.Context(), id); err != nil {
 		sendJSONError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -153,7 +153,7 @@ func (h *ListenerHandlers) HandleDeleteListener(w http.ResponseWriter, r *http.R
 	}
 
 	// Now using DeleteListener which completely removes the listener
-	if err := h.manager.DeleteListener(id); err != nil {
+	if err := h.manager.DeleteListenerWithContext(r.Context(), id); err != nil {
 		sendJSONError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -190,7 +190,7 @@ func (h *ListenerHandlers) HandleStartListener(w http.ResponseWriter, r *http.Re
 	}
 
 	// Start the listener
-	if err := h.manager.StartListener(id); err != nil {
+	if err := h.manager.StartListenerWithContext(r.Context(), id); err != nil {
 		sendJSONError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

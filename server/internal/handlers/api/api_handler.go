@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 
 	// Updated from `networking`
 
+	"microc2/server/internal/audit"
 	"microc2/server/internal/behaviour"
 	"microc2/server/internal/listeners"
 	"microc2/server/internal/tasks"
@@ -24,13 +26,21 @@ import (
 const scopedAgentKeyDelimiter = "/"
 
 func NewAPIHandler(manager *communication.ServerManager) *APIHandler {
-	return &APIHandler{
+	handler := &APIHandler{
 		serverManager: manager,
 	}
+	if manager != nil && manager.GetDatabase() != nil {
+		handler.audit, handler.auditErr = audit.NewStore(manager.GetDatabase())
+	}
+	return handler
 }
 
 func (h *APIHandler) HandleRequest(w http.ResponseWriter, r *http.Request) {
 	// log.Printf("[DEBUG] HandleRequest called: %s %s", r.Method, r.URL.Path)
+	if r.URL.Path == "/api/audit/events" {
+		h.handleAuditEvents(w, r)
+		return
+	}
 	if r.URL.Path == "/api/agents/list" {
 		h.handleListAgents(w, r)
 		return
@@ -132,6 +142,26 @@ type taskProtocol interface {
 	AgentLastSeen(agentID string) (time.Time, bool)
 }
 
+type taskCreateContextProtocol interface {
+	CreateTaskContext(
+		context.Context,
+		string,
+		tasks.CreateRequest,
+	) (tasks.Task, error)
+}
+
+type taskCancelContextProtocol interface {
+	CancelTaskContext(context.Context, string, string) (tasks.Task, error)
+}
+
+type legacyTaskQueueContextProtocol interface {
+	QueueLegacyShellTaskContext(
+		context.Context,
+		string,
+		string,
+	) (tasks.Task, error)
+}
+
 type taskSummaryProtocol interface {
 	ListTaskSummariesPage(
 		agentID string,
@@ -184,7 +214,12 @@ func (h *APIHandler) handleTasks(w http.ResponseWriter, r *http.Request, agentID
 			writeJSONDecodeError(w, "Invalid task request", err)
 			return
 		}
-		task, err := protocol.CreateTask(agentID, request)
+		var task tasks.Task
+		if actorAware, ok := protocol.(taskCreateContextProtocol); ok {
+			task, err = actorAware.CreateTaskContext(r.Context(), agentID, request)
+		} else {
+			task, err = protocol.CreateTask(agentID, request)
+		}
 		if err != nil {
 			writeTaskError(w, err)
 			return
@@ -246,7 +281,7 @@ func (h *APIHandler) handleCancelTask(w http.ResponseWriter, r *http.Request, ag
 		writeTaskQueryError(w, err)
 		return
 	}
-	task, err := h.cancelAgentTask(agentID, taskID)
+	task, err := h.cancelAgentTask(r.Context(), agentID, taskID)
 	if err != nil {
 		if errors.Is(err, errAmbiguousTaskOwnership) {
 			writeAgentResolutionError(w, err)
@@ -409,12 +444,27 @@ func (p *durableHistoryTaskProtocol) CreateTask(
 	return p.store.Create(agentID, request)
 }
 
+func (p *durableHistoryTaskProtocol) CreateTaskContext(
+	ctx context.Context,
+	agentID string,
+	request tasks.CreateRequest,
+) (tasks.Task, error) {
+	return p.store.CreateContext(ctx, agentID, request)
+}
+
 func (p *durableHistoryTaskProtocol) ListTasks(agentID string) ([]tasks.Task, error) {
 	return p.store.List(agentID)
 }
 
 func (p *durableHistoryTaskProtocol) CancelTask(agentID, taskID string) (tasks.Task, error) {
 	return p.store.Cancel(agentID, taskID)
+}
+
+func (p *durableHistoryTaskProtocol) CancelTaskContext(
+	ctx context.Context,
+	agentID, taskID string,
+) (tasks.Task, error) {
+	return p.store.CancelContext(ctx, agentID, taskID)
 }
 
 func (p *durableHistoryTaskProtocol) GetTask(agentID, taskID string) (tasks.Task, error) {
@@ -445,6 +495,13 @@ func (p *durableHistoryTaskProtocol) QueueLegacyShellTask(
 	agentID, command string,
 ) (tasks.Task, error) {
 	return p.store.CreateLegacyShell(agentID, command)
+}
+
+func (p *durableHistoryTaskProtocol) QueueLegacyShellTaskContext(
+	ctx context.Context,
+	agentID, command string,
+) (tasks.Task, error) {
+	return p.store.CreateLegacyShellContext(ctx, agentID, command)
 }
 
 func (p *durableHistoryTaskProtocol) AgentLastSeen(agentID string) (time.Time, bool) {
@@ -729,7 +786,10 @@ func (h *APIHandler) getAgentTask(agentID, taskID string) (tasks.Task, error) {
 	}
 }
 
-func (h *APIHandler) cancelAgentTask(agentID, taskID string) (tasks.Task, error) {
+func (h *APIHandler) cancelAgentTask(
+	ctx context.Context,
+	agentID, taskID string,
+) (tasks.Task, error) {
 	var owners []taskProtocol
 	refs, err := h.agentTaskProtocolRefs(agentID)
 	if err != nil {
@@ -746,6 +806,9 @@ func (h *APIHandler) cancelAgentTask(agentID, taskID string) (tasks.Task, error)
 	case 0:
 		return tasks.Task{}, tasks.ErrNotFound
 	case 1:
+		if actorAware, ok := owners[0].(taskCancelContextProtocol); ok {
+			return actorAware.CancelTaskContext(ctx, agentID, taskID)
+		}
 		return owners[0].CancelTask(agentID, taskID)
 	default:
 		return tasks.Task{}, errAmbiguousTaskOwnership
@@ -981,7 +1044,7 @@ func (h *APIHandler) handleQueueAgentCommandFromBody(w http.ResponseWriter, r *h
 		return
 	}
 
-	h.queueAgentCommandResponse(w, req.AgentID, req.Command)
+	h.queueAgentCommandResponse(r.Context(), w, req.AgentID, req.Command)
 }
 
 // handleQueueAgentCommand handles POST /api/agents/{AgentID}/command
@@ -999,16 +1062,25 @@ func (h *APIHandler) handleQueueAgentCommand(w http.ResponseWriter, r *http.Requ
 	}
 	// log.Printf("[DEBUG] handleQueueAgentCommand: AgentID=%s, command=%s", AgentID, req.Command)
 
-	h.queueAgentCommandResponse(w, AgentID, req.Command)
+	h.queueAgentCommandResponse(r.Context(), w, AgentID, req.Command)
 }
 
-func (h *APIHandler) queueAgentCommandResponse(w http.ResponseWriter, AgentID, command string) {
+func (h *APIHandler) queueAgentCommandResponse(
+	ctx context.Context,
+	w http.ResponseWriter,
+	AgentID, command string,
+) {
 	protocol, err := h.resolveActiveAgentTaskProtocol(AgentID)
 	if err != nil {
 		writeAgentResolutionError(w, err)
 		return
 	}
-	task, err := protocol.QueueLegacyShellTask(AgentID, command)
+	var task tasks.Task
+	if actorAware, ok := protocol.(legacyTaskQueueContextProtocol); ok {
+		task, err = actorAware.QueueLegacyShellTaskContext(ctx, AgentID, command)
+	} else {
+		task, err = protocol.QueueLegacyShellTask(AgentID, command)
+	}
 	if err != nil {
 		writeTaskError(w, err)
 		return

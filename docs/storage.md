@@ -2,15 +2,15 @@
 
 MicroC2's development branch uses one process-wide SQLite database for durable
 server state. It stores listener records and lifecycle events, historical agent
-metadata, typed task lifecycles and results, legacy result projections, and
-payload-build metadata. With #104 it also stores the enrollment HMAC key,
-payload bootstrap hashes and allowances, and durable agent-session state.
-Payload binaries, listener compatibility configs, operator uploads, and server
-logs remain files on disk.
+metadata, typed task lifecycles and results, legacy result projections,
+payload-build metadata, and immutable structured audit events. With #104 it
+also stores the enrollment HMAC key, payload bootstrap hashes and allowances,
+and durable agent-session state. Payload binaries, listener compatibility
+configs, operator uploads, and server logs remain files on disk.
 
-This is a single-process, local-lab persistence design. Issue #97 is merged into
-`dev`, and #104 builds authenticated enrollment on that foundation. Neither is
-a substitute for the structured audit trail planned in #100.
+This is a single-process, local-lab persistence design. Issues #97 and #104
+provide the durable and authenticated foundations on the `dev` integration
+line; #100 adds the separate actor-aware audit layer.
 
 ## Configuration
 
@@ -87,6 +87,11 @@ each build/listener/agent tuple. Per-build allowances count identities ever
 allocated from that bootstrap; revoking a session does not make its slot
 available to a different identity.
 
+`0004_structured_audit_events.sql` adds Audit Event v1 storage and causal links
+from tasks, payload builds, and listener lifecycle records. Existing records
+are backfilled with explicit `system` migration events, so an upgraded database
+does not pretend that pre-audit history had an authenticated human actor.
+
 A newly created database directory is restricted to mode `0700` on platforms
 that support POSIX permissions. The database file is created or tightened to
 mode `0600`. MicroC2 does not change permissions on an existing database parent
@@ -158,10 +163,10 @@ with current-user DPAPI, while Unix uses `0700` directories and `0600` files.
 Losing that state requires an explicit operator re-enrollment because the
 embedded bootstrap cannot replay after confirmation.
 
-Listener lifecycle events are append-only operational history. They cover
+Listener lifecycle events remain append-only operational history. They cover
 creation, import, start, stop, error, delete, compensated creation failure, and
-crash recovery, but they are not actor-aware security audit records. Issue
-#100 remains the audit boundary.
+crash recovery. Each new lifecycle record links to its structured audit event;
+older records are linked to explicit migration events.
 
 Payload metadata survives restart independently of the artifact bytes. A
 metadata row is created in `building` immediately before the build process
@@ -176,6 +181,61 @@ does not substitute different bytes.
 The compatibility `/static/` file server denies both `listeners` and `payloads`
 trees. Payload downloads must pass through the metadata and digest gate at
 `/api/payload/download/{id}`.
+
+## Structured Audit Events
+
+Audit Event v1 records:
+
+- a monotonic sequence and server receipt time;
+- an actor kind and identifier;
+- a stable action, route, target, and outcome;
+- an optional closed reason code and causal event sequence; and
+- only the relevant listener, agent, task, payload-build, file-basename, or
+  terminal-session identifiers.
+
+The normative contracts are [Audit Event v1](schemas/audit-event-v1.schema.json)
+and [Audit Page v1](schemas/audit-page-v1.schema.json). Authenticated operator
+requests identify the actor as `operator/loopback` or
+`operator/shared-token`. These identify the authentication mechanism, not an
+individual person. Agent lifecycle events use the enrolled runtime agent ID,
+and recovery or migration events use an explicit system actor.
+
+The application appends audit events transactionally with the durable state
+change where a shared SQLite transaction is available. Task and payload rows
+retain their root causal sequence; later lifecycle events reference it.
+Listener lifecycle rows retain the corresponding event sequence. Exact task
+status/result retries remain idempotent instead of manufacturing duplicate
+success events. Agent-session rotation, revocation, and required re-enrollment
+also share their state transaction with the audit append. Payload artifact
+reconciliation emits a root-linked event only when its durable state, detail,
+or verified hash changes; failed download attempts and rejected enrollment
+revocations receive closed reason codes.
+Audit history survives restart and is available newest-first at
+`GET /api/audit/events?limit=50&offset=0`; the operator endpoint allows 1–100
+events per page, caps requested offsets at 1,000,000, and sends
+`Cache-Control: no-store`.
+
+The event input is a closed allowlist. It deliberately has no arbitrary
+metadata, details, request-body, or raw-error field. MicroC2 never records:
+
+- task commands, stdout, stderr, or result error text;
+- terminal commands, terminal output, or transcripts;
+- operator or agent credentials, authorization headers, bootstrap values,
+  session bearers, or enrollment keys;
+- uploaded/downloaded file contents, multipart bodies, or full filesystem
+  paths; or
+- payload build output, compiler output, embedded configuration, or secret
+  build inputs.
+
+File basenames and object identifiers are still potentially sensitive
+metadata, and the SQLite database already contains credential-adjacent
+enrollment state. Protect the database and its backups accordingly. Audit
+events are application-level append-only: MicroC2 has no event update,
+selective-delete, TTL, or automatic-pruning API. The current retention period
+is therefore the lifetime of the database and its cold backups. If a lab has a
+shorter retention policy, rotate complete, coordinated database/artifact backup
+sets outside MicroC2 rather than editing individual audit rows or foreign-key
+links.
 
 ## Backup, Restore, And Upgrade
 
@@ -233,8 +293,8 @@ schema or migration ledger.
   4,096 active enrollment sessions.
 - Historical agent listings are bounded with `limit`/`offset` pagination:
   default 100 entries, maximum 500.
-- Listener lifecycle events are not the structured, actor-aware audit trail
-  tracked by #100.
+- Structured audit history is bounded only at the retrieval API. Storage has no
+  automatic retention or pruning policy.
 - Operator uploads, payload binaries, listener upload directories, and logs are
   files, not database blobs; backup and restore must include them separately.
   Listener config projections are redacted, regenerable compatibility files.

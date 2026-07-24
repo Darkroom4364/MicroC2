@@ -26,6 +26,9 @@ communication:
     
 security:
   enableCORS: true
+  # The browser-accessible server shell is disabled by default. Enable it only
+  # for an explicitly controlled lab after considering host-level impact.
+  enableServerTerminal: false
   agentTransport:
     # Plaintext HTTP agent listeners are rejected unless this isolated-lab
     # escape hatch is explicitly enabled.
@@ -33,8 +36,9 @@ security:
   # CORS origins for agent polling routes. Use ["*"] only as an explicit
   # escape hatch; empty list means no cross-origin access.
   corsOrigins: ["https://localhost:8443", "http://localhost:8080"]
-  # Shared token protecting the operator API, file drop, and server terminal.
-  # Empty means loopback-only operator access (safe lab default).
+  # Shared token protecting the operator API, file drop, and the server
+  # terminal when it is explicitly enabled. Empty means loopback-only operator
+  # access (safe lab default).
   # Can also be set via the MICROC2_OPERATOR_TOKEN environment variable.
   operatorToken: ""
   # Origins allowed to open operator WebSockets (log stream, terminal).

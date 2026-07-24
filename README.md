@@ -201,10 +201,13 @@ This framework was built by someone running on way too much caffeine. If you enc
 
 ### Safe lab defaults
 
-- With `security.operatorToken` empty, the operator UI, API, file drop, log
-  stream, and terminal accept loopback clients only. This keeps the default
-  local workflow available without exposing operator control to the lab
-  network.
+- With `security.operatorToken` empty, the operator UI, API, file drop, and log
+  stream accept loopback clients only. This keeps the default local workflow
+  available without exposing operator control to the lab network.
+- The host-shell WebSocket is disabled by default. Set
+  `security.enableServerTerminal: true` only for a controlled lab that needs
+  it. Access requests and session open/close state are audited even when access
+  is denied; commands and terminal output are never recorded as audit fields.
 - For remote operator access, set a strong token through the environment
   instead of committing it to YAML:
 
@@ -231,6 +234,10 @@ This framework was built by someone running on way too much caffeine. If you enc
   credentials added by #104. See
   [Authenticated agent enrollment](docs/agent-enrollment.md) for rotation,
   recovery, and upgrade details.
+- Structured audit history is available to authenticated operators at
+  `GET /api/audit/events?limit=50&offset=0`. It is durable and redacted but
+  still contains sensitive object metadata; see
+  [audit retention and redaction](docs/storage.md#structured-audit-events).
 - Bind listeners only to the isolated lab segment and keep detonation VMs
   without direct internet egress. See
   [`docs/research/r1-measurement-protocol.md`](docs/research/r1-measurement-protocol.md)

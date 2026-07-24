@@ -1,6 +1,7 @@
 package listeners
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"microc2/server/internal/audit"
 	"microc2/server/internal/common"
 	"microc2/server/internal/persistence"
 )
@@ -94,12 +96,18 @@ func TestListenerLifecycleEventsSurviveRestartAndRecoverStopped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create durable listener manager: %v", err)
 	}
-	listener, err := manager.CreateListener(ListenerConfig{
-		Name:     "durable-listener",
-		Protocol: "http",
-		BindHost: "127.0.0.1",
-		Port:     freeTCPPort(t),
-	})
+	listener, err := manager.CreateListenerWithContext(
+		audit.WithActor(context.Background(), audit.Actor{
+			Kind: audit.ActorOperator,
+			ID:   "shared-token",
+		}),
+		ListenerConfig{
+			Name:     "durable-listener",
+			Protocol: "http",
+			BindHost: "127.0.0.1",
+			Port:     freeTCPPort(t),
+		},
+	)
 	if err != nil {
 		t.Fatalf("create listener: %v", err)
 	}
@@ -110,6 +118,13 @@ func TestListenerLifecycleEventsSurviveRestartAndRecoverStopped(t *testing.T) {
 		t.Fatalf("list initial listener events: %v", err)
 	}
 	assertListenerEventTypes(t, events, "created", "started")
+	assertListenerAuditLinks(
+		t,
+		database,
+		listenerID,
+		[]string{"listener.create", "listener.start"},
+		[]string{"shared-token", "shared-token"},
+	)
 
 	// Model a process exit: the socket is closed, but the database retains the
 	// last committed ACTIVE state because no graceful manager stop occurred.
@@ -141,6 +156,13 @@ func TestListenerLifecycleEventsSurviveRestartAndRecoverStopped(t *testing.T) {
 		t.Fatalf("list recovered listener events: %v", err)
 	}
 	assertListenerEventTypes(t, events, "created", "started", "recovered_stopped")
+	assertListenerAuditLinks(
+		t,
+		database,
+		listenerID,
+		[]string{"listener.create", "listener.start", "listener.recover"},
+		[]string{"shared-token", "shared-token", "microc2-server"},
+	)
 
 	// Reconciliation is idempotent: a second reload does not append another
 	// recovery transition.
@@ -907,6 +929,47 @@ func assertListenerEventTypes(t *testing.T, events []ListenerEvent, want ...stri
 			events[index].OccurredAt.IsZero() {
 			t.Fatalf("event %d is incomplete: %#v", index, events[index])
 		}
+	}
+}
+
+func assertListenerAuditLinks(
+	t *testing.T,
+	database *persistence.Database,
+	listenerID string,
+	wantActions []string,
+	wantActorIDs []string,
+) {
+	t.Helper()
+	rows, err := database.SQL().Query(
+		`SELECT audit.action, audit.actor_id
+		 FROM listener_events AS lifecycle
+		 JOIN audit_events AS audit
+		   ON audit.seq = lifecycle.audit_event_seq
+		 WHERE lifecycle.listener_id = ?
+		 ORDER BY lifecycle.seq`,
+		listenerID,
+	)
+	if err != nil {
+		t.Fatalf("query linked listener audits: %v", err)
+	}
+	defer rows.Close()
+	var actions, actorIDs []string
+	for rows.Next() {
+		var action, actorID string
+		if err := rows.Scan(&action, &actorID); err != nil {
+			t.Fatalf("scan linked listener audit: %v", err)
+		}
+		actions = append(actions, action)
+		actorIDs = append(actorIDs, actorID)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate linked listener audits: %v", err)
+	}
+	if strings.Join(actions, ",") != strings.Join(wantActions, ",") {
+		t.Fatalf("listener audit actions = %#v, want %#v", actions, wantActions)
+	}
+	if strings.Join(actorIDs, ",") != strings.Join(wantActorIDs, ",") {
+		t.Fatalf("listener audit actors = %#v, want %#v", actorIDs, wantActorIDs)
 	}
 }
 

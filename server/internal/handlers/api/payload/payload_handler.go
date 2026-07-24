@@ -23,6 +23,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"microc2/server/internal/audit"
 	"microc2/server/internal/common"
 	"microc2/server/internal/enrollment"
 	"microc2/server/internal/listeners"
@@ -37,27 +38,31 @@ const (
 	payloadStateMissing     = "missing"
 	payloadStateCorrupt     = "corrupt"
 
-	payloadFailedDetail       = "payload build failed before completion"
-	payloadInterruptedDetail  = "server restarted before payload build completed"
-	defaultPayloadMaxSessions = 1
-	maxPayloadRequestBytes    = 64 << 10
-	maxPayloadRevokeBodyBytes = 1
-	privateCargoBuildRoot     = ".microc2-build"
+	payloadFailedDetail          = "payload build failed before completion"
+	payloadInterruptedDetail     = "server restarted before payload build completed"
+	payloadDownloadRoute         = "GET /api/payload/download/{payload_id}"
+	payloadEnrollmentRevokeRoute = "POST /api/payload/{payload_id}/enrollment/revoke"
+	payloadReconciliationRoute   = "internal:payload_reconciliation"
+	defaultPayloadMaxSessions    = 1
+	maxPayloadRequestBytes       = 64 << 10
+	maxPayloadRevokeBodyBytes    = 1
+	privateCargoBuildRoot        = ".microc2-build"
 )
 
 type payloadBuildRecord struct {
-	ID             string
-	PayloadID      string
-	ListenerID     string
-	MutationSeed   string
-	Filename       string
-	RelativePath   string
-	Size           int64
-	SHA256         string
-	CreatedAt      string
-	State          string
-	StateDetail    string
-	ProvenanceJSON []byte
+	ID                        string
+	PayloadID                 string
+	ListenerID                string
+	MutationSeed              string
+	Filename                  string
+	RelativePath              string
+	Size                      int64
+	SHA256                    string
+	CreatedAt                 string
+	State                     string
+	StateDetail               string
+	ProvenanceJSON            []byte
+	CreatedAuditEventSequence int64
 }
 
 // NewPayloadHandler creates a non-durable handler with the production-safe
@@ -217,7 +222,12 @@ func newPayloadHandler(
 		}
 	}
 	var enrollmentStore *enrollment.Store
+	var auditStore *audit.Store
 	if database != nil {
+		auditStore, err = audit.NewStore(database)
+		if err != nil {
+			return nil, fmt.Errorf("initialize payload audit store: %w", err)
+		}
 		enrollmentStore, err = enrollment.NewStore(context.Background(), database)
 		if err != nil {
 			return nil, fmt.Errorf("initialize payload enrollment store: %w", err)
@@ -228,6 +238,7 @@ func newPayloadHandler(
 		agentSourceDir:           agentSourceDir,
 		listenerLookup:           lookup,
 		database:                 database,
+		audit:                    auditStore,
 		enrollment:               enrollmentStore,
 		allowInsecureIsolatedLab: allowInsecureIsolatedLab,
 		payloads:                 make(map[string]PayloadResult),
@@ -353,9 +364,10 @@ func (h *PayloadHandler) HandleGeneratePayload(w http.ResponseWriter, r *http.Re
 	}
 
 	// Generate payload
-	result, err := h.GeneratePayload(config)
+	result, err := h.GeneratePayloadWithContext(r.Context(), config)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Print("[ERROR] Payload generation failed")
+		http.Error(w, "Payload generation failed", http.StatusInternalServerError)
 		return
 	}
 
@@ -386,13 +398,6 @@ func resolvedPayloadMaxSessions(configured int) (int, error) {
 		)
 	}
 	return configured, nil
-}
-
-func redactBuildDiagnostic(value string, bootstrapCredential string) string {
-	if value == "" || bootstrapCredential == "" {
-		return value
-	}
-	return strings.ReplaceAll(value, bootstrapCredential, "[REDACTED]")
 }
 
 func decodePayloadRequest(
@@ -610,6 +615,70 @@ func parsePayloadEnrollmentRevokePath(
 	return payloadID, true, true
 }
 
+func (h *PayloadHandler) writePayloadEnrollmentRejection(
+	w http.ResponseWriter,
+	r *http.Request,
+	payloadID string,
+	record *payloadBuildRecord,
+	outcome audit.Outcome,
+	reasonCode string,
+	status int,
+	message string,
+) {
+	if err := h.appendPayloadEnrollmentRejection(
+		r.Context(),
+		payloadID,
+		record,
+		outcome,
+		reasonCode,
+	); err != nil {
+		log.Print("[ERROR] Failed to record rejected payload enrollment revocation")
+		http.Error(
+			w,
+			"Payload enrollment audit is unavailable",
+			http.StatusServiceUnavailable,
+		)
+		return
+	}
+	http.Error(w, message, status)
+}
+
+func (h *PayloadHandler) appendPayloadEnrollmentRejection(
+	ctx context.Context,
+	payloadID string,
+	record *payloadBuildRecord,
+	outcome audit.Outcome,
+	reasonCode string,
+) error {
+	if h.audit == nil {
+		return errors.New("payload audit store is unavailable")
+	}
+	targetID := payloadID
+	buildID := payloadID
+	if !validPayloadID(payloadID) {
+		targetID = "invalid-request"
+		buildID = ""
+	}
+	input := audit.Input{
+		Actor:          audit.ActorOr(ctx, audit.DefaultOperatorActor()),
+		Action:         "payload.enrollment.revoke.rejected",
+		Route:          payloadEnrollmentRevokeRoute,
+		Target:         audit.Target{Kind: "payload_build", ID: targetID},
+		Outcome:        outcome,
+		ReasonCode:     reasonCode,
+		PayloadBuildID: buildID,
+	}
+	if record != nil {
+		input.ListenerID = record.ListenerID
+		if record.CreatedAuditEventSequence > 0 {
+			causation := record.CreatedAuditEventSequence
+			input.CausationSequence = &causation
+		}
+	}
+	_, err := h.audit.Append(context.WithoutCancel(ctx), input)
+	return err
+}
+
 // HandleRevokePayloadEnrollment retires a build's embedded bootstrap while
 // preserving sessions that were already issued. Production registers this
 // route only on the operator mux, outside the listener-owned agent surface.
@@ -625,19 +694,42 @@ func (h *PayloadHandler) HandleRevokePayloadEnrollment(
 		return
 	}
 	if !valid {
-		http.Error(w, "Invalid payload enrollment path", http.StatusBadRequest)
+		h.writePayloadEnrollmentRejection(
+			w,
+			r,
+			payloadID,
+			nil,
+			audit.OutcomeDenied,
+			"invalid_path",
+			http.StatusBadRequest,
+			"Invalid payload enrollment path",
+		)
 		return
 	}
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		h.writePayloadEnrollmentRejection(
+			w,
+			r,
+			payloadID,
+			nil,
+			audit.OutcomeDenied,
+			"method_not_allowed",
+			http.StatusMethodNotAllowed,
+			"Method not allowed",
+		)
 		return
 	}
 	if r.URL.RawQuery != "" {
-		http.Error(
+		h.writePayloadEnrollmentRejection(
 			w,
-			"Payload enrollment revocation does not accept query parameters",
+			r,
+			payloadID,
+			nil,
+			audit.OutcomeDenied,
+			"query_not_allowed",
 			http.StatusBadRequest,
+			"Payload enrollment revocation does not accept query parameters",
 		)
 		return
 	}
@@ -647,52 +739,146 @@ func (h *PayloadHandler) HandleRevokePayloadEnrollment(
 	if err != nil {
 		var maxBytesError *http.MaxBytesError
 		if errors.As(err, &maxBytesError) {
-			http.Error(
+			h.writePayloadEnrollmentRejection(
 				w,
-				"Payload enrollment revocation body is too large",
+				r,
+				payloadID,
+				nil,
+				audit.OutcomeDenied,
+				"body_too_large",
 				http.StatusRequestEntityTooLarge,
+				"Payload enrollment revocation body is too large",
 			)
 			return
 		}
-		http.Error(
+		h.writePayloadEnrollmentRejection(
 			w,
-			"Invalid payload enrollment revocation body",
+			r,
+			payloadID,
+			nil,
+			audit.OutcomeDenied,
+			"invalid_body",
 			http.StatusBadRequest,
+			"Invalid payload enrollment revocation body",
 		)
 		return
 	}
 	if len(body) != 0 {
-		http.Error(
+		h.writePayloadEnrollmentRejection(
 			w,
-			"Payload enrollment revocation requires an empty body",
+			r,
+			payloadID,
+			nil,
+			audit.OutcomeDenied,
+			"body_not_empty",
 			http.StatusBadRequest,
+			"Payload enrollment revocation requires an empty body",
 		)
 		return
 	}
-	if h.initErr != nil || h.enrollment == nil {
-		http.Error(
+	if h.initErr != nil ||
+		h.enrollment == nil ||
+		h.database == nil ||
+		h.audit == nil {
+		h.writePayloadEnrollmentRejection(
 			w,
-			"Payload enrollment management is unavailable",
+			r,
+			payloadID,
+			nil,
+			audit.OutcomeFailed,
+			"management_unavailable",
 			http.StatusServiceUnavailable,
+			"Payload enrollment management is unavailable",
 		)
 		return
 	}
-	if err := h.enrollment.RevokePayloadCredential(
-		r.Context(),
+	record, err := h.lookupPayload(payloadID)
+	if err != nil {
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			h.writePayloadEnrollmentRejection(
+				w,
+				r,
+				payloadID,
+				nil,
+				audit.OutcomeFailed,
+				"not_found",
+				http.StatusNotFound,
+				"Payload enrollment credential not found",
+			)
+		default:
+			log.Print("[ERROR] Failed to load payload enrollment metadata")
+			h.writePayloadEnrollmentRejection(
+				w,
+				r,
+				payloadID,
+				nil,
+				audit.OutcomeFailed,
+				"metadata_unavailable",
+				http.StatusInternalServerError,
+				"Payload enrollment revocation failed",
+			)
+		}
+		return
+	}
+	if record.CreatedAuditEventSequence <= 0 {
+		h.writePayloadEnrollmentRejection(
+			w,
+			r,
+			payloadID,
+			&record,
+			audit.OutcomeFailed,
+			"audit_root_missing",
+			http.StatusServiceUnavailable,
+			"Payload enrollment audit is unavailable",
+		)
+		return
+	}
+
+	ctx := context.WithoutCancel(r.Context())
+	tx, err := h.database.SQL().BeginTx(ctx, nil)
+	if err != nil {
+		h.writePayloadEnrollmentRejection(
+			w,
+			r,
+			payloadID,
+			&record,
+			audit.OutcomeFailed,
+			"transaction_unavailable",
+			http.StatusInternalServerError,
+			"Payload enrollment revocation failed",
+		)
+		return
+	}
+	defer tx.Rollback()
+	if err := h.enrollment.RevokePayloadCredentialTx(
+		ctx,
+		tx,
 		payloadID,
 	); err != nil {
+		_ = tx.Rollback()
 		switch {
 		case errors.Is(err, enrollment.ErrNotFound):
-			http.Error(
+			h.writePayloadEnrollmentRejection(
 				w,
-				"Payload enrollment credential not found",
+				r,
+				payloadID,
+				&record,
+				audit.OutcomeFailed,
+				"credential_not_found",
 				http.StatusNotFound,
+				"Payload enrollment credential not found",
 			)
 		case errors.Is(err, enrollment.ErrInvalidArgument):
-			http.Error(
+			h.writePayloadEnrollmentRejection(
 				w,
-				"Invalid payload enrollment request",
+				r,
+				payloadID,
+				&record,
+				audit.OutcomeDenied,
+				"invalid_request",
 				http.StatusBadRequest,
+				"Invalid payload enrollment request",
 			)
 		default:
 			// parsePayloadEnrollmentRevokePath restricts payloadID to the
@@ -703,12 +889,54 @@ func (h *PayloadHandler) HandleRevokePayloadEnrollment(
 				payloadID,
 				err,
 			)
-			http.Error(
+			h.writePayloadEnrollmentRejection(
 				w,
-				"Payload enrollment revocation failed",
+				r,
+				payloadID,
+				&record,
+				audit.OutcomeFailed,
+				"revocation_failed",
 				http.StatusInternalServerError,
+				"Payload enrollment revocation failed",
 			)
 		}
+		return
+	}
+	causation := record.CreatedAuditEventSequence
+	if _, err := h.audit.AppendTx(ctx, tx, audit.Input{
+		Actor:             audit.ActorOr(ctx, audit.DefaultOperatorActor()),
+		Action:            "payload.enrollment.revoke",
+		Route:             payloadEnrollmentRevokeRoute,
+		Target:            audit.Target{Kind: "payload_build", ID: payloadID},
+		Outcome:           audit.OutcomeSucceeded,
+		CausationSequence: &causation,
+		ListenerID:        record.ListenerID,
+		PayloadBuildID:    payloadID,
+	}); err != nil {
+		_ = tx.Rollback()
+		h.writePayloadEnrollmentRejection(
+			w,
+			r,
+			payloadID,
+			&record,
+			audit.OutcomeFailed,
+			"audit_append_failed",
+			http.StatusInternalServerError,
+			"Payload enrollment audit is unavailable",
+		)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		h.writePayloadEnrollmentRejection(
+			w,
+			r,
+			payloadID,
+			&record,
+			audit.OutcomeFailed,
+			"commit_failed",
+			http.StatusInternalServerError,
+			"Payload enrollment revocation failed",
+		)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -748,6 +976,19 @@ func (h *PayloadHandler) HandleDownloadPayload(w http.ResponseWriter, r *http.Re
 	record, err := h.lookupPayload(id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
+			if auditErr := h.appendPayloadDownloadRejection(
+				r.Context(),
+				payloadBuildRecord{ID: id, PayloadID: id},
+				audit.OutcomeFailed,
+				"not_found",
+			); auditErr != nil {
+				http.Error(
+					w,
+					"Payload download audit is unavailable",
+					http.StatusServiceUnavailable,
+				)
+				return
+			}
 			http.Error(w, "Payload not found", http.StatusNotFound)
 			return
 		}
@@ -758,6 +999,20 @@ func (h *PayloadHandler) HandleDownloadPayload(w http.ResponseWriter, r *http.Re
 
 	switch record.State {
 	case payloadStateBuilding, payloadStateFailed, payloadStateInterrupted:
+		outcome, reasonCode := payloadDownloadUnavailableDescriptor(record.State)
+		if err := h.appendPayloadDownloadRejection(
+			r.Context(),
+			record,
+			outcome,
+			reasonCode,
+		); err != nil {
+			http.Error(
+				w,
+				"Payload download audit is unavailable",
+				http.StatusServiceUnavailable,
+			)
+			return
+		}
 		http.Error(w, "Payload artifact is unavailable", http.StatusGone)
 		return
 	}
@@ -766,19 +1021,28 @@ func (h *PayloadHandler) HandleDownloadPayload(w http.ResponseWriter, r *http.Re
 	if file != nil {
 		defer file.Close()
 	}
-	if h.database != nil {
-		if err := h.updatePayloadState(record, state, detail, actualHash); err != nil {
-			log.Print("[ERROR] Failed to update payload state")
-			http.Error(w, "Failed to update payload metadata", http.StatusInternalServerError)
-			return
-		}
+	if state == payloadStateCompleted && h.afterVerified != nil {
+		h.afterVerified()
+	}
+	decision := payloadDownloadDecision(record, state)
+	authorized, err := h.reconcilePayloadStateAndAudit(
+		r.Context(),
+		record,
+		state,
+		detail,
+		actualHash,
+		payloadDownloadRoute,
+		audit.DefaultOperatorActor(),
+		&decision,
+	)
+	if err != nil {
+		log.Print("[ERROR] Failed to reconcile and audit payload download")
+		http.Error(w, "Payload download audit is unavailable", http.StatusServiceUnavailable)
+		return
 	}
 	if state != payloadStateCompleted {
 		http.Error(w, "Payload artifact is unavailable", http.StatusGone)
 		return
-	}
-	if h.afterVerified != nil {
-		h.afterVerified()
 	}
 
 	// Set appropriate headers
@@ -794,7 +1058,123 @@ func (h *PayloadHandler) HandleDownloadPayload(w http.ResponseWriter, r *http.Re
 	// Stream file to response
 	if _, err := io.Copy(w, file); err != nil {
 		log.Print("[ERROR] Failed to stream payload file")
+		if auditErr := h.appendPayloadDownloadResult(
+			r.Context(),
+			record,
+			authorized.Sequence,
+			audit.OutcomeFailed,
+			"stream_failed",
+		); auditErr != nil {
+			log.Print("[ERROR] Failed to audit payload download stream failure")
+		}
+		return
 	}
+	if err := h.appendPayloadDownloadResult(
+		r.Context(),
+		record,
+		authorized.Sequence,
+		audit.OutcomeSucceeded,
+		"",
+	); err != nil {
+		log.Print("[ERROR] Failed to audit completed payload download")
+	}
+}
+
+func (h *PayloadHandler) appendPayloadDownloadResult(
+	ctx context.Context,
+	record payloadBuildRecord,
+	authorizedSequence int64,
+	outcome audit.Outcome,
+	reasonCode string,
+) error {
+	if h.audit == nil {
+		return nil
+	}
+	causation := authorizedSequence
+	_, err := h.appendPayloadAudit(ctx, audit.Input{
+		Action:            "payload.download.completed",
+		Route:             payloadDownloadRoute,
+		Target:            audit.Target{Kind: "payload_build", ID: record.ID},
+		Outcome:           outcome,
+		ReasonCode:        reasonCode,
+		CausationSequence: &causation,
+		ListenerID:        record.ListenerID,
+		PayloadBuildID:    record.ID,
+	})
+	return err
+}
+
+func payloadDownloadDecision(
+	record payloadBuildRecord,
+	state string,
+) audit.Input {
+	input := audit.Input{
+		Action:         "payload.download.authorized",
+		Route:          payloadDownloadRoute,
+		Target:         audit.Target{Kind: "payload_build", ID: record.ID},
+		Outcome:        audit.OutcomeSucceeded,
+		ListenerID:     record.ListenerID,
+		PayloadBuildID: record.ID,
+	}
+	if state != payloadStateCompleted {
+		input.Action = "payload.download.rejected"
+		input.Outcome, input.ReasonCode =
+			payloadDownloadUnavailableDescriptor(state)
+	}
+	return input
+}
+
+func payloadDownloadUnavailableDescriptor(
+	state string,
+) (audit.Outcome, string) {
+	switch state {
+	case payloadStateBuilding:
+		return audit.OutcomeDenied, "build_in_progress"
+	case payloadStateFailed:
+		return audit.OutcomeDenied, "build_failed"
+	case payloadStateInterrupted:
+		return audit.OutcomeDenied, "build_interrupted"
+	case payloadStateMissing:
+		return audit.OutcomeFailed, "artifact_missing"
+	case payloadStateCorrupt:
+		return audit.OutcomeFailed, "artifact_corrupt"
+	default:
+		return audit.OutcomeFailed, "metadata_invalid"
+	}
+}
+
+func (h *PayloadHandler) appendPayloadDownloadRejection(
+	ctx context.Context,
+	record payloadBuildRecord,
+	outcome audit.Outcome,
+	reasonCode string,
+) error {
+	input := audit.Input{
+		Action:         "payload.download.rejected",
+		Route:          payloadDownloadRoute,
+		Target:         audit.Target{Kind: "payload_build", ID: record.ID},
+		Outcome:        outcome,
+		ReasonCode:     reasonCode,
+		ListenerID:     record.ListenerID,
+		PayloadBuildID: record.ID,
+	}
+	if record.CreatedAuditEventSequence > 0 {
+		causation := record.CreatedAuditEventSequence
+		input.CausationSequence = &causation
+	}
+	_, err := h.appendPayloadAudit(ctx, input)
+	return err
+}
+
+func (h *PayloadHandler) appendPayloadAudit(
+	ctx context.Context,
+	input audit.Input,
+) (audit.Event, error) {
+	if h.audit == nil {
+		return audit.Event{}, nil
+	}
+	input.Actor = audit.ActorOr(ctx, audit.DefaultOperatorActor())
+	return h.audit.Append(context.WithoutCancel(ctx), input)
 }
 
 // GeneratePayload creates a payload based on the provided configuration
@@ -811,7 +1191,27 @@ func (h *PayloadHandler) HandleDownloadPayload(w http.ResponseWriter, r *http.Re
 func (h *PayloadHandler) GeneratePayload(
 	config PayloadConfig,
 ) (result PayloadResult, returnErr error) {
+	return h.GeneratePayloadWithContext(
+		audit.WithActor(
+			context.Background(),
+			audit.DefaultOperatorActor(),
+		),
+		config,
+	)
+}
+
+// GeneratePayloadWithContext preserves the authenticated operator actor across
+// the long-running build and its durable audit transitions.
+func (h *PayloadHandler) GeneratePayloadWithContext(
+	ctx context.Context,
+	config PayloadConfig,
+) (result PayloadResult, returnErr error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx = context.WithoutCancel(ctx)
 	var durableBuildID string
+	var durableBuildAuditSequence int64
 	durableBuildStarted := false
 	durableBuildCompleted := false
 	defer func() {
@@ -821,7 +1221,11 @@ func (h *PayloadHandler) GeneratePayload(
 			returnErr == nil {
 			return
 		}
-		if err := h.failPayloadBuild(durableBuildID); err != nil {
+		if err := h.failPayloadBuild(
+			ctx,
+			durableBuildID,
+			durableBuildAuditSequence,
+		); err != nil {
 			returnErr = errors.Join(
 				returnErr,
 				fmt.Errorf("persist failed payload state: %w", err),
@@ -891,6 +1295,34 @@ func (h *PayloadHandler) GeneratePayload(
 
 	payloadFileName := payloadFilename(config.Format)
 	log.Printf("[INFO] Payload filename: %s", payloadFileName)
+
+	plannedRelativePath := filepath.ToSlash(filepath.Join(
+		buildType,
+		payloadID,
+		payloadFileName,
+	))
+	if h.database != nil {
+		buildAudit, err := h.beginPayloadBuild(ctx, payloadBuildRecord{
+			ID:             payloadID,
+			PayloadID:      payloadID,
+			ListenerID:     listener.ID,
+			MutationSeed:   mutationSeed,
+			Filename:       payloadFileName,
+			RelativePath:   plannedRelativePath,
+			Size:           0,
+			SHA256:         "",
+			CreatedAt:      buildStartedAt.Format(time.RFC3339Nano),
+			State:          payloadStateBuilding,
+			StateDetail:    "",
+			ProvenanceJSON: []byte("{}"),
+		})
+		if err != nil {
+			return PayloadResult{}, fmt.Errorf("persist building payload state: %w", err)
+		}
+		durableBuildID = payloadID
+		durableBuildAuditSequence = buildAudit.Sequence
+		durableBuildStarted = true
+	}
 
 	// Create a directory for build artifacts
 	outputDir := filepath.Join(h.payloadsDir, buildType, payloadID)
@@ -1093,31 +1525,6 @@ func (h *PayloadHandler) GeneratePayload(
 	log.Printf("[INFO] Environment variables set: TARGET=%s, OUTPUT_DIR=%s, BUILD_TYPE=%s, SLEEP_INTERVAL=%d, SOCKS5_ENABLED=%t, SOCKS5_PORT=%d",
 		buildTarget, outputDir, buildType, config.Sleep, config.Socks5Enabled, config.Socks5Port)
 
-	plannedRelativePath, err := h.plannedRelativeArtifactPath(payloadPath)
-	if err != nil {
-		return PayloadResult{}, err
-	}
-	if h.database != nil {
-		if err := h.beginPayloadBuild(payloadBuildRecord{
-			ID:             payloadID,
-			PayloadID:      payloadID,
-			ListenerID:     listener.ID,
-			MutationSeed:   mutationSeed,
-			Filename:       payloadFileName,
-			RelativePath:   plannedRelativePath,
-			Size:           0,
-			SHA256:         "",
-			CreatedAt:      buildStartedAt.Format(time.RFC3339Nano),
-			State:          payloadStateBuilding,
-			StateDetail:    "",
-			ProvenanceJSON: []byte("{}"),
-		}); err != nil {
-			return PayloadResult{}, fmt.Errorf("persist building payload state: %w", err)
-		}
-		durableBuildID = payloadID
-		durableBuildStarted = true
-	}
-
 	log.Printf("[INFO] Starting build process...")
 	if err := ensurePrivateCargoBuildDirectories(
 		cargoBuildRoot,
@@ -1126,7 +1533,7 @@ func (h *PayloadHandler) GeneratePayload(
 	); err != nil {
 		return PayloadResult{}, err
 	}
-	output, err := h.runSerializedBuild(cmd)
+	_, err = h.runSerializedBuild(cmd)
 	if cleanupErr := removePrivateCargoBuildDirectory(
 		cargoBuildRoot,
 		cargoBuildDir,
@@ -1142,42 +1549,13 @@ func (h *PayloadHandler) GeneratePayload(
 			err = errors.Join(err, cleanupErr)
 		}
 	}
-	// Build scripts and dependencies are not allowed to turn the bootstrap
-	// credential into a log, error, or operator-facing diagnostic. Scrub the
-	// exact secret immediately after the child exits, before using either
-	// output stream or the returned error anywhere.
-	safeOutput := redactBuildDiagnostic(string(output), bootstrap.Public)
 	if err != nil {
-		safeBuildError := redactBuildDiagnostic(err.Error(), bootstrap.Public)
-		log.Printf(
-			"[ERROR] Build command failed: %s\nOutput: %s",
-			safeBuildError,
-			safeOutput,
-		)
-
-		// Log each line of the output separately for better visibility in logs
-		outputLines := strings.Split(safeOutput, "\n")
-		for _, line := range outputLines {
-			if line != "" {
-				log.Printf("[ERROR] Build output: %s", line)
-			}
-		}
-
-		return PayloadResult{}, fmt.Errorf(
-			"build failed: %s - %s",
-			safeBuildError,
-			safeOutput,
-		)
+		// Child output is untrusted and can contain injected credentials or
+		// other secrets. Keep both logs and operator responses constant.
+		log.Printf("[ERROR] Payload build command failed")
+		return PayloadResult{}, errors.New("payload build failed")
 	}
-
-	// Log the first few lines of the output and summarize the rest
-	outputLines := strings.Split(safeOutput, "\n")
-	// Log ALL lines, not just the first 10
-	for _, line := range outputLines {
-		if line != "" {
-			log.Printf("[INFO] Build output: %s", line)
-		}
-	}
+	log.Printf("[INFO] Payload build command completed")
 
 	// Find the generated payload
 	log.Printf("[INFO] Checking for payload at: %s", payloadPath)
@@ -1288,26 +1666,19 @@ func (h *PayloadHandler) GeneratePayload(
 			json.RawMessage(nil),
 			provenanceJSON...,
 		),
+		createdAuditEventSequence: durableBuildAuditSequence,
 	}
 	if durableBuildStarted {
 		if h.enrollment == nil {
 			return PayloadResult{}, errors.New("payload enrollment store is unavailable")
 		}
-		if err := h.enrollment.ActivatePayloadCredential(
-			context.Background(),
-			enrollment.PayloadCredentialActivation{
-				PayloadBuildID:  payloadID,
-				ListenerID:      listener.ID,
-				BootstrapSHA256: bootstrap.SHA256,
-				MaxSessions:     maxSessions,
-			},
-		); err != nil {
-			return PayloadResult{}, fmt.Errorf(
-				"activate payload enrollment credential: %w",
-				err,
-			)
+		activation := enrollment.PayloadCredentialActivation{
+			PayloadBuildID:  payloadID,
+			ListenerID:      listener.ID,
+			BootstrapSHA256: bootstrap.SHA256,
+			MaxSessions:     maxSessions,
 		}
-		if err := h.completePayloadBuild(result); err != nil {
+		if err := h.completePayloadBuild(ctx, result, activation); err != nil {
 			return PayloadResult{}, fmt.Errorf("persist completed payload state: %w", err)
 		}
 		durableBuildCompleted = true
@@ -1326,23 +1697,50 @@ func (h *PayloadHandler) loadListenerConfig(listenerID string) (listeners.Listen
 	return h.listenerLookup.LookupListener(listenerID)
 }
 
-func (h *PayloadHandler) beginPayloadBuild(record payloadBuildRecord) error {
+func (h *PayloadHandler) beginPayloadBuild(
+	ctx context.Context,
+	record payloadBuildRecord,
+) (audit.Event, error) {
 	if h.database == nil {
-		return errors.New("payload persistence database is unavailable")
+		return audit.Event{}, errors.New("payload persistence database is unavailable")
+	}
+	if h.audit == nil {
+		return audit.Event{}, errors.New("payload audit store is unavailable")
 	}
 	if record.State != payloadStateBuilding {
-		return fmt.Errorf("initial payload state must be %q", payloadStateBuilding)
+		return audit.Event{}, fmt.Errorf(
+			"initial payload state must be %q",
+			payloadStateBuilding,
+		)
 	}
 	if len(record.ProvenanceJSON) == 0 || !json.Valid(record.ProvenanceJSON) {
-		return errors.New("initial payload provenance is invalid")
+		return audit.Event{}, errors.New("initial payload provenance is invalid")
 	}
 
-	_, err := h.database.SQL().Exec(
+	tx, err := h.database.SQL().BeginTx(ctx, nil)
+	if err != nil {
+		return audit.Event{}, fmt.Errorf("begin payload build: %w", err)
+	}
+	defer tx.Rollback()
+	buildAudit, err := h.audit.AppendTx(ctx, tx, audit.Input{
+		Actor:          audit.ActorOr(ctx, audit.DefaultOperatorActor()),
+		Action:         "payload.build.requested",
+		Route:          "POST /api/payload/generate",
+		Target:         audit.Target{Kind: "payload_build", ID: record.ID},
+		Outcome:        audit.OutcomeSucceeded,
+		ListenerID:     record.ListenerID,
+		PayloadBuildID: record.ID,
+	})
+	if err != nil {
+		return audit.Event{}, fmt.Errorf("audit requested payload build: %w", err)
+	}
+	_, err = tx.ExecContext(
+		ctx,
 		`INSERT INTO payload_builds (
 			id, payload_id, listener_id, mutation_seed, filename,
 			relative_path, size, sha256, created_at, state,
-			state_detail, provenance_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			state_detail, provenance_json, created_audit_event_seq
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		record.ID,
 		record.PayloadID,
 		record.ListenerID,
@@ -1355,16 +1753,27 @@ func (h *PayloadHandler) beginPayloadBuild(record payloadBuildRecord) error {
 		record.State,
 		record.StateDetail,
 		record.ProvenanceJSON,
+		buildAudit.Sequence,
 	)
 	if err != nil {
-		return fmt.Errorf("insert building payload metadata: %w", err)
+		return audit.Event{}, fmt.Errorf("insert building payload metadata: %w", err)
 	}
-	return nil
+	if err := tx.Commit(); err != nil {
+		return audit.Event{}, fmt.Errorf("commit requested payload build: %w", err)
+	}
+	return buildAudit, nil
 }
 
-func (h *PayloadHandler) completePayloadBuild(result PayloadResult) error {
+func (h *PayloadHandler) completePayloadBuild(
+	ctx context.Context,
+	result PayloadResult,
+	activation enrollment.PayloadCredentialActivation,
+) error {
 	if h.database == nil {
 		return errors.New("payload persistence database is unavailable")
+	}
+	if h.audit == nil || result.createdAuditEventSequence <= 0 {
+		return errors.New("payload audit root is unavailable")
 	}
 	if result.relativePath == "" ||
 		result.sha256 == "" ||
@@ -1372,7 +1781,13 @@ func (h *PayloadHandler) completePayloadBuild(result PayloadResult) error {
 		!json.Valid(result.provenanceJSON) {
 		return errors.New("completed payload metadata is incomplete")
 	}
-	sqlResult, err := h.database.SQL().Exec(
+	tx, err := h.database.SQL().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin completed payload transition: %w", err)
+	}
+	defer tx.Rollback()
+	sqlResult, err := tx.ExecContext(
+		ctx,
 		`UPDATE payload_builds
 		 SET relative_path = ?,
 		     size = ?,
@@ -1401,14 +1816,53 @@ func (h *PayloadHandler) completePayloadBuild(result PayloadResult) error {
 	if affected != 1 {
 		return fmt.Errorf("completed payload transition affected %d rows, want 1", affected)
 	}
+	if h.enrollment == nil {
+		return errors.New("payload enrollment store is unavailable")
+	}
+	if err := h.enrollment.ActivatePayloadCredentialTx(
+		ctx,
+		tx,
+		activation,
+	); err != nil {
+		return fmt.Errorf("activate payload enrollment credential: %w", err)
+	}
+	causation := result.createdAuditEventSequence
+	if _, err := h.audit.AppendTx(ctx, tx, audit.Input{
+		Actor:             audit.ActorOr(ctx, audit.DefaultOperatorActor()),
+		Action:            "payload.build.completed",
+		Route:             "POST /api/payload/generate",
+		Target:            audit.Target{Kind: "payload_build", ID: result.ID},
+		Outcome:           audit.OutcomeSucceeded,
+		CausationSequence: &causation,
+		ListenerID:        result.ListenerID,
+		PayloadBuildID:    result.ID,
+	}); err != nil {
+		return fmt.Errorf("audit completed payload build: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit completed payload transition: %w", err)
+	}
 	return nil
 }
 
-func (h *PayloadHandler) failPayloadBuild(payloadID string) error {
+func (h *PayloadHandler) failPayloadBuild(
+	ctx context.Context,
+	payloadID string,
+	createdAuditEventSequence int64,
+) error {
 	if h.database == nil {
 		return nil
 	}
-	sqlResult, err := h.database.SQL().Exec(
+	if h.audit == nil || createdAuditEventSequence <= 0 {
+		return errors.New("payload audit root is unavailable")
+	}
+	tx, err := h.database.SQL().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin failed payload transition: %w", err)
+	}
+	defer tx.Rollback()
+	sqlResult, err := tx.ExecContext(
+		ctx,
 		`UPDATE payload_builds
 		 SET state = ?, state_detail = ?
 		 WHERE id = ? AND state = ?`,
@@ -1427,20 +1881,86 @@ func (h *PayloadHandler) failPayloadBuild(payloadID string) error {
 	if affected != 1 {
 		return fmt.Errorf("failed payload transition affected %d rows, want 1", affected)
 	}
+	causation := createdAuditEventSequence
+	if _, err := h.audit.AppendTx(ctx, tx, audit.Input{
+		Actor:             audit.ActorOr(ctx, audit.DefaultOperatorActor()),
+		Action:            "payload.build.failed",
+		Route:             "POST /api/payload/generate",
+		Target:            audit.Target{Kind: "payload_build", ID: payloadID},
+		Outcome:           audit.OutcomeFailed,
+		ReasonCode:        "build_failed",
+		CausationSequence: &causation,
+		PayloadBuildID:    payloadID,
+	}); err != nil {
+		return fmt.Errorf("audit failed payload build: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit failed payload transition: %w", err)
+	}
 	return nil
 }
 
-func (h *PayloadHandler) interruptPayloadBuild(payloadID string) error {
+func (h *PayloadHandler) interruptPayloadBuild(
+	record payloadBuildRecord,
+) error {
 	if h.database == nil {
 		return nil
 	}
-	sqlResult, err := h.database.SQL().Exec(
+	if h.audit == nil {
+		return errors.New("payload audit root is unavailable")
+	}
+	ctx := audit.WithActor(context.Background(), audit.DefaultSystemActor())
+	tx, err := h.database.SQL().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin interrupted payload transition: %w", err)
+	}
+	defer tx.Rollback()
+	causation := record.CreatedAuditEventSequence
+	if causation <= 0 {
+		recoveryEvent, err := h.audit.AppendTx(ctx, tx, audit.Input{
+			Actor:          audit.DefaultSystemActor(),
+			Action:         "payload.build.recovered",
+			Route:          "internal:payload_recovery",
+			Target:         audit.Target{Kind: "payload_build", ID: record.ID},
+			Outcome:        audit.OutcomeSucceeded,
+			ReasonCode:     "missing_audit_root",
+			ListenerID:     record.ListenerID,
+			PayloadBuildID: record.ID,
+		})
+		if err != nil {
+			return fmt.Errorf("audit recovered payload build: %w", err)
+		}
+		sqlResult, err := tx.ExecContext(
+			ctx,
+			`UPDATE payload_builds
+			 SET created_audit_event_seq = ?
+			 WHERE id = ? AND created_audit_event_seq IS NULL`,
+			recoveryEvent.Sequence,
+			record.ID,
+		)
+		if err != nil {
+			return fmt.Errorf("link recovered payload audit root: %w", err)
+		}
+		affected, err := sqlResult.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("read recovered payload audit link result: %w", err)
+		}
+		if affected != 1 {
+			return fmt.Errorf(
+				"recovered payload audit link affected %d rows, want 1",
+				affected,
+			)
+		}
+		causation = recoveryEvent.Sequence
+	}
+	sqlResult, err := tx.ExecContext(
+		ctx,
 		`UPDATE payload_builds
 		 SET state = ?, state_detail = ?
 		 WHERE id = ? AND state = ?`,
 		payloadStateInterrupted,
 		payloadInterruptedDetail,
-		payloadID,
+		record.ID,
 		payloadStateBuilding,
 	)
 	if err != nil {
@@ -1452,6 +1972,22 @@ func (h *PayloadHandler) interruptPayloadBuild(payloadID string) error {
 	}
 	if affected != 1 {
 		return fmt.Errorf("interrupted payload transition affected %d rows, want 1", affected)
+	}
+	if _, err := h.audit.AppendTx(ctx, tx, audit.Input{
+		Actor:             audit.DefaultSystemActor(),
+		Action:            "payload.build.interrupted",
+		Route:             "internal:payload_recovery",
+		Target:            audit.Target{Kind: "payload_build", ID: record.ID},
+		Outcome:           audit.OutcomeFailed,
+		ReasonCode:        "server_restart",
+		CausationSequence: &causation,
+		ListenerID:        record.ListenerID,
+		PayloadBuildID:    record.ID,
+	}); err != nil {
+		return fmt.Errorf("audit interrupted payload build: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit interrupted payload transition: %w", err)
 	}
 	return nil
 }
@@ -1465,17 +2001,18 @@ func (h *PayloadHandler) lookupPayload(id string) (payloadBuildRecord, error) {
 			return payloadBuildRecord{}, sql.ErrNoRows
 		}
 		record := payloadBuildRecord{
-			ID:             result.ID,
-			PayloadID:      result.PayloadID,
-			ListenerID:     result.ListenerID,
-			MutationSeed:   result.MutationSeed,
-			Filename:       result.Filename,
-			RelativePath:   result.relativePath,
-			Size:           result.Size,
-			SHA256:         result.sha256,
-			CreatedAt:      result.Created,
-			State:          payloadStateCompleted,
-			ProvenanceJSON: append([]byte(nil), result.provenanceJSON...),
+			ID:                        result.ID,
+			PayloadID:                 result.PayloadID,
+			ListenerID:                result.ListenerID,
+			MutationSeed:              result.MutationSeed,
+			Filename:                  result.Filename,
+			RelativePath:              result.relativePath,
+			Size:                      result.Size,
+			SHA256:                    result.sha256,
+			CreatedAt:                 result.Created,
+			State:                     payloadStateCompleted,
+			ProvenanceJSON:            append([]byte(nil), result.provenanceJSON...),
+			CreatedAuditEventSequence: result.createdAuditEventSequence,
 		}
 		if record.RelativePath == "" {
 			relativePath, err := h.relativeArtifactPath(result.Path)
@@ -1495,11 +2032,12 @@ func (h *PayloadHandler) lookupPayload(id string) (payloadBuildRecord, error) {
 	}
 
 	record := payloadBuildRecord{}
+	var createdAuditEventSequence sql.NullInt64
 	err := h.database.SQL().QueryRow(
 		`SELECT
 			id, payload_id, listener_id, mutation_seed, filename,
 			relative_path, size, sha256, created_at, state,
-			state_detail, provenance_json
+			state_detail, provenance_json, created_audit_event_seq
 		FROM payload_builds
 		WHERE id = ?`,
 		id,
@@ -1516,10 +2054,12 @@ func (h *PayloadHandler) lookupPayload(id string) (payloadBuildRecord, error) {
 		&record.State,
 		&record.StateDetail,
 		&record.ProvenanceJSON,
+		&createdAuditEventSequence,
 	)
 	if err != nil {
 		return payloadBuildRecord{}, err
 	}
+	record.CreatedAuditEventSequence = createdAuditEventSequence.Int64
 	return record, nil
 }
 
@@ -1528,10 +2068,11 @@ func (h *PayloadHandler) reconcilePayloads() error {
 	if err != nil {
 		return err
 	}
+	ctx := audit.WithActor(context.Background(), audit.DefaultSystemActor())
 	for _, record := range records {
 		switch record.State {
 		case payloadStateBuilding:
-			if err := h.interruptPayloadBuild(record.ID); err != nil {
+			if err := h.interruptPayloadBuild(record); err != nil {
 				return fmt.Errorf("interrupt payload %s after restart: %w", record.ID, err)
 			}
 			continue
@@ -1539,7 +2080,16 @@ func (h *PayloadHandler) reconcilePayloads() error {
 			continue
 		}
 		_, state, detail, actualHash := h.revalidatePayload(record)
-		if err := h.updatePayloadState(record, state, detail, actualHash); err != nil {
+		if _, err := h.reconcilePayloadStateAndAudit(
+			ctx,
+			record,
+			state,
+			detail,
+			actualHash,
+			payloadReconciliationRoute,
+			audit.DefaultSystemActor(),
+			nil,
+		); err != nil {
 			return fmt.Errorf("reconcile payload %s: %w", record.ID, err)
 		}
 	}
@@ -1551,7 +2101,7 @@ func (h *PayloadHandler) listPayloadRecords() ([]payloadBuildRecord, error) {
 		`SELECT
 			id, payload_id, listener_id, mutation_seed, filename,
 			relative_path, size, sha256, created_at, state,
-			state_detail, provenance_json
+			state_detail, provenance_json, created_audit_event_seq
 		FROM payload_builds
 		ORDER BY id`,
 	)
@@ -1563,6 +2113,7 @@ func (h *PayloadHandler) listPayloadRecords() ([]payloadBuildRecord, error) {
 	records := make([]payloadBuildRecord, 0)
 	for rows.Next() {
 		record := payloadBuildRecord{}
+		var createdAuditEventSequence sql.NullInt64
 		if err := rows.Scan(
 			&record.ID,
 			&record.PayloadID,
@@ -1576,9 +2127,11 @@ func (h *PayloadHandler) listPayloadRecords() ([]payloadBuildRecord, error) {
 			&record.State,
 			&record.StateDetail,
 			&record.ProvenanceJSON,
+			&createdAuditEventSequence,
 		); err != nil {
 			return nil, fmt.Errorf("scan payload metadata: %w", err)
 		}
+		record.CreatedAuditEventSequence = createdAuditEventSequence.Int64
 		records = append(records, record)
 	}
 	if err := rows.Err(); err != nil {
@@ -1587,37 +2140,214 @@ func (h *PayloadHandler) listPayloadRecords() ([]payloadBuildRecord, error) {
 	return records, nil
 }
 
-func (h *PayloadHandler) updatePayloadState(
+func (h *PayloadHandler) reconcilePayloadStateAndAudit(
+	ctx context.Context,
 	record payloadBuildRecord,
 	state string,
 	detail string,
 	actualHash string,
-) error {
+	route string,
+	fallbackActor audit.Actor,
+	followup *audit.Input,
+) (audit.Event, error) {
 	if h.database == nil {
-		return nil
+		if followup == nil {
+			return audit.Event{}, nil
+		}
+		return h.appendPayloadAudit(ctx, *followup)
+	}
+	if h.audit == nil {
+		return audit.Event{}, errors.New("payload audit store is unavailable")
 	}
 	if state != payloadStateCompleted &&
 		state != payloadStateMissing &&
 		state != payloadStateCorrupt {
-		return fmt.Errorf("unsupported reconciled payload state %q", state)
+		return audit.Event{}, fmt.Errorf(
+			"unsupported reconciled payload state %q",
+			state,
+		)
 	}
-	hash := record.SHA256
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx = context.WithoutCancel(ctx)
+	tx, err := h.database.SQL().BeginTx(ctx, nil)
+	if err != nil {
+		return audit.Event{}, fmt.Errorf(
+			"begin reconciled payload transition: %w",
+			err,
+		)
+	}
+	defer tx.Rollback()
+
+	var currentState, currentDetail, currentHash string
+	var rootSequence sql.NullInt64
+	if err := tx.QueryRowContext(
+		ctx,
+		`SELECT state, state_detail, sha256, created_audit_event_seq
+		 FROM payload_builds
+		 WHERE id = ?`,
+		record.ID,
+	).Scan(
+		&currentState,
+		&currentDetail,
+		&currentHash,
+		&rootSequence,
+	); err != nil {
+		return audit.Event{}, fmt.Errorf(
+			"read reconciled payload state: %w",
+			err,
+		)
+	}
+	if !rootSequence.Valid || rootSequence.Int64 <= 0 {
+		systemCtx := audit.WithActor(ctx, audit.DefaultSystemActor())
+		recoveryEvent, err := h.audit.AppendTx(systemCtx, tx, audit.Input{
+			Actor:          audit.DefaultSystemActor(),
+			Action:         "payload.build.recovered",
+			Route:          "internal:payload_recovery",
+			Target:         audit.Target{Kind: "payload_build", ID: record.ID},
+			Outcome:        audit.OutcomeSucceeded,
+			ReasonCode:     "missing_audit_root",
+			ListenerID:     record.ListenerID,
+			PayloadBuildID: record.ID,
+		})
+		if err != nil {
+			return audit.Event{}, fmt.Errorf(
+				"audit recovered payload build: %w",
+				err,
+			)
+		}
+		result, err := tx.ExecContext(
+			systemCtx,
+			`UPDATE payload_builds
+			 SET created_audit_event_seq = ?
+			 WHERE id = ?
+			   AND (
+			       created_audit_event_seq IS NULL
+			       OR created_audit_event_seq <= 0
+			   )`,
+			recoveryEvent.Sequence,
+			record.ID,
+		)
+		if err != nil {
+			return audit.Event{}, fmt.Errorf(
+				"link recovered payload audit root: %w",
+				err,
+			)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return audit.Event{}, fmt.Errorf(
+				"read recovered payload audit link result: %w",
+				err,
+			)
+		}
+		if affected != 1 {
+			return audit.Event{}, fmt.Errorf(
+				"recovered payload audit link affected %d rows, want 1",
+				affected,
+			)
+		}
+		rootSequence = sql.NullInt64{
+			Int64: recoveryEvent.Sequence,
+			Valid: true,
+		}
+	}
+	hash := currentHash
 	if state == payloadStateCompleted && hash == "" {
 		hash = actualHash
 	}
-	_, err := h.database.SQL().Exec(
-		`UPDATE payload_builds
-		 SET state = ?, state_detail = ?, sha256 = ?
-		 WHERE id = ?`,
-		state,
-		detail,
-		hash,
-		record.ID,
-	)
-	if err != nil {
-		return fmt.Errorf("update payload state: %w", err)
+
+	causation := rootSequence.Int64
+	actor := audit.ActorOr(ctx, fallbackActor)
+	changed := currentState != state ||
+		currentDetail != detail ||
+		currentHash != hash
+	if changed {
+		result, err := tx.ExecContext(
+			ctx,
+			`UPDATE payload_builds
+			 SET state = ?, state_detail = ?, sha256 = ?
+			 WHERE id = ?`,
+			state,
+			detail,
+			hash,
+			record.ID,
+		)
+		if err != nil {
+			return audit.Event{}, fmt.Errorf("update payload state: %w", err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return audit.Event{}, fmt.Errorf(
+				"read reconciled payload transition result: %w",
+				err,
+			)
+		}
+		if affected != 1 {
+			return audit.Event{}, fmt.Errorf(
+				"reconciled payload transition affected %d rows, want 1",
+				affected,
+			)
+		}
+		outcome, reasonCode := payloadReconciliationDescriptor(state)
+		if _, err := h.audit.AppendTx(ctx, tx, audit.Input{
+			Actor:             actor,
+			Action:            "payload.artifact.reconciled",
+			Route:             route,
+			Target:            audit.Target{Kind: "payload_build", ID: record.ID},
+			Outcome:           outcome,
+			ReasonCode:        reasonCode,
+			CausationSequence: &causation,
+			ListenerID:        record.ListenerID,
+			PayloadBuildID:    record.ID,
+		}); err != nil {
+			return audit.Event{}, fmt.Errorf(
+				"audit reconciled payload state: %w",
+				err,
+			)
+		}
 	}
-	return nil
+
+	var followupEvent audit.Event
+	if followup != nil {
+		input := *followup
+		input.Actor = actor
+		input.CausationSequence = &causation
+		if input.ListenerID == "" {
+			input.ListenerID = record.ListenerID
+		}
+		if input.PayloadBuildID == "" {
+			input.PayloadBuildID = record.ID
+		}
+		followupEvent, err = h.audit.AppendTx(ctx, tx, input)
+		if err != nil {
+			return audit.Event{}, fmt.Errorf(
+				"audit reconciled payload followup: %w",
+				err,
+			)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return audit.Event{}, fmt.Errorf(
+			"commit reconciled payload transition: %w",
+			err,
+		)
+	}
+	return followupEvent, nil
+}
+
+func payloadReconciliationDescriptor(
+	state string,
+) (audit.Outcome, string) {
+	switch state {
+	case payloadStateCompleted:
+		return audit.OutcomeSucceeded, "artifact_verified"
+	case payloadStateMissing:
+		return audit.OutcomeFailed, "artifact_missing"
+	default:
+		return audit.OutcomeFailed, "artifact_corrupt"
+	}
 }
 
 func (h *PayloadHandler) revalidatePayload(
@@ -1710,30 +2440,6 @@ func payloadFilename(format string) string {
 	default:
 		return "agent"
 	}
-}
-
-func (h *PayloadHandler) plannedRelativeArtifactPath(artifactPath string) (string, error) {
-	absoluteArtifactPath, err := filepath.Abs(artifactPath)
-	if err != nil {
-		return "", fmt.Errorf("resolve planned artifact path: %w", err)
-	}
-	relativePath, err := filepath.Rel(h.payloadsDir, absoluteArtifactPath)
-	if err != nil || !isContainedRelativePath(relativePath) {
-		return "", errors.New("planned payload artifact is outside the configured payload root")
-	}
-	resolvedRoot, err := filepath.EvalSymlinks(h.payloadsDir)
-	if err != nil {
-		return "", fmt.Errorf("resolve payload root: %w", err)
-	}
-	resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(absoluteArtifactPath))
-	if err != nil {
-		return "", fmt.Errorf("resolve planned artifact directory: %w", err)
-	}
-	resolvedRelative, err := filepath.Rel(resolvedRoot, resolvedParent)
-	if err != nil || (resolvedRelative != "." && !isContainedRelativePath(resolvedRelative)) {
-		return "", errors.New("planned payload artifact resolves outside the configured payload root")
-	}
-	return filepath.ToSlash(relativePath), nil
 }
 
 func (h *PayloadHandler) relativeArtifactPath(artifactPath string) (string, error) {

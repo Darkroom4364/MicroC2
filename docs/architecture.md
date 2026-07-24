@@ -3,8 +3,8 @@
 MicroC2 is an academic C2 research testbed for controlled, authorized lab
 environments. The current implementation is a Go management server, a Rust
 agent, and a static browser UI. It is useful as a prototype and research base,
-but several security, audit, task-family, and transport boundaries are still
-being stabilized.
+but several security, evidence/reporting, task-family, and transport boundaries
+are still being stabilized.
 
 This document describes the repository as it exists today. It deliberately marks
 partially wired features and prototype assumptions so future work can start from
@@ -105,20 +105,41 @@ are visible during development.
 | `/api/agents/command` | `internal/handlers/api` | Deprecated adapter from an `agent_id` plus raw command to a v1 shell task. |
 | `/api/agents/{id}/command` | `internal/handlers/api` | Deprecated adapter from a raw command to a v1 shell task. |
 | `/api/agents/{id}/results` | `internal/handlers/api` | Deprecated bare-array result adapter with strict `limit`/`offset` pagination and a 16 MiB encoded-page ceiling; response headers expose count, total, and continuation offset. |
-| `/api/file_drop/upload` | `internal/handlers/api` | Upload operator files into the server file store. |
+| `/api/audit/events` | `internal/handlers/api` | Retrieve a bounded, newest-first page of Audit Event v1 records. |
+| `/api/file_drop/upload` | `internal/handlers/api` | Upload operator files into the server file store with a 32 MiB total request cap and same-directory atomic staging. |
 | `/api/file_drop/list` | `internal/handlers/api` | List operator file-drop contents. |
-| `/api/file_drop/download/{name}` | `internal/handlers/api` | Download a file-drop item. |
+| `/api/file_drop/download/{name}` | `internal/handlers/api` | Download a verified regular file with causal request/completion audit events. |
 | `/api/file_drop/delete/{name}` | `internal/handlers/api` | Delete a file-drop item. |
 | `/api/payload/generate` | `internal/handlers/api/payload` | Build an agent payload from a listener and payload config. |
 | `/api/payload/download/{id}` | `internal/handlers/api/payload` | Revalidate and download a generated payload tracked by durable metadata. |
 | `/api/payload/{id}/enrollment/revoke` | `internal/handlers/api/payload` | Idempotently retire future bootstrap enrollment while preserving issued sessions. |
 | `/ws/logs` | `internal/handlers/ws` | Stream recent and live server logs. |
-| `/ws/terminal` | `internal/handlers/ws` | Browser-accessible shell on the server host. |
+| `/ws/terminal` | `internal/handlers/ws` | Browser-accessible shell on the server host; disabled unless `security.enableServerTerminal` is explicitly true. |
 
 The operator guard allows loopback clients or a configured shared token and
-checks browser origins for HTTP and WebSocket routes. It is not actor-aware
-authentication or authorization. The server terminal can execute shell commands
-on the host running MicroC2 and remains a local, controlled-lab capability.
+checks browser origins for HTTP and WebSocket routes. Accepted requests carry a
+trusted audit actor identifying loopback or shared-token authentication. This
+is audit attribution, not individual-user authentication or authorization. The
+server terminal can execute shell commands on the host running MicroC2, is
+disabled by default, and remains a local, controlled-lab capability when
+enabled. Requested, denied, opened, and closed terminal access is audited;
+commands and output are never audit fields.
+
+### Structured Audit Contract
+
+The normative contracts are:
+
+- [Audit Event v1](schemas/audit-event-v1.schema.json)
+- [Audit Page v1](schemas/audit-page-v1.schema.json)
+
+Audit events are durable, newest-first by monotonic sequence, and use a closed
+redacted field set. Listener and agent-session lifecycle, payload
+build/download/artifact-reconciliation, file-drop actions, terminal access, and
+task queue/dispatch/running/result/cancellation paths emit events. Task and
+payload rows retain their causal root sequences, and listener lifecycle records
+link to their matching audit events. See
+[storage.md](storage.md#structured-audit-events) for transaction, retention,
+and redaction semantics.
 
 ### Typed Task Contract
 
@@ -254,7 +275,8 @@ filesystem artifacts:
   `data/microc2.db`, with `MICROC2_STORAGE_PATH` as the environment override.
 - SQLite records: listeners and lifecycle events, historical agents, typed
   tasks and results, legacy result projections, payload-build metadata,
-  bootstrap hashes/allowances, the enrollment HMAC key, and durable sessions.
+  structured audit events, bootstrap hashes/allowances, the enrollment HMAC
+  key, and durable sessions.
 - Listener compatibility configs: redacted, regenerable JSON projections under
   `{server.staticDir}/listeners/`.
 - Operator uploads: configured server upload directory, default `uploads`.
@@ -365,7 +387,10 @@ The main remaining gaps are tracked as issues:
 - #97: durable storage is merged into `dev`.
 - #104: authenticated agent enrollment is complete for the `dev` integration
   line; it does not imply a `dev` to `main` promotion.
-- #100: add structured, durable audit events.
+- #100: structured, durable audit events are complete on the `dev` integration
+  line; operator-facing evidence export is still future work.
+- #108: replace payload artifact check-then-use paths with cross-platform
+  open-beneath handles before any `dev` to `main` promotion.
 - #88: add file transfer and pivot controls as typed task families after #98.
 - #99: finish payload validation and manifests; current provenance is partial.
 - #65: finish the agent configuration system and optional OPSEC feature gating.

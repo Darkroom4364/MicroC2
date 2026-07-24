@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"sync"
 
+	"microc2/server/internal/audit"
 	"microc2/server/internal/enrollment"
 	"microc2/server/internal/listeners"
 	"microc2/server/internal/persistence"
@@ -61,9 +62,10 @@ type PayloadResult struct {
 	Size         int64  `json:"size"`
 	Created      string `json:"created"`
 
-	relativePath   string
-	sha256         string
-	provenanceJSON json.RawMessage
+	relativePath              string
+	sha256                    string
+	provenanceJSON            json.RawMessage
+	createdAuditEventSequence int64
 }
 
 // ListenerLookup resolves the authoritative listener configuration used for a
@@ -79,6 +81,7 @@ type PayloadHandler struct {
 	agentSourceDir           string
 	listenerLookup           ListenerLookup
 	database                 *persistence.Database
+	audit                    *audit.Store
 	enrollment               *enrollment.Store
 	allowInsecureIsolatedLab bool
 	initErr                  error

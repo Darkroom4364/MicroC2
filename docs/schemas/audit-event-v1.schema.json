@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://microc2.local/schemas/audit-event-v1.schema.json",
+  "title": "MicroC2 Audit Event v1",
+  "description": "Immutable, actor-aware audit record with a closed redacted field set. Commands, output, request bodies, credentials, file contents, terminal transcripts, and raw errors are intentionally excluded.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "sequence",
+    "occurred_at",
+    "actor",
+    "action",
+    "route",
+    "target",
+    "outcome"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time",
+      "maxLength": 35
+    },
+    "actor": {
+      "$ref": "#/$defs/actor"
+    },
+    "action": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9._:-]+$"
+    },
+    "route": {
+      "$ref": "#/$defs/text256"
+    },
+    "target": {
+      "$ref": "#/$defs/target"
+    },
+    "outcome": {
+      "enum": [
+        "succeeded",
+        "failed",
+        "denied",
+        "noop"
+      ]
+    },
+    "reason_code": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9._:-]+$"
+    },
+    "causation_sequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "listener_id": {
+      "$ref": "#/$defs/text128"
+    },
+    "agent_id": {
+      "$ref": "#/$defs/text128"
+    },
+    "task_id": {
+      "$ref": "#/$defs/text128"
+    },
+    "payload_build_id": {
+      "$ref": "#/$defs/text128"
+    },
+    "file_name": {
+      "$ref": "#/$defs/text255"
+    },
+    "terminal_session_id": {
+      "$ref": "#/$defs/text128"
+    }
+  },
+  "$defs": {
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "id"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "operator",
+            "agent",
+            "system"
+          ]
+        },
+        "id": {
+          "$ref": "#/$defs/text128"
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "id"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z0-9._:-]+$"
+        },
+        "id": {
+          "$ref": "#/$defs/text255"
+        }
+      }
+    },
+    "text128": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^(?!\\s)(?!.*\\s$)(?!.*\\p{Cc}).+$"
+    },
+    "text255": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "pattern": "^(?!\\s)(?!.*\\s$)(?!.*\\p{Cc}).+$"
+    },
+    "text256": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^(?!\\s)(?!.*\\s$)(?!.*\\p{Cc}).+$"
+    }
+  }
+}

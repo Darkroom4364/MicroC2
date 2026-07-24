@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"microc2/server/internal/audit"
 	"microc2/server/internal/enrollment"
 	"microc2/server/internal/persistence"
 )
@@ -50,8 +51,14 @@ func TestAgentSessionManagementRoutesNeverExposeCredentials(t *testing.T) {
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
 	path := "/api/listeners/listener-one/agents/agent-one/session/"
+	operator := audit.Actor{
+		Kind: audit.ActorOperator,
+		ID:   "shared-token:session-operator",
+	}
+	operatorContext := audit.WithActor(context.Background(), operator)
 
-	response := serveListenerManagementRequest(
+	response := serveListenerManagementRequestWithContext(
+		operatorContext,
 		mux,
 		http.MethodPost,
 		path+"rotate",
@@ -86,7 +93,8 @@ func TestAgentSessionManagementRoutesNeverExposeCredentials(t *testing.T) {
 		t.Fatal("agent authentication did not receive pending replacement")
 	}
 
-	response = serveListenerManagementRequest(
+	response = serveListenerManagementRequestWithContext(
+		operatorContext,
 		mux,
 		http.MethodPost,
 		path+"revoke",
@@ -104,7 +112,8 @@ func TestAgentSessionManagementRoutesNeverExposeCredentials(t *testing.T) {
 		t.Fatal("revoked credential remained authenticated")
 	}
 
-	response = serveListenerManagementRequest(
+	response = serveListenerManagementRequestWithContext(
+		operatorContext,
 		mux,
 		http.MethodPost,
 		path+"re-enroll",
@@ -127,6 +136,68 @@ func TestAgentSessionManagementRoutesNeverExposeCredentials(t *testing.T) {
 	}
 	if reenrolled.Credential == enrolled.Credential {
 		t.Fatal("re-enrollment reused the revoked session credential")
+	}
+
+	auditStore, err := audit.NewStore(database)
+	if err != nil {
+		t.Fatalf("create audit reader: %v", err)
+	}
+	page, err := auditStore.Page(
+		context.Background(),
+		audit.PageOptions{Limit: 10},
+	)
+	if err != nil {
+		t.Fatalf("page agent-session audit events: %v", err)
+	}
+	if page.Total != 3 || len(page.Events) != 3 {
+		t.Fatalf(
+			"agent-session audit event count = %d/%d, want 3/3: %#v",
+			page.Total,
+			len(page.Events),
+			page.Events,
+		)
+	}
+	for index, want := range []struct {
+		action string
+		route  string
+	}{
+		{
+			action: "agent.session.require_reenrollment",
+			route:  "POST /api/listeners/{listener_id}/agents/{agent_id}/session/re-enroll",
+		},
+		{
+			action: "agent.session.revoke",
+			route:  "POST /api/listeners/{listener_id}/agents/{agent_id}/session/revoke",
+		},
+		{
+			action: "agent.session.rotate",
+			route:  "POST /api/listeners/{listener_id}/agents/{agent_id}/session/rotate",
+		},
+	} {
+		event := page.Events[index]
+		if event.Actor != operator ||
+			event.Action != want.action ||
+			event.Route != want.route ||
+			event.Target != (audit.Target{Kind: "agent", ID: "agent-one"}) ||
+			event.Outcome != audit.OutcomeSucceeded ||
+			event.ListenerID != "listener-one" ||
+			event.AgentID != "agent-one" {
+			t.Fatalf("unexpected agent-session audit event %d: %#v", index, event)
+		}
+	}
+	serialized, err := json.Marshal(page.Events)
+	if err != nil {
+		t.Fatalf("marshal agent-session audit events: %v", err)
+	}
+	for name, secret := range map[string]string{
+		"bootstrap credential":       bootstrap.Public,
+		"session credential":         enrolled.Credential,
+		"pending session credential": authentication.ReplacementCredential,
+		"session id":                 enrolled.SessionID,
+	} {
+		if bytes.Contains(serialized, []byte(secret)) {
+			t.Fatalf("agent-session audit events exposed %s: %s", name, serialized)
+		}
 	}
 }
 
@@ -247,7 +318,24 @@ func serveListenerManagementRequest(
 	path string,
 	body string,
 ) *httptest.ResponseRecorder {
+	return serveListenerManagementRequestWithContext(
+		context.Background(),
+		handler,
+		method,
+		path,
+		body,
+	)
+}
+
+func serveListenerManagementRequestWithContext(
+	ctx context.Context,
+	handler http.Handler,
+	method string,
+	path string,
+	body string,
+) *httptest.ResponseRecorder {
 	request := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+	request = request.WithContext(ctx)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	return response

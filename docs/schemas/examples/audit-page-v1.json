@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "events": [
+    {
+      "schema_version": 1,
+      "sequence": 42,
+      "occurred_at": "2026-07-24T09:15:05Z",
+      "actor": {
+        "kind": "agent",
+        "id": "agent-lab-01"
+      },
+      "action": "task.result_received",
+      "route": "POST /api/agent/{agent_id}/results",
+      "target": {
+        "kind": "task",
+        "id": "task-7"
+      },
+      "outcome": "succeeded",
+      "causation_sequence": 41,
+      "listener_id": "listener-lab",
+      "agent_id": "agent-lab-01",
+      "task_id": "task-7"
+    },
+    {
+      "schema_version": 1,
+      "sequence": 41,
+      "occurred_at": "2026-07-24T09:15:00Z",
+      "actor": {
+        "kind": "operator",
+        "id": "shared-token"
+      },
+      "action": "task.queued",
+      "route": "POST /api/agents/{agent_id}/tasks",
+      "target": {
+        "kind": "task",
+        "id": "task-7"
+      },
+      "outcome": "succeeded",
+      "listener_id": "listener-lab",
+      "agent_id": "agent-lab-01",
+      "task_id": "task-7"
+    }
+  ],
+  "limit": 50,
+  "offset": 0,
+  "total": 2,
+  "next_offset": null
+}

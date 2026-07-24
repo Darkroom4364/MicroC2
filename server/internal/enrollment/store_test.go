@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"microc2/server/internal/audit"
 )
 
 func TestEnrollResumesAfterLostResponseAndEnforcesBuildCapacity(t *testing.T) {
@@ -462,6 +464,42 @@ func TestRotationIsStableUntilPendingCredentialPromotes(t *testing.T) {
 		!second.AlreadyPending {
 		t.Fatalf("rotation results first=%+v second=%+v", first, second)
 	}
+	page, err := environment.store.audit.Page(
+		context.Background(),
+		audit.PageOptions{Limit: 10},
+	)
+	if err != nil {
+		t.Fatalf("page repeated rotation audit events: %v", err)
+	}
+	if page.Total != 2 || len(page.Events) != 2 {
+		t.Fatalf(
+			"rotation audit event count = %d/%d, want 2/2: %#v",
+			page.Total,
+			len(page.Events),
+			page.Events,
+		)
+	}
+	repeatedEvent := page.Events[0]
+	initialEvent := page.Events[1]
+	for name, event := range map[string]audit.Event{
+		"initial":  initialEvent,
+		"repeated": repeatedEvent,
+	} {
+		if event.Action != agentSessionRotateAction ||
+			event.ListenerID != "listener-one" ||
+			event.AgentID != "agent-one" ||
+			event.Target != (audit.Target{Kind: "agent", ID: "agent-one"}) {
+			t.Fatalf("%s rotation audit event has wrong scope: %#v", name, event)
+		}
+	}
+	if initialEvent.Outcome != audit.OutcomeSucceeded ||
+		initialEvent.ReasonCode != "" {
+		t.Fatalf("unexpected initial rotation audit event: %#v", initialEvent)
+	}
+	if repeatedEvent.Outcome != audit.OutcomeNoop ||
+		repeatedEvent.ReasonCode != "rotation_already_pending" {
+		t.Fatalf("unexpected repeated rotation audit event: %#v", repeatedEvent)
+	}
 
 	firstDelivery, err := environment.store.Authenticate(
 		context.Background(),
@@ -512,6 +550,101 @@ func TestRotationIsStableUntilPendingCredentialPromotes(t *testing.T) {
 			again.ReplacementCredential != "",
 			err,
 		)
+	}
+}
+
+func TestAgentSessionAuditFailureRollsBackManagementState(t *testing.T) {
+	tests := []struct {
+		name       string
+		mutate     func(context.Context, *Store) error
+		changedSQL string
+	}{
+		{
+			name: "rotate",
+			mutate: func(ctx context.Context, store *Store) error {
+				_, err := store.Rotate(ctx, "listener-one", "agent-one")
+				return err
+			},
+			changedSQL: `SELECT COUNT(*)
+				FROM agent_enrollment_sessions
+				WHERE listener_id = 'listener-one'
+				  AND agent_id = 'agent-one'
+				  AND pending_generation IS NOT NULL`,
+		},
+		{
+			name: "revoke",
+			mutate: func(ctx context.Context, store *Store) error {
+				return store.RevokeSession(ctx, "listener-one", "agent-one")
+			},
+			changedSQL: `SELECT COUNT(*)
+				FROM agent_enrollment_sessions
+				WHERE listener_id = 'listener-one'
+				  AND agent_id = 'agent-one'
+				  AND revoked_at IS NOT NULL`,
+		},
+		{
+			name: "require re-enrollment",
+			mutate: func(ctx context.Context, store *Store) error {
+				return store.RequireReenrollment(
+					ctx,
+					"listener-one",
+					"agent-one",
+				)
+			},
+			changedSQL: `SELECT COUNT(*)
+				FROM agent_enrollment_sessions
+				WHERE listener_id = 'listener-one'
+				  AND agent_id = 'agent-one'
+				  AND reenrollment_required_at IS NOT NULL`,
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			environment := newTestEnvironment(t)
+			environment.insertListener(t, "listener-one")
+			bootstrap := environment.readyBuild(
+				t,
+				"build-one",
+				"listener-one",
+				1,
+			)
+			environment.enroll(
+				t,
+				"listener-one",
+				"agent-one",
+				"build-one",
+				bootstrap.Public,
+			)
+			if _, err := environment.database.SQL().Exec(
+				`CREATE TRIGGER reject_agent_session_audit
+				 BEFORE INSERT ON audit_events
+				 BEGIN
+				     SELECT RAISE(ABORT, 'forced audit failure');
+				 END`,
+			); err != nil {
+				t.Fatalf("install rejecting audit trigger: %v", err)
+			}
+
+			err := testCase.mutate(context.Background(), environment.store)
+			if err == nil {
+				t.Fatal("management mutation succeeded despite rejected audit event")
+			}
+			if got := countRows(
+				t,
+				environment.database.SQL(),
+				testCase.changedSQL,
+			); got != 0 {
+				t.Fatalf("management state changed despite audit rollback: %d rows", got)
+			}
+			if got := countRows(
+				t,
+				environment.database.SQL(),
+				`SELECT COUNT(*) FROM audit_events`,
+			); got != 0 {
+				t.Fatalf("rejected audit transaction retained %d events", got)
+			}
+		})
 	}
 }
 
@@ -850,6 +983,174 @@ func TestPayloadCredentialRevocationBlocksBootstrapButNotExistingSession(t *test
 		enrolled.Credential,
 	); err != nil {
 		t.Fatalf("existing session after payload revocation: %v", err)
+	}
+}
+
+func TestActivatePayloadCredentialTxUsesCallerCommitAndRollback(t *testing.T) {
+	environment := newTestEnvironment(t)
+	environment.insertListener(t, "listener-one")
+	environment.insertBuild(t, "build-one", "listener-one", "building")
+	bootstrap, err := GenerateBootstrapCredential()
+	if err != nil {
+		t.Fatalf("generate bootstrap credential: %v", err)
+	}
+	activation := PayloadCredentialActivation{
+		PayloadBuildID:  "build-one",
+		ListenerID:      "listener-one",
+		BootstrapSHA256: bootstrap.SHA256,
+		MaxSessions:     1,
+	}
+	ctx := context.Background()
+
+	rolledBack, err := environment.database.SQL().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin rollback activation transaction: %v", err)
+	}
+	if err := environment.store.ActivatePayloadCredentialTx(
+		ctx,
+		rolledBack,
+		activation,
+	); err != nil {
+		_ = rolledBack.Rollback()
+		t.Fatalf("activate payload credential in rollback transaction: %v", err)
+	}
+	if err := rolledBack.Rollback(); err != nil {
+		t.Fatalf("rollback payload credential activation: %v", err)
+	}
+	if got := countRows(
+		t,
+		environment.database.SQL(),
+		`SELECT COUNT(*)
+		 FROM payload_bootstrap_credentials
+		 WHERE payload_build_id = 'build-one'`,
+	); got != 0 {
+		t.Fatalf("rolled-back activation retained %d credential rows", got)
+	}
+
+	committed, err := environment.database.SQL().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin committed activation transaction: %v", err)
+	}
+	if err := environment.store.ActivatePayloadCredentialTx(
+		ctx,
+		committed,
+		activation,
+	); err != nil {
+		_ = committed.Rollback()
+		t.Fatalf("activate payload credential in committed transaction: %v", err)
+	}
+	if err := committed.Commit(); err != nil {
+		t.Fatalf("commit payload credential activation: %v", err)
+	}
+	if got := countRows(
+		t,
+		environment.database.SQL(),
+		`SELECT COUNT(*)
+		 FROM payload_bootstrap_credentials
+		 WHERE payload_build_id = 'build-one'`,
+	); got != 1 {
+		t.Fatalf("committed activation retained %d credential rows, want 1", got)
+	}
+	if err := environment.store.ActivatePayloadCredentialTx(
+		ctx,
+		nil,
+		activation,
+	); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("nil activation transaction error = %v, want ErrInvalidArgument", err)
+	}
+}
+
+func TestRevokePayloadCredentialTxUsesCallerCommitAndRollback(t *testing.T) {
+	environment := newTestEnvironment(t)
+	environment.insertListener(t, "listener-one")
+	environment.readyBuild(t, "build-one", "listener-one", 1)
+	ctx := context.Background()
+
+	rolledBack, err := environment.database.SQL().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin rollback revocation transaction: %v", err)
+	}
+	if err := environment.store.RevokePayloadCredentialTx(
+		ctx,
+		rolledBack,
+		"build-one",
+	); err != nil {
+		_ = rolledBack.Rollback()
+		t.Fatalf("revoke payload credential in rollback transaction: %v", err)
+	}
+	var revokedInside int
+	if err := rolledBack.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*)
+		 FROM payload_bootstrap_credentials
+		 WHERE payload_build_id = 'build-one'
+		   AND revoked_at IS NOT NULL`,
+	).Scan(&revokedInside); err != nil {
+		_ = rolledBack.Rollback()
+		t.Fatalf("read revocation inside transaction: %v", err)
+	}
+	if revokedInside != 1 {
+		_ = rolledBack.Rollback()
+		t.Fatalf("revoked rows inside transaction = %d, want 1", revokedInside)
+	}
+	if err := rolledBack.Rollback(); err != nil {
+		t.Fatalf("rollback payload credential revocation: %v", err)
+	}
+	if got := countRows(
+		t,
+		environment.database.SQL(),
+		`SELECT COUNT(*)
+		 FROM payload_bootstrap_credentials
+		 WHERE payload_build_id = 'build-one'
+		   AND revoked_at IS NOT NULL`,
+	); got != 0 {
+		t.Fatalf("rolled-back revocation retained %d changed rows", got)
+	}
+
+	committed, err := environment.database.SQL().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin committed revocation transaction: %v", err)
+	}
+	if err := environment.store.RevokePayloadCredentialTx(
+		ctx,
+		committed,
+		"build-one",
+	); err != nil {
+		_ = committed.Rollback()
+		t.Fatalf("revoke payload credential in committed transaction: %v", err)
+	}
+	if err := committed.Commit(); err != nil {
+		t.Fatalf("commit payload credential revocation: %v", err)
+	}
+	if got := countRows(
+		t,
+		environment.database.SQL(),
+		`SELECT COUNT(*)
+		 FROM payload_bootstrap_credentials
+		 WHERE payload_build_id = 'build-one'
+		   AND revoked_at IS NOT NULL`,
+	); got != 1 {
+		t.Fatalf("committed revocation changed %d rows, want 1", got)
+	}
+
+	missing, err := environment.database.SQL().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin missing revocation transaction: %v", err)
+	}
+	defer missing.Rollback()
+	if err := environment.store.RevokePayloadCredentialTx(
+		ctx,
+		missing,
+		"missing-build",
+	); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing transactional revocation error = %v, want ErrNotFound", err)
+	}
+	if err := environment.store.RevokePayloadCredentialTx(
+		ctx,
+		nil,
+		"build-one",
+	); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("nil transaction error = %v, want ErrInvalidArgument", err)
 	}
 }
 

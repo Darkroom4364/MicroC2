@@ -123,7 +123,7 @@ Focus areas:
 - Replace raw string-only tasking as the primary API.
 - Store agents, tasks, results, payload metadata, and listener events durably;
   keep filesystem artifacts covered by coordinated backup and restore.
-- Add actor-aware audit records as a distinct layer on top of durable
+- Maintain actor-aware audit records as a distinct layer on top of durable
   operational state.
 - Build a consistent UI flow for agents, tasking, results, files, listeners,
   payloads, and logs.
@@ -150,7 +150,10 @@ Candidate issues:
 - #97 `[Server] Add durable storage for agents, tasks, results, payloads, and
   listener events` — merged into `dev`.
 - #100 `[Server] Add structured audit events for operator actions and agent
-  tasking`
+  tasking` — complete on the `dev` integration line with causal task/payload
+  links, redacted retention semantics, terminal auditing, and a paginated API.
+- #108 `[Security] Anchor payload artifact access beneath the configured root`
+  — required before any `dev` to `main` promotion.
 - #88 `[Agent] Wire file transfer and pivot controls into command dispatch` —
   extend the typed contract only after #98.
 - #65 `[Agent] Configuration System extension`
@@ -377,14 +380,15 @@ detection, Internet-scale botnet market measurement.
 
 Recommended next sequence:
 
-1. Add #100 on the durable model so operator and agent actions have causal,
-   reviewable audit events.
-2. Tackle #88 after #98, adding file transfer and pivot operations as explicit
+1. Tackle #88 after #98, adding file transfer and pivot operations as explicit
    task types instead of new string commands.
-3. Continue the bounded #99 payload-quality track alongside the data path.
+2. Continue the bounded #99 payload-quality track alongside the data path.
+3. Build evidence export and reporting views on the completed structured audit
+   foundation.
 
-The data path is **#98 → #97 → #100**. Issues #98 and #97 are complete, and
-#104 closes the authenticated-enrollment boundary for the `dev` integration
-line. No `dev` to `main` promotion is part of this sequence, and the #104
-implementation does not imply that one is ready. Issue #99 remains a bounded
-P1 payload-quality track that can proceed alongside it.
+The data path **#98 → #97 → #100** is complete on the `dev` integration line,
+and #104 closes the authenticated-enrollment boundary there. No `dev` to
+`main` promotion is part of this sequence, and completion does not imply that
+one is ready. Issue #108 is an explicit promotion gate for cross-platform
+payload-path containment. Issue #99 remains a bounded P1 payload-quality track
+that can proceed alongside it.

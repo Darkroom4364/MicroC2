@@ -23,6 +23,7 @@ for (const file of schemaFiles) {
 }
 
 const exampleSchemas = new Map([
+    ['audit-page-v1.json', 'audit-page-v1.schema.json'],
     ['task-create-request-v1.json', 'task-create-request-v1.schema.json'],
     ['task-dispatched-v1.json', 'task-v1.schema.json'],
     ['task-page-v1.json', 'task-page-v1.schema.json'],
@@ -128,6 +129,30 @@ for (const testCase of lifecyclePositiveCases) {
 }
 
 const negativeCases = [
+    {
+        name: 'audit event rejects arbitrary details',
+        schema: 'audit-event-v1.schema.json',
+        value: {
+            ...readJSON(path.join(exampleDirectory, 'audit-page-v1.json')).events[0],
+            details: 'terminal output must never appear here'
+        }
+    },
+    {
+        name: 'audit event rejects a credential-shaped arbitrary field',
+        schema: 'audit-event-v1.schema.json',
+        value: {
+            ...readJSON(path.join(exampleDirectory, 'audit-page-v1.json')).events[0],
+            token: 'must-not-be-recorded'
+        }
+    },
+    {
+        name: 'audit page rejects an excessive offset',
+        schema: 'audit-page-v1.schema.json',
+        value: {
+            ...readJSON(path.join(exampleDirectory, 'audit-page-v1.json')),
+            offset: 1000001
+        }
+    },
     {
         name: 'create request rejects a blank command',
         schema: 'task-create-request-v1.schema.json',
