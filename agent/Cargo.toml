@@ -24,6 +24,7 @@ sysinfo = "0.35.0"
 winapi = { version = "0.3.9", features = ["wtsapi32", "sysinfoapi"] }
 obfstr = "0.4.4"
 aes-gcm = "0.10.3"
+base64 = "0.22.1"
 rand_core = { version = "0.6.4", features = ["std"] }
 bincode = "1.3"
 
@@ -32,7 +33,11 @@ default = []
 dll = []  # Feature flag for DLL exports
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3.9", features = ["winuser", "libloaderapi", "jobapi2", "handleapi"] }
+winapi = { version = "0.3.9", features = ["winuser", "libloaderapi", "jobapi2", "handleapi", "fileapi", "winbase", "dpapi", "wincrypt"] }
+
+[build-dependencies]
+serde_json = "1.0.140"
+url = "2.5.4"
 
 [profile.release]
 opt-level = "z"  # Optimize for size

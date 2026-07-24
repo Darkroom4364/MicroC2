@@ -2,8 +2,10 @@ package listeners
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"microc2/server/internal/behaviour"
 	"microc2/server/internal/common"
 	"microc2/server/internal/persistence"
 	"os"
@@ -21,49 +23,135 @@ const scopedAgentKeyDelimiter = "/"
 // ListenerManager handles the creation, management, and tracking of protocol listeners.
 // It maintains a thread-safe registry of all active and stopped listeners.
 type ListenerManager struct {
-	listeners    map[string]*Listener
-	protocol     common.Protocol
-	listenersDir string
-	database     *persistence.Database
-	now          func() time.Time
-	mu           sync.RWMutex
+	listeners        map[string]*Listener
+	protocol         common.Protocol
+	listenersDir     string
+	database         *persistence.Database
+	transportPolicy  common.AgentTransportPolicy
+	requireAgentAuth bool
+	now              func() time.Time
+	mu               sync.RWMutex
 }
 
-// NewListenerManager creates a new listener manager instance
+// Database returns the immutable process-wide persistence handle used by this
+// manager. Callers must not change its connection-pool or durability settings.
+func (m *ListenerManager) Database() *persistence.Database {
+	if m == nil {
+		return nil
+	}
+	return m.database
+}
+
+// NewListenerManager creates a non-durable manager with the production-safe
+// transport policy. Focused tests that require plaintext HTTP must explicitly
+// call NewListenerManagerForIsolatedLab.
 func NewListenerManager(proto common.Protocol) *ListenerManager {
 	manager, err := newListenerManager(
 		proto,
 		filepath.Join("static", "listeners"),
 		nil,
+		common.AgentTransportPolicy{},
+		true,
 		time.Now,
 	)
 	if err != nil {
 		log.Printf("[WARNING] Failed to load listener configurations: %v", err)
 		return &ListenerManager{
-			listeners:    make(map[string]*Listener),
-			protocol:     proto,
-			listenersDir: filepath.Join("static", "listeners"),
-			now:          time.Now,
+			listeners:        make(map[string]*Listener),
+			protocol:         proto,
+			listenersDir:     filepath.Join("static", "listeners"),
+			transportPolicy:  common.AgentTransportPolicy{},
+			requireAgentAuth: true,
+			now:              time.Now,
 		}
 	}
 	return manager
 }
 
-// NewListenerManagerWithPersistence constructs a manager backed by the shared
-// durable database. Startup fails if durable listener state cannot be
-// reconciled with the saved configuration directory.
+// NewListenerManagerForIsolatedLab creates a non-durable manager whose policy
+// explicitly permits plaintext HTTP agent listeners.
+func NewListenerManagerForIsolatedLab(proto common.Protocol) *ListenerManager {
+	manager, err := newListenerManager(
+		proto,
+		filepath.Join("static", "listeners"),
+		nil,
+		common.IsolatedLabAgentTransportPolicy(),
+		false,
+		time.Now,
+	)
+	if err != nil {
+		log.Printf("[WARNING] Failed to load listener configurations: %v", err)
+		return &ListenerManager{
+			listeners:        make(map[string]*Listener),
+			protocol:         proto,
+			listenersDir:     filepath.Join("static", "listeners"),
+			transportPolicy:  common.IsolatedLabAgentTransportPolicy(),
+			requireAgentAuth: false,
+			now:              time.Now,
+		}
+	}
+	return manager
+}
+
+// NewListenerManagerWithPersistence constructs a durable manager with the
+// production-safe transport policy. Focused tests that require plaintext HTTP
+// must explicitly call NewListenerManagerWithPersistenceForIsolatedLab.
 func NewListenerManagerWithPersistence(
 	proto common.Protocol,
 	listenersDir string,
 	database *persistence.Database,
 ) (*ListenerManager, error) {
-	return newListenerManager(proto, listenersDir, database, time.Now)
+	return newListenerManager(
+		proto,
+		listenersDir,
+		database,
+		common.AgentTransportPolicy{},
+		true,
+		time.Now,
+	)
+}
+
+// NewListenerManagerWithPersistenceForIsolatedLab constructs a durable
+// manager whose policy explicitly permits plaintext HTTP agent listeners.
+func NewListenerManagerWithPersistenceForIsolatedLab(
+	proto common.Protocol,
+	listenersDir string,
+	database *persistence.Database,
+) (*ListenerManager, error) {
+	return newListenerManager(
+		proto,
+		listenersDir,
+		database,
+		common.IsolatedLabAgentTransportPolicy(),
+		false,
+		time.Now,
+	)
+}
+
+// NewProductionListenerManager constructs a listener manager with an explicit
+// production transport policy. Its zero-value policy rejects plaintext HTTP.
+func NewProductionListenerManager(
+	proto common.Protocol,
+	listenersDir string,
+	database *persistence.Database,
+	transportPolicy common.AgentTransportPolicy,
+) (*ListenerManager, error) {
+	return newListenerManager(
+		proto,
+		listenersDir,
+		database,
+		transportPolicy,
+		true,
+		time.Now,
+	)
 }
 
 func newListenerManager(
 	proto common.Protocol,
 	listenersDir string,
 	database *persistence.Database,
+	transportPolicy common.AgentTransportPolicy,
+	requireAgentAuth bool,
 	now func() time.Time,
 ) (*ListenerManager, error) {
 	if listenersDir == "" {
@@ -73,11 +161,13 @@ func newListenerManager(
 		now = time.Now
 	}
 	manager := &ListenerManager{
-		listeners:    make(map[string]*Listener),
-		protocol:     proto,
-		listenersDir: listenersDir,
-		database:     database,
-		now:          now,
+		listeners:        make(map[string]*Listener),
+		protocol:         proto,
+		listenersDir:     listenersDir,
+		database:         database,
+		transportPolicy:  transportPolicy,
+		requireAgentAuth: requireAgentAuth,
+		now:              now,
 	}
 
 	if err := ensurePrivateDirectory(listenersDir); err != nil {
@@ -100,7 +190,14 @@ func newListenerManager(
 			)
 		}
 
-		listener, err := newListener(config, listenersDir, database, false)
+		listener, err := newListener(
+			config,
+			listenersDir,
+			database,
+			manager.transportPolicy,
+			manager.requireAgentAuth,
+			false,
+		)
 		if err != nil {
 			return nil, fmt.Errorf(
 				"create durable listener runtime %s: %w",
@@ -169,6 +266,14 @@ func newListenerManager(
 			continue
 		}
 		if err := manager.validateListenerConfig(config); err != nil {
+			if errors.Is(err, common.ErrInsecureHTTPAgentTransport) ||
+				errors.Is(err, common.ErrClientCertificateValidationUnavailable) {
+				return nil, fmt.Errorf(
+					"saved listener %s violates agent transport policy: %w",
+					config.ID,
+					err,
+				)
+			}
 			log.Print("[WARNING] Saved listener configuration is invalid; skipping")
 			continue
 		}
@@ -200,7 +305,14 @@ func newListenerManager(
 			continue
 		}
 
-		listener, err := newListener(config, listenersDir, database, false)
+		listener, err := newListener(
+			config,
+			listenersDir,
+			database,
+			manager.transportPolicy,
+			manager.requireAgentAuth,
+			false,
+		)
 		if err != nil {
 			log.Printf("[WARNING] Failed to create listener instance for %s: %v", config.Name, err)
 			continue
@@ -267,6 +379,8 @@ func (m *ListenerManager) CreateListener(config ListenerConfig) (*Listener, erro
 		config,
 		m.listenersDir,
 		m.database,
+		m.transportPolicy,
+		m.requireAgentAuth,
 		m.database == nil,
 	)
 	if err != nil {
@@ -361,11 +475,38 @@ func (m *ListenerManager) AddListener(listener *Listener) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if _, exists := m.listeners[listener.Config.ID]; exists {
-		return fmt.Errorf("listener with ID %s already exists", listener.Config.ID)
+	if listener == nil {
+		return fmt.Errorf("listener is required")
+	}
+	listener.mu.Lock()
+	defer listener.mu.Unlock()
+	if listener.Status != StatusStopped {
+		return fmt.Errorf(
+			"listener %s must be stopped before it can be added",
+			listener.Config.ID,
+		)
+	}
+	config := listener.Config
+	if err := m.validateListenerConfig(config); err != nil {
+		return err
+	}
+	if _, exists := m.listeners[config.ID]; exists {
+		return fmt.Errorf("listener with ID %s already exists", config.ID)
+	}
+	if m.requireAgentAuth {
+		httpProtocol, ok := listener.Protocol.(*behaviour.HTTPPollingProtocol)
+		if !listener.requireAgentAuth ||
+			!ok ||
+			!httpProtocol.RequiresAgentAuthentication() {
+			return errors.New(
+				"listener does not enforce authenticated agent enrollment",
+			)
+		}
 	}
 
-	m.listeners[listener.Config.ID] = listener
+	listener.transportPolicy = m.transportPolicy
+	listener.requireAgentAuth = m.requireAgentAuth
+	m.listeners[config.ID] = listener
 	return nil
 }
 
@@ -662,6 +803,15 @@ func (m *ListenerManager) validateListenerConfig(config ListenerConfig) error {
 	default:
 		return fmt.Errorf("unsupported protocol: %s", config.Protocol)
 	}
+	if err := validateListenerTLSProtocol(protocol, config.TLSConfig); err != nil {
+		return err
+	}
+	if err := m.transportPolicy.ValidateListener(
+		protocol,
+		config.TLSConfig != nil && config.TLSConfig.RequireClientCert,
+	); err != nil {
+		return err
+	}
 
 	if config.Port < 1 || config.Port > 65535 {
 		log.Printf("[ERROR] Listener validation failed: invalid port number %d", config.Port)
@@ -752,7 +902,14 @@ func (m *ListenerManager) LoadSavedListener(configPath string) (*Listener, error
 	}
 
 	config.Protocol = strings.ToLower(config.Protocol)
-	listener, err := newListener(config, m.listenersDir, m.database, false)
+	listener, err := newListener(
+		config,
+		m.listenersDir,
+		m.database,
+		m.transportPolicy,
+		m.requireAgentAuth,
+		false,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create listener: %v", err)
 	}

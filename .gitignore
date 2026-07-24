@@ -1,5 +1,6 @@
 /.togi-cache/
 /agent/target/*
+/agent/.microc2-build/*
 /agent/static/payloads/*
 /server/server
 /server/data/

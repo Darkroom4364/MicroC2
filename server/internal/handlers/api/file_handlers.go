@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 
+	"microc2/server/internal/common"
 	"microc2/server/internal/filestore"
 	"microc2/server/internal/handlers/api/payload"
 	"microc2/server/internal/listeners" // Updated from `networking`
@@ -158,12 +159,14 @@ func PayloadHandlerSetup(
 	agentSourceDir string,
 	manager *listeners.ListenerManager,
 	database *persistence.Database,
+	transportPolicy common.AgentTransportPolicy,
 ) (*payload.PayloadHandler, error) {
-	return payload.NewPayloadHandlerWithPersistence(
+	return payload.NewProductionPayloadHandler(
 		payloadsDir,
 		agentSourceDir,
 		managerListenerLookup{manager: manager},
 		database,
+		transportPolicy,
 	)
 }
 

@@ -8,6 +8,10 @@
 # inside the isolated lab. Lab use only.
 
 set -euo pipefail
+# Enrollment credentials are passed through the environment. Disable shell
+# tracing even when a caller invokes this script with `bash -x`.
+set +x
+unset ENROLLMENT_CREDENTIAL
 
 # --- Defaults ---
 COUNT=""
@@ -17,7 +21,7 @@ BASE_SEED="5eed"
 SEEDS=""
 LISTENER_HOST="192.0.2.1"   # TEST-NET-1 placeholder; override with the lab C2 address
 LISTENER_PORT="8443"
-PROTOCOL="http"
+PROTOCOL="https"
 FORMAT="windows_exe"
 BUILD_TYPE="release"
 STUDY_ID=""
@@ -39,7 +43,8 @@ Options:
                          (overrides --count and --base-seed)
       --listener-host H  C2 listener host baked into payloads (default: 192.0.2.1)
       --listener-port P  C2 listener port (default: 8443)
-      --protocol P       C2 protocol (default: http)
+      --protocol P       C2 protocol (default: https). Explicit http is only
+                         for an isolated lab and enables the agent's lab gate.
       --format F         build.sh format (default: windows_exe)
       --build-type T     release|debug (default: release)
       --study-id S       Study identifier recorded in the manifest
@@ -71,6 +76,11 @@ done
 if [[ -z "$SEEDS" && -z "$COUNT" ]]; then
   echo "Error: --count is required unless --seeds is given" >&2; usage
 fi
+if [[ -z "$SEEDS" ]] &&
+   { [[ ! "$COUNT" =~ ^[1-9][0-9]*$ ]] || (( COUNT > 1000 )); }; then
+  echo "Error: --count must be an integer from 1 through 1000" >&2
+  exit 1
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -94,19 +104,46 @@ json_escape() { # $1 = raw string -> JSON-escaped (no surrounding quotes)
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
 
+generate_enrollment_credential() {
+  local credential=""
+  if command -v openssl >/dev/null 2>&1; then
+    credential="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\r\n')"
+  elif command -v python3 >/dev/null 2>&1; then
+    credential="$(python3 -c \
+      'import base64, secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii"))')"
+  else
+    echo "Error: openssl or python3 is required to generate build credentials" >&2
+    return 1
+  fi
+
+  if [[ ${#credential} -ne 43 ]] ||
+     [[ ! "$credential" =~ ^[A-Za-z0-9_-]{43}$ ]] ||
+     [[ ! "${credential: -1}" =~ ^[AEIMQUYcgkosw048]$ ]]; then
+    echo "Error: secure credential generation returned a non-canonical value" >&2
+    return 1
+  fi
+  printf '%s' "$credential"
+}
+
 # --- Resolve the seed list ---
 declare -a SEED_LIST=()
 if [[ -n "$SEEDS" ]]; then
-  # shellcheck disable=SC2206
-  SEED_LIST=(${SEEDS//,/ })
+  NORMALIZED_SEEDS="${SEEDS//,/ }"
+  read -r -a SEED_LIST <<< "$NORMALIZED_SEEDS"
 else
   for ((i = 0; i < COUNT; i++)); do
     SEED_LIST+=("$(printf '%s' "microc2-r1:${BASE_SEED}:${i}" | sha256_hex | cut -c1-16)")
   done
 fi
 
-for s in "${SEED_LIST[@]}"; do
+[[ ${#SEED_LIST[@]} -gt 0 ]] || {
+  echo "Error: --seeds must contain at least one hex seed" >&2
+  exit 1
+}
+for index in "${!SEED_LIST[@]}"; do
+  s="${SEED_LIST[$index]}"
   [[ "$s" =~ ^[0-9a-fA-F]{1,16}$ ]] || { echo "Error: invalid seed '$s' (expect hex u64)" >&2; exit 1; }
+  SEED_LIST[$index]="$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')"
 done
 
 GIT_REVISION="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo "unknown")"
@@ -117,6 +154,20 @@ OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 
 echo "Building ${#SEED_LIST[@]} variant(s) from revision $GIT_REVISION"
 echo "Seeds: ${SEED_LIST[*]}"
+
+case "$PROTOCOL" in
+  https)
+    LAB_ALLOW_INSECURE_ISOLATED_LAB="false"
+    ;;
+  http)
+    LAB_ALLOW_INSECURE_ISOLATED_LAB="true"
+    echo "Warning: building for plaintext HTTP; use only on the isolated lab segment." >&2
+    ;;
+  *)
+    echo "Error: --protocol must be http or https" >&2
+    exit 1
+    ;;
+esac
 
 # --- Artifact name per format (mirrors agent/build.sh) ---
 case "$FORMAT" in
@@ -134,10 +185,30 @@ esac
 declare -a CELLS=()
 for seed in "${SEED_LIST[@]}"; do
   CELL_DIR="$OUTPUT_DIR/seed_${seed}"
+  if [[ -e "$CELL_DIR" ]]; then
+    [[ -d "$CELL_DIR" && ! -L "$CELL_DIR" ]] || {
+      echo "Error: existing cell path is not a regular directory: $CELL_DIR" >&2
+      exit 1
+    }
+    if [[ -n "$(find "$CELL_DIR" -mindepth 1 -print -quit)" ]]; then
+      echo "Error: refusing to reuse non-empty cell directory: $CELL_DIR" >&2
+      exit 1
+    fi
+  fi
   mkdir -p "$CELL_DIR"
   echo "==> seed $seed"
 
-  ( cd "$AGENT_DIR" && ./build.sh \
+  # This credential exists only long enough to compile this standalone cell.
+  # Its hash is not activated in the server database, and the raw value must
+  # never be added to the run manifest or provenance.
+  CELL_ENROLLMENT_CREDENTIAL="$(generate_enrollment_credential)"
+  ( cd "$AGENT_DIR"
+    ENROLLMENT_CREDENTIAL="$CELL_ENROLLMENT_CREDENTIAL" \
+    ALLOW_INSECURE_ISOLATED_LAB="$LAB_ALLOW_INSECURE_ISOLATED_LAB" \
+    ALLOW_INVALID_CERTS="false" \
+    LISTENER_ID="standalone-lab-matrix" \
+    SERVER_URL="" \
+    ./build.sh \
       --target "$TARGET" \
       --output "$CELL_DIR" \
       --build-type "$BUILD_TYPE" \
@@ -153,10 +224,27 @@ for seed in "${SEED_LIST[@]}"; do
   HASH="$(file_sha256 "$ARTIFACT")"
   BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-  PROVENANCE="null"
   if [[ -f "$CELL_DIR/provenance.json" ]]; then
+    [[ -r "$CELL_DIR/provenance.json" ]] || {
+      echo "Error: provenance file is not readable" >&2
+      exit 1
+    }
+    if printf '%s\n' "$CELL_ENROLLMENT_CREDENTIAL" |
+       grep -Fq -f - "$CELL_DIR/provenance.json"; then
+      echo "Error: provenance contains raw enrollment credential material" >&2
+      exit 1
+    fi
+    if grep -Eq '"(enrollment_credential|session_credential)"[[:space:]]*:' \
+       "$CELL_DIR/provenance.json"; then
+      echo "Error: provenance contains a forbidden credential field" >&2
+      exit 1
+    fi
     PROVENANCE="\"seed_${seed}/provenance.json\""
+  else
+    PROVENANCE="null"
   fi
+  CELL_ENROLLMENT_CREDENTIAL=""
+  unset CELL_ENROLLMENT_CREDENTIAL
 
   CELLS+=("$(cat <<EOF
     {
@@ -166,6 +254,7 @@ for seed in "${SEED_LIST[@]}"; do
       "artifact": {
         "path": "seed_${seed}/${ARTIFACT_NAME}",
         "sha256": "${HASH}",
+        "server_enrolled": false,
         "provenance_path": ${PROVENANCE}
       },
       "edr": {
@@ -203,7 +292,7 @@ done
 MANIFEST="$OUTPUT_DIR/manifest.json"
 cat > "$MANIFEST" <<EOF
 {
-  "manifest_version": "1.0",
+  "manifest_version": "1.1",
   "study_id": "$(json_escape "${STUDY_ID:-TODO}")",
   "generated_by": "lab/build_matrix.sh",
   "generated_at": "${GENERATED_AT}",
@@ -215,5 +304,7 @@ EOF
 
 echo
 echo "Wrote $MANIFEST"
+echo "Standalone matrix artifacts are not enrolled with a MicroC2 server."
+echo "Use server-driven payload builds for cells that require live beaconing or tasking."
 echo "Next: copy $OUTPUT_DIR into the isolated lab and run each cell per"
 echo "docs/research/r1-measurement-protocol.md, filling verdict fields."

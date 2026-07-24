@@ -82,21 +82,23 @@ type SOCKS5ListenerConfig struct {
 // Listener represents a communication protocol listener that agents connect to
 // It manages the lifecycle of the listening service and tracks its operational state.
 type Listener struct {
-	Config          ListenerConfig    `json:"config"`
-	Status          ListenerStatus    `json:"status"`
-	Error           string            `json:"error,omitempty"`
-	StartTime       time.Time         `json:"start_time"`
-	StopTime        time.Time         `json:"stop_time,omitempty"`
-	Stats           ListenerStats     `json:"stats"`
-	URIs            []string          `json:"uris,omitempty"`
-	Headers         map[string]string `json:"headers,omitempty"`
-	UserAgent       string            `json:"user_agent,omitempty"`
-	mu              sync.RWMutex
-	listener        net.Listener
-	server          *http.Server
-	protocolHandler http.Handler // HTTP handler for http
-	Protocol        common.Protocol
-	onError         func(error)
+	Config           ListenerConfig    `json:"config"`
+	Status           ListenerStatus    `json:"status"`
+	Error            string            `json:"error,omitempty"`
+	StartTime        time.Time         `json:"start_time"`
+	StopTime         time.Time         `json:"stop_time,omitempty"`
+	Stats            ListenerStats     `json:"stats"`
+	URIs             []string          `json:"uris,omitempty"`
+	Headers          map[string]string `json:"headers,omitempty"`
+	UserAgent        string            `json:"user_agent,omitempty"`
+	mu               sync.RWMutex
+	listener         net.Listener
+	server           *http.Server
+	protocolHandler  http.Handler // HTTP handler for http
+	Protocol         common.Protocol
+	transportPolicy  common.AgentTransportPolicy
+	requireAgentAuth bool
+	onError          func(error)
 }
 
 // ListenerStats tracks operational statistics for a listener
@@ -154,7 +156,7 @@ func cloneStringMap(in map[string]string) map[string]string {
 	return out
 }
 
-// NewListener creates a new listener instance with the given configuration
+// NewListener creates a listener with the production-safe transport policy.
 //
 // Pre-conditions:
 //   - config is a valid ListenerConfig instance
@@ -169,6 +171,22 @@ func NewListener(config ListenerConfig) (*Listener, error) {
 		config,
 		filepath.Join("static", "listeners"),
 		nil,
+		common.AgentTransportPolicy{},
+		true,
+		true,
+	)
+}
+
+// NewListenerForIsolatedLab creates a listener with the explicit compatibility
+// policy that permits plaintext HTTP. Production code must construct listeners
+// through a ListenerManager carrying the configured AgentTransportPolicy.
+func NewListenerForIsolatedLab(config ListenerConfig) (*Listener, error) {
+	return newListener(
+		config,
+		filepath.Join("static", "listeners"),
+		nil,
+		common.IsolatedLabAgentTransportPolicy(),
+		false,
 		true,
 	)
 }
@@ -177,10 +195,21 @@ func newListener(
 	config ListenerConfig,
 	listenersDir string,
 	database *persistence.Database,
+	transportPolicy common.AgentTransportPolicy,
+	requireAgentAuth bool,
 	saveConfig bool,
 ) (*Listener, error) {
 	config.Protocol = strings.ToLower(config.Protocol)
 	if err := validateListenerIdentity(config); err != nil {
+		return nil, err
+	}
+	if err := transportPolicy.ValidateListener(
+		config.Protocol,
+		config.TLSConfig != nil && config.TLSConfig.RequireClientCert,
+	); err != nil {
+		return nil, err
+	}
+	if err := validateListenerTLSProtocol(config.Protocol, config.TLSConfig); err != nil {
 		return nil, err
 	}
 	if listenersDir == "" {
@@ -215,9 +244,29 @@ func newListener(
 			Port:      fmt.Sprintf("%d", config.Port),
 		}
 		var httpProto *behaviour.HTTPPollingProtocol
-		if database == nil {
+		switch {
+		case requireAgentAuth && database == nil:
+			return nil, errors.New(
+				"authenticated agent listener requires durable storage",
+			)
+		case requireAgentAuth:
+			var err error
+			httpProto, err =
+				behaviour.NewAuthenticatedHTTPPollingProtocolWithPersistence(
+					protoConfig,
+					database,
+					config.ID,
+				)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"load authenticated protocol state for listener %s: %w",
+					config.ID,
+					err,
+				)
+			}
+		case database == nil:
 			httpProto = behaviour.NewHTTPPollingProtocol(protoConfig)
-		} else {
+		default:
 			var err error
 			httpProto, err = behaviour.NewHTTPPollingProtocolWithPersistence(
 				protoConfig,
@@ -247,11 +296,13 @@ func newListener(
 
 	// Construct listener instance
 	l := &Listener{
-		Config:          config,
-		Status:          StatusStopped,
-		Stats:           ListenerStats{},
-		protocolHandler: protoHandler,
-		Protocol:        proto,
+		Config:           config,
+		Status:           StatusStopped,
+		Stats:            ListenerStats{},
+		protocolHandler:  protoHandler,
+		Protocol:         proto,
+		transportPolicy:  transportPolicy,
+		requireAgentAuth: requireAgentAuth,
 	}
 	return l, nil
 }
@@ -437,6 +488,26 @@ func (l *Listener) Start() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	if err := l.transportPolicy.ValidateListener(
+		l.Config.Protocol,
+		l.Config.TLSConfig != nil && l.Config.TLSConfig.RequireClientCert,
+	); err != nil {
+		return err
+	}
+	if err := validateListenerTLSProtocol(
+		l.Config.Protocol,
+		l.Config.TLSConfig,
+	); err != nil {
+		return err
+	}
+	if l.requireAgentAuth {
+		httpProtocol, ok := l.Protocol.(*behaviour.HTTPPollingProtocol)
+		if !ok || !httpProtocol.RequiresAgentAuthentication() {
+			return errors.New(
+				"listener protocol does not enforce authenticated agent enrollment",
+			)
+		}
+	}
 	if l.Status == StatusActive {
 		return fmt.Errorf("listener %s is already running", l.Config.Name)
 	}
@@ -465,9 +536,13 @@ func (l *Listener) Start() error {
 	}
 
 	server := &http.Server{
-		Addr:      addr,
-		Handler:   l.protocolHandler,
-		TLSConfig: tlsConfig,
+		Addr:              addr,
+		Handler:           l.protocolHandler,
+		TLSConfig:         tlsConfig,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	tcpListener, err := net.Listen("tcp", addr)
@@ -503,7 +578,17 @@ func (l *Listener) Start() error {
 }
 
 func (l *Listener) usesTLS() bool {
-	return l.Config.Protocol == "https" || l.Config.TLSConfig != nil
+	return strings.EqualFold(strings.TrimSpace(l.Config.Protocol), "https")
+}
+
+func validateListenerTLSProtocol(protocol string, tlsConfig *TLSConfig) error {
+	if strings.EqualFold(strings.TrimSpace(protocol), "http") &&
+		tlsConfig != nil {
+		return errors.New(
+			`listener TLS configuration requires protocol "https"`,
+		)
+	}
+	return nil
 }
 
 func (l *Listener) tlsCertFiles() (string, string) {

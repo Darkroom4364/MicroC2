@@ -26,6 +26,10 @@ communication:
     
 security:
   enableCORS: true
+  agentTransport:
+    # Plaintext HTTP agent listeners are rejected unless this isolated-lab
+    # escape hatch is explicitly enabled.
+    allowInsecureIsolatedLab: false
   # CORS origins for agent polling routes. Use ["*"] only as an explicit
   # escape hatch; empty list means no cross-origin access.
   corsOrigins: ["https://localhost:8443", "http://localhost:8080"]

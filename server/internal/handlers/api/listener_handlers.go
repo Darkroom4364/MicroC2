@@ -1,17 +1,28 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"log"
+	"microc2/server/internal/enrollment"
 	"microc2/server/internal/listeners" // Updated from `networking`
+	"microc2/server/internal/tasks"
 	"net/http"
 	"strings"
 )
 
 // NewListenerHandlers creates a new listener handlers instance
 func NewListenerHandlers(manager *listeners.ListenerManager) *ListenerHandlers {
-	return &ListenerHandlers{
-		manager: manager,
+	handler := &ListenerHandlers{manager: manager}
+	if manager != nil && manager.Database() != nil {
+		handler.enrollment, handler.enrollmentErr = enrollment.NewStore(
+			context.Background(),
+			manager.Database(),
+		)
 	}
+	return handler
 }
 
 // HandleCreateListener handles requests to create a new listener
@@ -199,11 +210,148 @@ func sendJSONResponse(w http.ResponseWriter, data interface{}) {
 	json.NewEncoder(w).Encode(data)
 }
 
+func parseListenerAgentSessionRoute(
+	path string,
+) (matched, valid bool, listenerID, agentID, action string) {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) < 4 ||
+		parts[0] != "api" ||
+		parts[1] != "listeners" ||
+		parts[3] != "agents" {
+		return false, false, "", "", ""
+	}
+	if len(parts) != 7 ||
+		parts[5] != "session" ||
+		(parts[6] != "rotate" &&
+			parts[6] != "revoke" &&
+			parts[6] != "re-enroll") ||
+		tasks.ValidateIdentifier("listener_id", parts[2]) != nil ||
+		tasks.ValidateIdentifier("agent_id", parts[4]) != nil {
+		return true, false, "", "", ""
+	}
+	return true, true, parts[2], parts[4], parts[6]
+}
+
+func (h *ListenerHandlers) handleAgentSessionManagement(
+	w http.ResponseWriter,
+	r *http.Request,
+	listenerID string,
+	agentID string,
+	action string,
+) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if r.URL.RawQuery != "" {
+		http.Error(w, "Query parameters are not supported", http.StatusBadRequest)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 2))
+	if err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	if len(body) != 0 {
+		http.Error(w, "Request body must be empty", http.StatusBadRequest)
+		return
+	}
+	if h.enrollmentErr != nil {
+		log.Printf("[ERROR] Agent enrollment management unavailable: %v", h.enrollmentErr)
+		http.Error(w, "Agent enrollment management unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if h.enrollment == nil {
+		http.Error(w, "Agent enrollment management unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	response := map[string]interface{}{
+		"listener_id": listenerID,
+		"agent_id":    agentID,
+	}
+	switch action {
+	case "rotate":
+		rotation, err := h.enrollment.Rotate(
+			r.Context(),
+			listenerID,
+			agentID,
+		)
+		if err != nil {
+			writeEnrollmentManagementError(w, err)
+			return
+		}
+		response["status"] = "rotation_pending"
+		response["pending_generation"] = rotation.PendingGeneration
+		response["already_pending"] = rotation.AlreadyPending
+	case "revoke":
+		if err := h.enrollment.RevokeSession(
+			r.Context(),
+			listenerID,
+			agentID,
+		); err != nil {
+			writeEnrollmentManagementError(w, err)
+			return
+		}
+		response["status"] = "revoked"
+	case "re-enroll":
+		if err := h.enrollment.RequireReenrollment(
+			r.Context(),
+			listenerID,
+			agentID,
+		); err != nil {
+			writeEnrollmentManagementError(w, err)
+			return
+		}
+		response["status"] = "reenrollment_required"
+	default:
+		http.Error(w, "Unknown session action", http.StatusNotFound)
+		return
+	}
+	sendJSONResponse(w, response)
+}
+
+func writeEnrollmentManagementError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, enrollment.ErrNotFound):
+		http.Error(w, "Agent enrollment session not found", http.StatusNotFound)
+	case errors.Is(err, enrollment.ErrConflict),
+		errors.Is(err, enrollment.ErrGenerationExhausted),
+		errors.Is(err, enrollment.ErrEnrollmentCapacity):
+		http.Error(w, "Agent enrollment state conflict", http.StatusConflict)
+	case errors.Is(err, enrollment.ErrInvalidArgument):
+		http.Error(w, "Invalid agent enrollment request", http.StatusBadRequest)
+	default:
+		log.Printf("[ERROR] Agent enrollment management failed: %v", err)
+		http.Error(w, "Agent enrollment management failed", http.StatusInternalServerError)
+	}
+}
+
 // RegisterRoutes registers all listener-related routes on the provided mux.
 func (h *ListenerHandlers) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/listeners/create", h.HandleCreateListener)
 	mux.HandleFunc("/api/listeners/list", h.HandleListListeners)
 	mux.HandleFunc("/api/listeners/", func(w http.ResponseWriter, r *http.Request) {
+		if matched, valid, listenerID, agentID, action :=
+			parseListenerAgentSessionRoute(r.URL.Path); matched {
+			if !valid {
+				http.Error(
+					w,
+					"Invalid agent session management path",
+					http.StatusBadRequest,
+				)
+				return
+			}
+			h.handleAgentSessionManagement(
+				w,
+				r,
+				listenerID,
+				agentID,
+				action,
+			)
+			return
+		}
 		path := strings.TrimPrefix(r.URL.Path, "/api/listeners/")
 		if strings.HasSuffix(path, "/events") {
 			h.HandleListListenerEvents(w, r)

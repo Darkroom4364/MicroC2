@@ -9,7 +9,7 @@
   "properties": {
     "manifest_version": {
       "type": "string",
-      "description": "Schema version of this manifest, e.g. \"1.0\"."
+      "description": "Schema version of this manifest, e.g. \"1.1\"."
     },
     "study_id": {
       "type": "string",
@@ -55,7 +55,7 @@
         "seed": {
           "type": "string",
           "pattern": "^[0-9a-f]{1,16}$",
-          "description": "Mutation seed, hex u64 without 0x prefix (matches agent/build.sh --mutation-seed and provenance.json)."
+          "description": "Mutation seed, hex u64 without 0x prefix (matches agent/build.sh --mutation-seed and provenance.json when present)."
         },
         "git_revision": {
           "type": "string",
@@ -64,7 +64,7 @@
         "artifact": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["path", "sha256"],
+          "required": ["path", "sha256", "server_enrolled"],
           "properties": {
             "path": {
               "type": "string",
@@ -74,6 +74,10 @@
               "type": "string",
               "pattern": "^[0-9a-f]{64}$",
               "description": "SHA-256 of the payload artifact, lowercase hex."
+            },
+            "server_enrolled": {
+              "type": "boolean",
+              "description": "True only when this exact artifact was built through the server and its bootstrap hash was activated for the selected build/listener. Standalone build_matrix.sh artifacts set this to false."
             },
             "provenance_path": {
               "type": ["string", "null"],

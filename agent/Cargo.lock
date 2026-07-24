@@ -42,6 +42,7 @@ name = "agent"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "base64",
  "bincode",
  "chrono",
  "env_logger",
@@ -61,6 +62,7 @@ dependencies = [
  "sysinfo",
  "tokio",
  "tokio-socks",
+ "url",
  "winapi 0.3.9",
  "zeroize",
 ]

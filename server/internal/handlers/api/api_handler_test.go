@@ -697,7 +697,7 @@ func TestOperatorAPIDurableHistorySurvivesWithoutRuntimeListenerConfig(t *testin
 			t.Errorf("close reopened durable database: %v", err)
 		}
 	})
-	manager, err := communication.NewServerManager(&communication.ServerConfig{
+	manager, err := communication.NewServerManagerForIsolatedLab(&communication.ServerConfig{
 		UploadDir:    filepath.Join(root, "uploads"),
 		Port:         "0",
 		StaticDir:    filepath.Join(root, "empty-static"),
@@ -836,7 +836,7 @@ func TestOperatorAPITaskDetailRejectsAmbiguousOwnership(t *testing.T) {
 	}
 	listenersInManager[0].Protocol = first
 
-	secondListener, err := listeners.NewListener(listeners.ListenerConfig{
+	secondListener, err := listeners.NewListenerForIsolatedLab(listeners.ListenerConfig{
 		ID:       "listener-two",
 		Name:     "listener-two",
 		Protocol: "http",
@@ -1139,6 +1139,108 @@ func TestOperatorAPIListsAgents(t *testing.T) {
 	if _, ok := agents["agent-one"]; !ok {
 		t.Fatalf("expected registered agent in list, got %#v", agents)
 	}
+	if got := rec.Header().Get("X-Total-Count"); got != "1" {
+		t.Fatalf("X-Total-Count = %q, want 1", got)
+	}
+}
+
+func TestOperatorAPIAgentListIsBoundedAndPaged(t *testing.T) {
+	handler, _ := newTestAPIHandler(t, "agent-b")
+	addTestHTTPListener(
+		t,
+		handler,
+		"listener-agent-a",
+		49021,
+		listeners.StatusActive,
+		"agent-a",
+	)
+	addTestHTTPListener(
+		t,
+		handler,
+		"listener-agent-c",
+		49022,
+		listeners.StatusActive,
+		"agent-c",
+	)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/api/agents/list?limit=2&offset=0",
+		nil,
+	)
+	handler.HandleRequest(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first agent page: %d: %s", rec.Code, rec.Body.String())
+	}
+	var first map[string]behaviour.Agent
+	if err := json.Unmarshal(rec.Body.Bytes(), &first); err != nil {
+		t.Fatalf("decode first agent page: %v", err)
+	}
+	if len(first) != 2 {
+		t.Fatalf("first agent page count = %d, want 2: %#v", len(first), first)
+	}
+	for _, key := range []string{"agent-a", "agent-b"} {
+		if _, exists := first[key]; !exists {
+			t.Fatalf("first agent page missing %q: %#v", key, first)
+		}
+	}
+	for name, want := range map[string]string{
+		"X-Total-Count": "3",
+		"X-Limit":       "2",
+		"X-Offset":      "0",
+		"X-Next-Offset": "2",
+	} {
+		if got := rec.Header().Get(name); got != want {
+			t.Fatalf("%s = %q, want %q", name, got, want)
+		}
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(
+		http.MethodGet,
+		"/api/agents/list?limit=2&offset=2",
+		nil,
+	)
+	handler.HandleRequest(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second agent page: %d: %s", rec.Code, rec.Body.String())
+	}
+	var second map[string]behaviour.Agent
+	if err := json.Unmarshal(rec.Body.Bytes(), &second); err != nil {
+		t.Fatalf("decode second agent page: %v", err)
+	}
+	if len(second) != 1 || second["agent-c"].ID != "agent-c" {
+		t.Fatalf("unexpected second agent page: %#v", second)
+	}
+	if got := rec.Header().Get("X-Next-Offset"); got != "" {
+		t.Fatalf("final page X-Next-Offset = %q, want empty", got)
+	}
+}
+
+func TestOperatorAPIAgentListRejectsUnboundedQueries(t *testing.T) {
+	handler, _ := newTestAPIHandler(t, "agent-one")
+	for _, path := range []string{
+		"/api/agents/list?limit=0",
+		"/api/agents/list?limit=501",
+		"/api/agents/list?offset=-1",
+		"/api/agents/list?unknown=1",
+		"/api/agents/list?limit=1&limit=2",
+	} {
+		t.Run(path, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			handler.HandleRequest(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf(
+					"GET %s status = %d, want 400: %s",
+					path,
+					rec.Code,
+					rec.Body.String(),
+				)
+			}
+		})
+	}
 }
 
 func TestOperatorAPIDurableAgentKeysCannotCollide(t *testing.T) {
@@ -1183,7 +1285,7 @@ func TestOperatorAPIDurableAgentKeysCannotCollide(t *testing.T) {
 	addAgent("other", "agent")
 	addAgent("unique", "scope:agent")
 
-	manager, err := communication.NewServerManager(&communication.ServerConfig{
+	manager, err := communication.NewServerManagerForIsolatedLab(&communication.ServerConfig{
 		UploadDir:    filepath.Join(root, "uploads"),
 		Port:         "0",
 		StaticDir:    filepath.Join(root, "static"),
@@ -1309,7 +1411,7 @@ func newTestAPIHandler(t *testing.T, agentID string) (*APIHandler, *behaviour.HT
 		}
 	})
 
-	manager, err := communication.NewServerManager(&communication.ServerConfig{
+	manager, err := communication.NewServerManagerForIsolatedLab(&communication.ServerConfig{
 		UploadDir:    filepath.Join(tempDir, "uploads"),
 		Port:         "0",
 		StaticDir:    filepath.Join(tempDir, "static"),
@@ -1319,7 +1421,7 @@ func newTestAPIHandler(t *testing.T, agentID string) (*APIHandler, *behaviour.HT
 		t.Fatalf("create server manager: %v", err)
 	}
 
-	listener, err := listeners.NewListener(listeners.ListenerConfig{
+	listener, err := listeners.NewListenerForIsolatedLab(listeners.ListenerConfig{
 		ID:       "listener-one",
 		Name:     "listener-one",
 		Protocol: "http",
@@ -1337,10 +1439,10 @@ func newTestAPIHandler(t *testing.T, agentID string) (*APIHandler, *behaviour.HT
 	if err := proto.HandleAgentHeartbeat(heartbeat); err != nil {
 		t.Fatalf("register agent heartbeat: %v", err)
 	}
-	listener.Status = listeners.StatusActive
 	if err := manager.GetListenerManager().AddListener(listener); err != nil {
 		t.Fatalf("add listener: %v", err)
 	}
+	listener.Status = listeners.StatusActive
 
 	return NewAPIHandler(manager), proto
 }
@@ -1354,7 +1456,7 @@ func addTestHTTPListener(
 	agentID string,
 ) *behaviour.HTTPPollingProtocol {
 	t.Helper()
-	listener, err := listeners.NewListener(listeners.ListenerConfig{
+	listener, err := listeners.NewListenerForIsolatedLab(listeners.ListenerConfig{
 		ID:       listenerID,
 		Name:     listenerID,
 		Protocol: "http",
@@ -1376,10 +1478,10 @@ func addTestHTTPListener(
 	if err := proto.HandleAgentHeartbeat(heartbeat); err != nil {
 		t.Fatalf("register %s heartbeat on %s: %v", agentID, listenerID, err)
 	}
-	listener.Status = status
 	if err := handler.serverManager.GetListenerManager().AddListener(listener); err != nil {
 		t.Fatalf("add listener %s: %v", listenerID, err)
 	}
+	listener.Status = status
 	return proto
 }
 

@@ -147,8 +147,10 @@ type boundedLegacyResultProtocol interface {
 }
 
 const (
-	defaultTaskListLimit = 50
-	maxTaskListLimit     = 100
+	defaultTaskListLimit  = 50
+	maxTaskListLimit      = 100
+	defaultAgentListLimit = 100
+	maxAgentListLimit     = 500
 )
 
 type taskListOptions struct {
@@ -756,47 +758,143 @@ func (h *APIHandler) handleListAgents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	agents, err := h.allAgents()
+	options, err := parseAgentListOptions(r.URL.RawQuery)
+	if err != nil {
+		http.Error(w, "Invalid agent query: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	agents, total, err := h.allAgents(options)
 	if err != nil {
 		log.Printf("[ERROR] Failed to load durable agent history: %v", err)
 		http.Error(w, "Agent history unavailable", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Total-Count", strconv.Itoa(total))
+	w.Header().Set("X-Limit", strconv.Itoa(options.limit))
+	w.Header().Set("X-Offset", strconv.Itoa(options.offset))
+	if next := options.offset + len(agents); next < total {
+		w.Header().Set("X-Next-Offset", strconv.Itoa(next))
+	}
 	if err := json.NewEncoder(w).Encode(agents); err != nil {
 		log.Printf("[ERROR] Failed to encode agent history: %v", err)
 	}
 }
 
-func (h *APIHandler) allAgents() (map[string]interface{}, error) {
+type agentListOptions struct {
+	limit  int
+	offset int
+}
+
+func parseAgentListOptions(rawQuery string) (agentListOptions, error) {
+	options := agentListOptions{
+		limit:  defaultAgentListLimit,
+		offset: 0,
+	}
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return agentListOptions{}, fmt.Errorf("malformed query string: %w", err)
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if key != "limit" && key != "offset" {
+			return agentListOptions{}, fmt.Errorf("unknown query parameter %q", key)
+		}
+		if len(values[key]) != 1 {
+			return agentListOptions{}, fmt.Errorf(
+				"query parameter %q must be provided exactly once",
+				key,
+			)
+		}
+	}
+	if values.Has("limit") {
+		limit, err := parseTaskQueryInteger("limit", values.Get("limit"))
+		if err != nil {
+			return agentListOptions{}, err
+		}
+		if limit < 1 || limit > maxAgentListLimit {
+			return agentListOptions{}, fmt.Errorf(
+				"query parameter %q must be between 1 and %d",
+				"limit",
+				maxAgentListLimit,
+			)
+		}
+		options.limit = limit
+	}
+	if values.Has("offset") {
+		offset, err := parseTaskQueryInteger("offset", values.Get("offset"))
+		if err != nil {
+			return agentListOptions{}, err
+		}
+		options.offset = offset
+	}
+	return options, nil
+}
+
+func (h *APIHandler) allAgents(
+	options agentListOptions,
+) (map[string]interface{}, int, error) {
 	if h.serverManager == nil {
-		return map[string]interface{}{}, nil
+		return map[string]interface{}{}, 0, nil
 	}
 	database := h.serverManager.GetDatabase()
 	if database == nil {
 		manager := h.serverManager.GetListenerManager()
 		if manager == nil {
-			return map[string]interface{}{}, nil
+			return map[string]interface{}{}, 0, nil
 		}
-		return manager.AllAgents(), nil
+		all := manager.AllAgents()
+		keys := make([]string, 0, len(all))
+		for key := range all {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		total := len(keys)
+		start := options.offset
+		if start > total {
+			start = total
+		}
+		end := start + options.limit
+		if end > total {
+			end = total
+		}
+		page := make(map[string]interface{}, end-start)
+		for _, key := range keys[start:end] {
+			page[key] = all[key]
+		}
+		return page, total, nil
 	}
 
+	var total int
+	if err := database.SQL().QueryRow(
+		`SELECT COUNT(*) FROM agents`,
+	).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count durable agents: %w", err)
+	}
 	rows, err := database.SQL().Query(
 		`SELECT listener_id, agent_id, payload_id, os, hostname, ip,
-		        ip_list_json, last_commands_json, last_seen_at
+		        ip_list_json, last_commands_json, last_seen_at,
+		        COUNT(*) OVER (PARTITION BY agent_id)
 		 FROM agents
-		 ORDER BY listener_id, agent_id`,
+		 ORDER BY last_seen_at DESC, listener_id, agent_id
+		 LIMIT ? OFFSET ?`,
+		options.limit,
+		options.offset,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("query durable agents: %w", err)
+		return nil, 0, fmt.Errorf("query durable agents: %w", err)
 	}
 	type scopedAgent struct {
 		listenerID string
 		agentID    string
 		agent      *behaviour.Agent
+		idCount    int
 	}
 	var persisted []scopedAgent
-	counts := make(map[string]int)
 	for rows.Next() {
 		var (
 			agent        behaviour.Agent
@@ -804,6 +902,7 @@ func (h *APIHandler) allAgents() (map[string]interface{}, error) {
 			ipListJSON   []byte
 			commandsJSON []byte
 			lastSeen     string
+			idCount      int
 		)
 		if err := rows.Scan(
 			&listenerID,
@@ -815,22 +914,23 @@ func (h *APIHandler) allAgents() (map[string]interface{}, error) {
 			&ipListJSON,
 			&commandsJSON,
 			&lastSeen,
+			&idCount,
 		); err != nil {
 			_ = rows.Close()
-			return nil, fmt.Errorf("scan durable agent: %w", err)
+			return nil, 0, fmt.Errorf("scan durable agent: %w", err)
 		}
 		if err := json.Unmarshal(ipListJSON, &agent.IPList); err != nil {
 			_ = rows.Close()
-			return nil, fmt.Errorf("decode durable agent IP list: %w", err)
+			return nil, 0, fmt.Errorf("decode durable agent IP list: %w", err)
 		}
 		if err := json.Unmarshal(commandsJSON, &agent.Commands); err != nil {
 			_ = rows.Close()
-			return nil, fmt.Errorf("decode durable agent command list: %w", err)
+			return nil, 0, fmt.Errorf("decode durable agent command list: %w", err)
 		}
 		agent.LastSeen, err = time.Parse(time.RFC3339Nano, lastSeen)
 		if err != nil {
 			_ = rows.Close()
-			return nil, fmt.Errorf("decode durable agent last_seen: %w", err)
+			return nil, 0, fmt.Errorf("decode durable agent last_seen: %w", err)
 		}
 		agent.ListenerID = listenerID
 		agentCopy := agent
@@ -838,26 +938,26 @@ func (h *APIHandler) allAgents() (map[string]interface{}, error) {
 			listenerID: listenerID,
 			agentID:    agent.ID,
 			agent:      &agentCopy,
+			idCount:    idCount,
 		})
-		counts[agent.ID]++
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		return nil, fmt.Errorf("iterate durable agents: %w", err)
+		return nil, 0, fmt.Errorf("iterate durable agents: %w", err)
 	}
 	if err := rows.Close(); err != nil {
-		return nil, fmt.Errorf("close durable agents: %w", err)
+		return nil, 0, fmt.Errorf("close durable agents: %w", err)
 	}
 
 	agents := make(map[string]interface{}, len(persisted))
 	for _, persistedAgent := range persisted {
 		key := persistedAgent.agentID
-		if counts[persistedAgent.agentID] > 1 {
+		if persistedAgent.idCount > 1 {
 			key = persistedAgent.listenerID + scopedAgentKeyDelimiter + persistedAgent.agentID
 		}
 		agents[key] = persistedAgent.agent
 	}
-	return agents, nil
+	return agents, total, nil
 }
 
 type queueCommandRequest struct {

@@ -62,13 +62,30 @@ Builds happen on the operator host, never inside the lab:
 
 ```bash
 lab/build_matrix.sh --count 20 --output-dir lab/runs/<study-id> \
-  --target x86_64-pc-windows-gnu --base-seed <hex>
+  --target x86_64-pc-windows-gnu --base-seed <hex> --protocol https
 ```
 
-This produces one directory per seed containing the payload and (for
-server-driven builds) `provenance.json`, plus a `manifest.json` skeleton
-with build-side fields filled. Record the git revision once per study; all
-cells must build from the same revision.
+This produces one directory per seed containing a standalone payload, plus a
+`manifest.json` skeleton with build-side fields filled. The script generates a
+fresh credential for each cell only to satisfy the authenticated agent build
+contract. It never prints or records that credential, and it does not activate
+the credential hash in the server database. Consequently, generated cells are
+marked `artifact.server_enrolled: false`: they can support offline/static
+measurements, but they cannot authenticate to a MicroC2 listener.
+
+For any cell that requires live beaconing or tasking, build the payload through
+the server payload workflow with the same requested `mutation_seed`. Copy the
+server-produced artifact and non-secret `provenance.json` into the cell
+directory and mark `artifact.server_enrolled` as `true`. The server build
+transaction is what binds and activates the bootstrap hash for the selected
+payload build and listener. Never put the raw bootstrap or session credential
+in the run manifest, provenance, notes, or logs.
+
+Record the git revision once per study; all cells must build from the same
+revision. The seed schedule is deterministic, but full artifact bytes also
+depend on enrollment material, resolved configuration, target/toolchain, and
+other build inputs. Source revision plus seed alone is not a full-artifact
+reproduction contract.
 
 ## 3. Run steps per (seed, EDR) cell
 
@@ -82,10 +99,14 @@ Per cell, in order:
 4. Execute the payload as the standard user. Do not re-execute if the
    first launch fails — record the failure in notes and mark the verdict
    `unknown` unless the failure was EDR-mediated (then `detected`).
-5. Let the agent dwell for the configured dwell time (§5). Issue the fixed
-   tasking script from the C2 server (also lab-internal).
-6. At dwell end: stop ETW capture, export the Sysmon log, export the EDR
-   console alerts, pull the agent network log from the C2 side.
+5. Let the agent dwell for the configured dwell time (§5). For a
+   server-enrolled cell, issue the fixed tasking script from the C2 server
+   (also lab-internal). A standalone matrix artifact is not valid for this
+   live-tasking step; use it only in a study that explicitly defines an
+   offline/static cell.
+6. At dwell end: stop ETW capture, export the Sysmon log, and export the EDR
+   console alerts. For a server-enrolled cell, also pull the agent network log
+   from the C2 side; leave that telemetry field `null` for a standalone cell.
 7. Record the EDR verdict and alert names in the manifest cell.
 8. Power off; revert to baseline.
 
@@ -100,7 +121,7 @@ One operator action per step, in order, every time — deviations go in
 | EDR alerts | Alert names + console export (JSON/CSV/PDF) | Attribution: which engine fired (static, behavioral, reputation, cloud) |
 | Sysmon | `.evtx` export of `Microsoft-Windows-Sysmon/Operational` | Ground truth: did the behavior actually happen (process, network, DNS, file, registry) |
 | ETW | `.etl` trace (e.g., `logman`/`wpr` with Microsoft-Windows-Kernel-* providers), where the study includes it | Ground truth below Sysmon; catches AMSI/ETW-tamper visibility gaps |
-| Agent network log | C2 server log for the payload_id (beacon times, tasks issued, responses) | Confirms functional equivalence: the variant actually beaconed and executed the tasking script |
+| Agent network log | C2 server log for the payload build (server-enrolled cells only: beacon times, tasks issued, responses) | Confirms functional equivalence: the variant authenticated, beaconed, and executed the tasking script |
 | Static scan | Pre-run on-demand scan verdict of the payload file (optional per study) | Separates static from behavioral detection |
 
 File references go into the cell's `telemetry` object in the manifest.
@@ -110,8 +131,10 @@ Verdict rules:
 
 - `detected` — the EDR raised any alert, block, or quarantine action
   attributable to the payload or its behavior during the cell window.
-- `not-detected` — the full dwell + tasking script completed with no
-  EDR action and Sysmon ground truth confirms the behavior occurred.
+- `not-detected` — for a server-enrolled behavioral cell, the full dwell +
+  tasking script completed with no EDR action and Sysmon ground truth confirms
+  the behavior occurred. A separately designed offline/static study must
+  define its own completion criterion in the manifest notes.
 - `unknown` — the cell is invalid (agent failed to run, Sysmon shows no
   activity, evidence incomplete). Unknown cells are excluded from the
   detection-rate denominator but kept in the manifest.
@@ -146,6 +169,11 @@ cross-layer ablation (R1 track) depends on it.
 - Snapshots: baseline snapshot is never taken after a payload has touched
   the VM; revert after every cell, including failed/unknown cells.
 - The C2 server for lab runs binds only to the lab segment.
+- Prefer HTTPS with a certificate trusted by the detonation VM. Plaintext HTTP
+  requires the explicit isolated-lab build gate and must remain confined to
+  that segment.
+- Enrollment credentials are secret build inputs. Never place their raw values
+  in manifests, provenance, captured command output, or study notes.
 - No real third-party data on detonation VMs; any credentials present are
   lab canaries.
 - MicroC2 is an academic research testbed; all of the above assumes

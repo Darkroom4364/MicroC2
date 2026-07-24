@@ -31,8 +31,13 @@ type Config struct {
 	} `yaml:"communication"`
 
 	Security struct {
-		EnableCORS  bool     `yaml:"enableCORS"`
-		CORSOrigins []string `yaml:"corsOrigins"`
+		EnableCORS     bool     `yaml:"enableCORS"`
+		CORSOrigins    []string `yaml:"corsOrigins"`
+		AgentTransport struct {
+			// AllowInsecureIsolatedLab permits plaintext HTTP agent listeners.
+			// The secure production default is false.
+			AllowInsecureIsolatedLab bool `yaml:"allowInsecureIsolatedLab"`
+		} `yaml:"agentTransport"`
 		// OperatorToken protects the operator API and server terminal for
 		// non-loopback clients. Empty means loopback-only operator access.
 		// Can also be set via the MICROC2_OPERATOR_TOKEN environment variable.

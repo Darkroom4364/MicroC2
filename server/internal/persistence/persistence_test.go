@@ -39,6 +39,10 @@ func TestOpenBootstrapsAndReopensFileDatabase(t *testing.T) {
 		"task_results",
 		"legacy_results",
 		"payload_builds",
+		"enrollment_server_keys",
+		"payload_bootstrap_credentials",
+		"agent_enrollment_sessions",
+		"payload_enrollment_allocations",
 	}
 	for _, table := range requiredTables {
 		var count int
@@ -55,14 +59,22 @@ func TestOpenBootstrapsAndReopensFileDatabase(t *testing.T) {
 	}
 
 	var migrationCount int
-	var migrationName, checksum string
 	if err := database.SQL().QueryRow(
-		`SELECT COUNT(*), MIN(name), MIN(checksum_sha256)
-		 FROM schema_migrations`,
-	).Scan(&migrationCount, &migrationName, &checksum); err != nil {
+		`SELECT COUNT(*) FROM schema_migrations`,
+	).Scan(&migrationCount); err != nil {
 		t.Fatalf("read migration ledger: %v", err)
 	}
-	if migrationCount != 1 || migrationName != "0001_initial.sql" || len(checksum) != 64 {
+	var migrationName, checksum string
+	if err := database.SQL().QueryRow(
+		`SELECT name, checksum_sha256
+		 FROM schema_migrations
+		 WHERE version = 3`,
+	).Scan(&migrationName, &checksum); err != nil {
+		t.Fatalf("read latest migration ledger entry: %v", err)
+	}
+	if migrationCount != 3 ||
+		migrationName != "0003_payload_enrollment_allocations.sql" ||
+		len(checksum) != 64 {
 		t.Fatalf(
 			"unexpected migration ledger: count=%d name=%q checksum=%q",
 			migrationCount,

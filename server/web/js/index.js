@@ -571,12 +571,18 @@ class DashboardManager {
 
     async loadActiveAgents() {
         try {
-            const response = await fetch('/api/agents/list');
+            const response = await fetch('/api/agents/list?limit=100&offset=0');
             if (!response.ok) {
                 throw new Error(`Server returned ${response.status}`);
             }
 
             const agentData = await response.json();
+            const nextOffset = response.headers?.get?.('X-Next-Offset') ?? null;
+            if (nextOffset !== null) {
+                console.warn(
+                    `Agent list is paged; ${response.headers.get('X-Total-Count')} durable agents are available`
+                );
+            }
             // Convert agent map/object to array for rendering
             const agents = Object.values(agentData);
             const agentsContainer = document.getElementById('agent-list');

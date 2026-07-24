@@ -3,12 +3,14 @@
 MicroC2's development branch uses one process-wide SQLite database for durable
 server state. It stores listener records and lifecycle events, historical agent
 metadata, typed task lifecycles and results, legacy result projections, and
-payload-build metadata. Payload binaries, listener compatibility configs,
-operator uploads, and server logs remain files on disk.
+payload-build metadata. With #104 it also stores the enrollment HMAC key,
+payload bootstrap hashes and allowances, and durable agent-session state.
+Payload binaries, listener compatibility configs, operator uploads, and server
+logs remain files on disk.
 
-This is a single-process, local-lab persistence design. It is not a substitute
-for the agent enrollment work in #104 or the structured audit trail planned in
-#100.
+This is a single-process, local-lab persistence design. Issue #97 is merged into
+`dev`, and #104 builds authenticated enrollment on that foundation. Neither is
+a substitute for the structured audit trail planned in #100.
 
 ## Configuration
 
@@ -74,13 +76,25 @@ Do not edit an applied migration or the migration ledger. Add a new migration
 for every schema change, and back up durable state before running a binary that
 contains a new migration.
 
+`0002_agent_enrollment.sql` adds the enrollment key, hash-only payload
+bootstraps, immutable per-build session allowances, and listener-scoped agent
+sessions. The database does not store raw bootstrap or session bearer strings,
+but the HMAC key and session records are security-sensitive and must be
+protected as credential material.
+
+`0003_payload_enrollment_allocations.sql` adds immutable allocation history for
+each build/listener/agent tuple. Per-build allowances count identities ever
+allocated from that bootstrap; revoking a session does not make its slot
+available to a different identity.
+
 A newly created database directory is restricted to mode `0700` on platforms
 that support POSIX permissions. The database file is created or tightened to
 mode `0600`. MicroC2 does not change permissions on an existing database parent
 directory, so operators remain responsible for securing that directory and its
 backups. Listener directories and compatibility configs are tightened to
-`0700` and `0600` respectively; operators remain responsible for payload
-artifacts, uploads, and logs.
+`0700` and `0600` respectively. Payload roots, build directories, and generated
+artifacts are tightened to owner-only mode (`0700` on POSIX platforms);
+operators remain responsible for uploads and logs.
 
 ## Startup Reconciliation
 
@@ -103,7 +117,9 @@ artifacts without blindly resuming pre-crash runtime activity:
 - A deleted listener remains tombstoned and is not resurrected by a stale
   compatibility config left on disk.
 - Historical agents are reloaded, but they remain inactive for the new process
-  lifetime until a fresh heartbeat arrives on their listener.
+  lifetime until a fresh authenticated heartbeat arrives on their listener.
+- Enrollment sessions, credential generations, revocation, re-enrollment
+  requirements, and bootstrap-confirmation state survive restart.
 - Payload builds left in `building` are changed once to `interrupted`. Builds
   that fail in-process are retained as `failed`; neither state is resumed.
 - Indexed payload artifacts are revalidated against their relative path,
@@ -131,7 +147,16 @@ compatibility history.
 
 Agent history is durable but presence is intentionally process-local. A
 persisted agent can still be inspected after restart, yet is not considered an
-active dispatch target until it sends a fresh post-start heartbeat.
+active dispatch target until it sends a fresh authenticated post-start
+heartbeat. A confirmed session can resume from the agent's tuple-bound
+per-user state. Linux uses `$XDG_STATE_HOME/microc2/agent` or
+`$HOME/.local/state/microc2/agent`; macOS uses
+`$HOME/Library/Application Support/microc2/agent`; Windows uses
+`%LOCALAPPDATA%\microc2\agent`. The listener, payload, and agent path components
+are encoded separately with unpadded base64url. Windows protects the bearer
+with current-user DPAPI, while Unix uses `0700` directories and `0600` files.
+Losing that state requires an explicit operator re-enrollment because the
+embedded bootstrap cannot replay after confirmation.
 
 Listener lifecycle events are append-only operational history. They cover
 creation, import, start, stop, error, delete, compensated creation failure, and
@@ -171,6 +196,10 @@ can produce an inconsistent backup even though rollback journaling is enabled.
 Do not omit a transient rollback-journal file from a live filesystem snapshot;
 prefer the cold procedure above.
 
+Treat every database copy and backup set as credential material. The stored
+enrollment HMAC key plus durable session bindings can be used to derive valid
+session credentials even though raw bearers and bootstrap values are absent.
+
 To restore, stop the server, replace the database and companion directories as
 one backup set, verify ownership and restrictive permissions, and start the
 same MicroC2 revision first. Confirm that listeners load as stopped, historical
@@ -181,9 +210,12 @@ Before an upgrade:
 
 1. Create and test a cold backup.
 2. Review new migration files and release notes.
-3. Start the new binary against a disposable copy when the history is
+3. Convert persisted HTTP listeners to HTTPS, or explicitly enable
+   `security.agentTransport.allowInsecureIsolatedLab` only for a contained lab;
+   the secure default rejects plaintext listeners during startup.
+4. Start the new binary against a disposable copy when the history is
    important.
-4. Upgrade the real database only after that check succeeds.
+5. Upgrade the real database only after that check succeeds.
 
 Downgrading a migrated database is not supported: an older binary will refuse a
 future schema. Restore the pre-upgrade backup instead of manually editing the
@@ -193,9 +225,14 @@ schema or migration ledger.
 
 - Storage is designed for one local MicroC2 server process, not horizontal
   scaling or a shared database service.
-- #104 remains the P0 gate for authenticated agent enrollment and for any
-  promotion beyond the isolated-lab boundary. Durable correlation does not
-  authenticate an agent.
+- #104 authenticated enrollment is complete for the `dev` integration line.
+- A payload build enrolls one distinct runtime identity by default and may
+  declare an immutable allowance from 1 through 64. Allocation is monotonic:
+  session revocation does not refund a slot, while explicit same-identity
+  re-enrollment reuses the existing allocation. A listener permits at most
+  4,096 active enrollment sessions.
+- Historical agent listings are bounded with `limit`/`offset` pagination:
+  default 100 entries, maximum 500.
 - Listener lifecycle events are not the structured, actor-aware audit trail
   tracked by #100.
 - Operator uploads, payload binaries, listener upload directories, and logs are
@@ -207,8 +244,10 @@ schema or migration ledger.
   projections are rebuilt. Unreadable or malformed disk-only configs are
   skipped rather than trusted; unsafe listener identities and directory/name
   mismatches stop durable startup so an existing listener is not hidden.
-- Until #104 lands, an unauthenticated listener client can invent agent IDs.
-  Durable storage therefore remains isolated-lab state and is not an
-  authorization boundary.
-- This development work does not by itself justify promotion from `dev` to
-  `main`.
+- Agent IDs remain correlation values, not credentials. Production lifecycle
+  routes authenticate the complete listener/payload/runtime tuple through the
+  durable enrollment session.
+- Payloads built before #104 have no bootstrap credential and must be rebuilt;
+  there is no unauthenticated production compatibility path.
+- This integration targets `dev` only. It does not promote `dev` to `main` or
+  imply that promotion is ready.

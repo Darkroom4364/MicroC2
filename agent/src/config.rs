@@ -1,11 +1,16 @@
+use crate::auth::SecretCredential;
 use log::{error, info, warn};
 use obfstr::obfstr;
-use reqwest::{Client, Proxy, Url};
+use reqwest::{redirect, Client, Proxy, Url};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::time::Duration;
+
+const C2_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const C2_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 // Include the generated config file
 include!(concat!(env!("OUT_DIR"), "/config.rs"));
@@ -85,6 +90,8 @@ pub struct AgentConfig {
     pub agent_id: String,
     #[serde(default)]
     pub listener_id: String,
+    #[serde(default, skip_serializing)]
+    pub enrollment_credential: SecretCredential,
     pub protocol: String,
     #[serde(default)]
     pub socks5_enabled: bool,
@@ -94,6 +101,8 @@ pub struct AgentConfig {
     pub socks5_port: u16,
     #[serde(default)]
     pub allow_invalid_certs: bool,
+    #[serde(default)]
+    pub allow_insecure_isolated_lab: bool,
     #[serde(default = "default_proc_scan_interval")]
     pub proc_scan_interval_secs: u64,
     #[serde(default = "default_user_agent")]
@@ -192,11 +201,13 @@ impl Default for AgentConfig {
             payload_id: String::new(),
             agent_id: String::new(),
             listener_id: String::new(),
+            enrollment_credential: SecretCredential::default(),
             protocol: obfstr!("http").to_string(),
             socks5_enabled: false,
             socks5_host: obfstr!("127.0.0.1").to_string(),
             socks5_port: 9050,
             allow_invalid_certs: false,
+            allow_insecure_isolated_lab: false,
             proc_scan_interval_secs: default_proc_scan_interval(),
             user_agent: default_user_agent(),
             base_score_threshold_bg_to_reduced: default_base_score_threshold_bg_to_reduced(),
@@ -266,15 +277,44 @@ impl AgentConfig {
     }
 
     pub fn get_validated_server_url(&self) -> Result<Url, String> {
-        validate_c2_base_url(&self.get_server_url())
+        self.validate_transport_policy(&self.get_server_url())
+    }
+
+    pub fn validate_transport_policy(&self, raw_url: &str) -> Result<Url, String> {
+        let url = validate_c2_base_url(raw_url)?;
+        if url.scheme() != "https" && !self.allow_insecure_isolated_lab {
+            return Err(
+                "plaintext C2 transport is disabled; isolated lab builds must explicitly opt in"
+                    .to_string(),
+            );
+        }
+        if self.allow_invalid_certs && !self.allow_insecure_isolated_lab {
+            return Err(
+                "invalid TLS certificates require the isolated-lab transport override".to_string(),
+            );
+        }
+        Ok(url)
     }
 
     /// Build an HTTP client that respects the SOCKS5 proxy config and logs the proxy status.
     pub fn build_http_client(&self) -> Result<Client, io::Error> {
-        let mut builder = Client::builder().user_agent(self.user_agent.clone());
+        if self.allow_invalid_certs && !self.allow_insecure_isolated_lab {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid TLS certificates require the isolated-lab transport override",
+            ));
+        }
+        let mut builder = Client::builder()
+            .user_agent(self.user_agent.clone())
+            .redirect(redirect::Policy::none())
+            .connect_timeout(C2_CONNECT_TIMEOUT)
+            .timeout(C2_REQUEST_TIMEOUT)
+            // Agent traffic must never inherit an ambient OS/environment proxy.
+            // The configured SOCKS5 transport below is the only proxy path.
+            .no_proxy();
 
         if self.allow_invalid_certs {
-            warn!("[HTTP] TLS certificate verification is disabled by agent config");
+            warn!("[HTTP] TLS certificate verification is disabled by isolated-lab config");
             builder = builder.danger_accept_invalid_certs(self.allow_invalid_certs);
         }
 
@@ -287,7 +327,7 @@ impl AgentConfig {
             match builder
                 .proxy(Proxy::all(&proxy_url).map_err(|e| {
                     error!("[HTTP] Invalid proxy URL: {}", e);
-                    io::Error::new(io::ErrorKind::Other, format!("Invalid proxy URL: {}", e))
+                    io::Error::other(format!("Invalid proxy URL: {}", e))
                 })?)
                 .build()
             {
@@ -297,17 +337,15 @@ impl AgentConfig {
                         "[HTTP] Failed to build HTTP client with SOCKS5 proxy: {}",
                         e
                     );
-                    Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("Failed to build HTTP client with proxy: {}", e),
-                    ))
+                    Err(io::Error::other(format!(
+                        "Failed to build HTTP client with proxy: {}",
+                        e
+                    )))
                 }
             }
         } else {
             info!("[HTTP] Building HTTP client with direct connection (no proxy)");
-            builder
-                .build()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            builder.build().map_err(io::Error::other)
         }
     }
 }
@@ -338,6 +376,107 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn transport_policy_requires_explicit_isolated_lab_override() {
+        let secure = AgentConfig {
+            server_url: "https://c2.example".to_string(),
+            ..Default::default()
+        };
+        assert!(secure.get_validated_server_url().is_ok());
+
+        let plaintext = AgentConfig {
+            server_url: "http://127.0.0.1:8080".to_string(),
+            ..Default::default()
+        };
+        assert!(plaintext.get_validated_server_url().is_err());
+
+        let isolated_lab = AgentConfig {
+            allow_insecure_isolated_lab: true,
+            ..plaintext.clone()
+        };
+        assert!(isolated_lab.get_validated_server_url().is_ok());
+
+        let invalid_certs = AgentConfig {
+            server_url: "https://c2.example".to_string(),
+            allow_invalid_certs: true,
+            ..Default::default()
+        };
+        assert!(invalid_certs.get_validated_server_url().is_err());
+        assert!(invalid_certs.build_http_client().is_err());
+
+        let isolated_invalid_certs = AgentConfig {
+            allow_insecure_isolated_lab: true,
+            ..invalid_certs
+        };
+        assert!(isolated_invalid_certs.get_validated_server_url().is_ok());
+        assert!(isolated_invalid_certs.build_http_client().is_ok());
+    }
+
+    #[test]
+    fn serialized_config_omits_bootstrap_credentials() {
+        let bootstrap = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI";
+        let config = AgentConfig {
+            enrollment_credential: SecretCredential::new_bootstrap(bootstrap).expect("credential"),
+            ..Default::default()
+        };
+        let serialized = serde_json::to_string(&config).expect("serialize config");
+        assert!(!serialized.contains(bootstrap));
+        assert!(!serialized.contains("enrollment_credential"));
+    }
+
+    #[test]
+    fn bootstrap_constructor_rejects_weak_or_noncanonical_values() {
+        for invalid in [
+            "",
+            "bootstrap-secret",
+            "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=",
+            "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJ",
+        ] {
+            assert!(SecretCredential::new_bootstrap(invalid).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn c2_client_does_not_follow_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect test server");
+        let address = listener.local_addr().expect("redirect test address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept redirect request");
+            let mut request = [0_u8; 1024];
+            let _ = stream
+                .read(&mut request)
+                .await
+                .expect("read redirect request");
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{address}/credential-sink\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write redirect response");
+        });
+
+        let config = AgentConfig {
+            allow_insecure_isolated_lab: true,
+            ..Default::default()
+        };
+        let response = config
+            .build_http_client()
+            .expect("build client")
+            .get(format!("http://{address}/original"))
+            .bearer_auth("must-not-forward")
+            .send()
+            .await
+            .expect("redirect response");
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        server.await.expect("redirect test server");
     }
 
     #[test]

