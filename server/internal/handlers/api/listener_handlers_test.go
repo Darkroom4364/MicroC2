@@ -1,0 +1,254 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"microc2/server/internal/enrollment"
+	"microc2/server/internal/persistence"
+)
+
+func TestAgentSessionManagementRoutesNeverExposeCredentials(t *testing.T) {
+	database, err := persistence.Open(filepath.Join(t.TempDir(), "microc2.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	})
+	store, err := enrollment.NewStore(context.Background(), database)
+	if err != nil {
+		t.Fatalf("create enrollment store: %v", err)
+	}
+	bootstrap := activateAPITestPayload(
+		t,
+		database,
+		store,
+		"listener-one",
+		"payload-one",
+	)
+	enrolled, err := store.Enroll(context.Background(), enrollment.EnrollRequest{
+		ListenerID:     "listener-one",
+		AgentID:        "agent-one",
+		PayloadBuildID: "payload-one",
+		Bootstrap:      bootstrap.Public,
+	})
+	if err != nil {
+		t.Fatalf("enroll API test agent: %v", err)
+	}
+
+	handler := &ListenerHandlers{enrollment: store}
+	mux := http.NewServeMux()
+	handler.RegisterRoutes(mux)
+	path := "/api/listeners/listener-one/agents/agent-one/session/"
+
+	response := serveListenerManagementRequest(
+		mux,
+		http.MethodPost,
+		path+"rotate",
+		"",
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("rotate status = %d: %s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), enrolled.Credential) ||
+		strings.Contains(response.Body.String(), "s1.") ||
+		strings.Contains(response.Body.String(), bootstrap.Public) {
+		t.Fatalf("rotation response exposed a credential: %s", response.Body.String())
+	}
+	var rotation map[string]interface{}
+	if err := json.Unmarshal(response.Body.Bytes(), &rotation); err != nil {
+		t.Fatalf("decode rotation response: %v", err)
+	}
+	if rotation["status"] != "rotation_pending" ||
+		rotation["pending_generation"] != float64(2) {
+		t.Fatalf("unexpected rotation response: %#v", rotation)
+	}
+	authentication, err := store.Authenticate(
+		context.Background(),
+		"listener-one",
+		"agent-one",
+		enrolled.Credential,
+	)
+	if err != nil {
+		t.Fatalf("authenticate current credential after rotation: %v", err)
+	}
+	if authentication.ReplacementCredential == "" {
+		t.Fatal("agent authentication did not receive pending replacement")
+	}
+
+	response = serveListenerManagementRequest(
+		mux,
+		http.MethodPost,
+		path+"revoke",
+		"",
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("revoke status = %d: %s", response.Code, response.Body.String())
+	}
+	if _, err := store.Authenticate(
+		context.Background(),
+		"listener-one",
+		"agent-one",
+		enrolled.Credential,
+	); err == nil {
+		t.Fatal("revoked credential remained authenticated")
+	}
+
+	response = serveListenerManagementRequest(
+		mux,
+		http.MethodPost,
+		path+"re-enroll",
+		"",
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("re-enroll status = %d: %s", response.Code, response.Body.String())
+	}
+	reenrolled, err := store.Enroll(
+		context.Background(),
+		enrollment.EnrollRequest{
+			ListenerID:     "listener-one",
+			AgentID:        "agent-one",
+			PayloadBuildID: "payload-one",
+			Bootstrap:      bootstrap.Public,
+		},
+	)
+	if err != nil {
+		t.Fatalf("explicitly re-enroll agent: %v", err)
+	}
+	if reenrolled.Credential == enrolled.Credential {
+		t.Fatal("re-enrollment reused the revoked session credential")
+	}
+}
+
+func TestAgentSessionManagementRoutesRejectAmbiguousRequests(t *testing.T) {
+	handler := &ListenerHandlers{}
+	mux := http.NewServeMux()
+	handler.RegisterRoutes(mux)
+
+	for _, testCase := range []struct {
+		name   string
+		method string
+		path   string
+		body   string
+		status int
+	}{
+		{
+			name:   "method",
+			method: http.MethodGet,
+			path:   "/api/listeners/listener-one/agents/agent-one/session/rotate",
+			status: http.StatusMethodNotAllowed,
+		},
+		{
+			name:   "body",
+			method: http.MethodPost,
+			path:   "/api/listeners/listener-one/agents/agent-one/session/rotate",
+			body:   "{}",
+			status: http.StatusBadRequest,
+		},
+		{
+			name:   "query",
+			method: http.MethodPost,
+			path:   "/api/listeners/listener-one/agents/agent-one/session/rotate?force=1",
+			status: http.StatusBadRequest,
+		},
+		{
+			name:   "malformed path",
+			method: http.MethodPost,
+			path:   "/api/listeners/listener-one/agents/agent-one/session/unknown",
+			status: http.StatusBadRequest,
+		},
+		{
+			name:   "store unavailable",
+			method: http.MethodPost,
+			path:   "/api/listeners/listener-one/agents/agent-one/session/rotate",
+			status: http.StatusServiceUnavailable,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			response := serveListenerManagementRequest(
+				mux,
+				testCase.method,
+				testCase.path,
+				testCase.body,
+			)
+			if response.Code != testCase.status {
+				t.Fatalf(
+					"status = %d, want %d: %s",
+					response.Code,
+					testCase.status,
+					response.Body.String(),
+				)
+			}
+		})
+	}
+}
+
+func activateAPITestPayload(
+	t *testing.T,
+	database *persistence.Database,
+	store *enrollment.Store,
+	listenerID string,
+	payloadID string,
+) enrollment.BootstrapCredential {
+	t.Helper()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := database.SQL().Exec(
+		`INSERT INTO payload_builds (
+			id, payload_id, listener_id, mutation_seed, filename,
+			relative_path, size, sha256, created_at, state,
+			state_detail, provenance_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		payloadID,
+		payloadID,
+		listenerID,
+		"0123456789abcdef",
+		"agent",
+		"release/"+payloadID+"/agent",
+		1,
+		strings.Repeat("a", 64),
+		now,
+		"completed",
+		"",
+		[]byte("{}"),
+	); err != nil {
+		t.Fatalf("insert API test payload: %v", err)
+	}
+	bootstrap, err := enrollment.GenerateBootstrapCredential()
+	if err != nil {
+		t.Fatalf("generate API test bootstrap: %v", err)
+	}
+	if err := store.ActivatePayloadCredential(
+		context.Background(),
+		enrollment.PayloadCredentialActivation{
+			PayloadBuildID:  payloadID,
+			ListenerID:      listenerID,
+			BootstrapSHA256: bootstrap.SHA256,
+			MaxSessions:     1,
+		},
+	); err != nil {
+		t.Fatalf("activate API test bootstrap: %v", err)
+	}
+	return bootstrap
+}
+
+func serveListenerManagementRequest(
+	handler http.Handler,
+	method string,
+	path string,
+	body string,
+) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
+}

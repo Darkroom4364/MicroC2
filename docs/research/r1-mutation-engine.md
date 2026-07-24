@@ -8,7 +8,9 @@ MicroC2 is an academic C2 research testbed for authorized lab environments.
 The mutation engine exists to build a **measurement instrument**: N seeded,
 functionally identical agent builds whose detection *distributions* can be
 measured against EDR products under controlled conditions. It is not an
-evasion feature; every artifact carries the provenance needed to reproduce it.
+evasion feature. Server-driven artifacts carry non-secret provenance, and the
+lab manifest records the original artifact hash. Secret enrollment credentials
+are deliberately excluded from provenance.
 
 Scope boundaries for v0:
 
@@ -25,7 +27,7 @@ Resolution order:
 
 1. Server-driven builds: `payload_handler.go` generates a random seed per
    payload (or honors a caller-supplied `mutation_seed` in the generate
-   request for reproduction builds) and exports it to `build.sh`.
+   request for controlled mutation reruns) and exports it to `build.sh`.
 2. Manual builds: pass `--mutation-seed <hex>` to `agent/build.sh` or export
    `MUTATION_SEED` before invoking cargo.
 3. Unset: `build.rs` falls back to a fixed dev seed with a `cargo:warning`,
@@ -39,8 +41,11 @@ Resolution order:
 - **Junk-code module** — `build.rs` generates `OUT_DIR/mutation.rs` with
   seed-derived decoy functions, random string constants, and a random-length
   padding blob. The agent references `mutation::mutation_entry()` once via
-  `std::hint::black_box` so LLVM cannot strip it. This guarantees a unique
-  binary layout/hash per seed and breaks byte-level clustering across builds.
+  `std::hint::black_box` so LLVM cannot strip it. With all non-seed inputs held
+  fixed, the determinism check verifies that different test seeds change the
+  generated mutation source and the local binary hash. This is a tested
+  property of the fixture, not a guarantee that every possible seed produces a
+  globally unique artifact.
 - **Surface strings** — a seed-selected user-agent from a curated pool is
   written into the embedded config (and used by the agent's HTTP client).
   Randomized endpoint path segments are recorded in the embedded config as
@@ -70,29 +75,56 @@ Every server-driven build writes `provenance.json` next to the artifact:
 The seed is also returned in the payload API result (`mutation_seed`) and
 shown in the payload UI log.
 
-## Reproduction recipe
+`config_sha256` records a digest of the resolved configuration; it does not
+contain enough material to reconstruct it. In particular, the raw enrollment
+credential is embedded in the payload but is never written to provenance or
+durable server metadata.
 
-Any payload is reproducible from (source revision, seed):
+## Determinism and reproduction boundary
+
+The mutation decisions are reproducible from the source revision and seed when
+all other build inputs are held constant. A complete authenticated artifact is
+not reproducible from those two values alone. Its bytes also depend on the
+resolved listener/payload configuration, a unique enrollment credential,
+target, profile, locked dependencies, Rust toolchain, linker, and build
+environment.
+
+To reproduce the mutation choices with a fresh, non-enrolled credential:
 
 ```bash
 git checkout <git_revision from provenance.json>
 cd agent
+ENROLLMENT_CREDENTIAL='<fresh canonical 32-byte base64url credential>' \
+ALLOW_INSECURE_ISOLATED_LAB=false \
+LISTENER_ID='<listener-or-standalone-id>' \
 MUTATION_SEED=<mutation_seed> ./build.sh \
   --target <target> --output out --build-type release \
-  --listener-host <host> --listener-port <port> --protocol <proto>
+  --listener-host <host> --listener-port <port> --protocol https \
+  --payload-id <payload-build-id>
 ```
 
-Same seed + same revision produces byte-identical generated sources
-(`config.rs`, `mutation.rs`) and, on the same host, an identical binary.
-Cross-host byte identity is not asserted (linkers differ). Verify locally
-with:
+The fresh credential changes the resolved `config.rs` and therefore the
+artifact hash; it also is not activated for a server unless the build runs
+through the server payload workflow. Preserve the original artifact and its
+manifest SHA-256 when byte identity matters.
+
+Verify mutation determinism locally with:
 
 ```bash
 agent/check_mutation_determinism.sh
 ```
 
-which asserts same-seed source identity and different-seed source/binary
-divergence. It runs in CI as part of the agent job.
+The check fixes the complete test configuration, including a test-only
+credential. It asserts same-input generated-source identity and
+different-seed mutation-source/local-binary divergence. It does not claim
+same-seed binary identity across hosts or toolchains.
+
+`lab/build_matrix.sh` intentionally generates a different random credential
+for every standalone cell. Therefore, differences between full matrix
+artifact hashes cannot be attributed to the mutation seed alone. The seed
+schedule remains deterministic, while the credential is a required,
+unrecorded security input and must be treated as a nuisance build variable in
+analysis.
 
 ## Planned measurement protocol (next milestone)
 

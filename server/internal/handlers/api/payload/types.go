@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"sync"
 
+	"microc2/server/internal/enrollment"
 	"microc2/server/internal/listeners"
 	"microc2/server/internal/persistence"
 )
@@ -24,6 +25,9 @@ type PayloadConfig struct {
 	Socks5Enabled   bool   `json:"socks5_enabled"`
 	Socks5Host      string `json:"socks5_host"`
 	Socks5Port      int    `json:"socks5_port"`
+	// MaxSessions bounds the active runtime identities that may enroll from
+	// this payload build. Zero selects the secure default of one.
+	MaxSessions int `json:"max_sessions,omitempty"`
 
 	// MutationSeed optionally pins the hex u64 seed for the source mutation
 	// engine; a random seed is generated when empty (issue #67).
@@ -71,13 +75,16 @@ type ListenerLookup interface {
 
 // PayloadHandler manages payload generation operations
 type PayloadHandler struct {
-	payloadsDir    string
-	agentSourceDir string
-	listenerLookup ListenerLookup
-	database       *persistence.Database
-	initErr        error
-	runBuild       func(*exec.Cmd) ([]byte, error)
-	afterVerified  func()
-	mutex          sync.Mutex
-	payloads       map[string]PayloadResult
+	payloadsDir              string
+	agentSourceDir           string
+	listenerLookup           ListenerLookup
+	database                 *persistence.Database
+	enrollment               *enrollment.Store
+	allowInsecureIsolatedLab bool
+	initErr                  error
+	runBuild                 func(*exec.Cmd) ([]byte, error)
+	afterVerified            func()
+	buildMutex               sync.Mutex
+	mutex                    sync.Mutex
+	payloads                 map[string]PayloadResult
 }

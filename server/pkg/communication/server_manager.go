@@ -1,6 +1,7 @@
 package communication
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -17,9 +18,11 @@ import (
 )
 
 type ServerManager struct {
-	protocol        common.Protocol
-	config          *ServerConfig
-	listenerManager *listeners.ListenerManager
+	protocol             common.Protocol
+	config               *ServerConfig
+	listenerManager      *listeners.ListenerManager
+	agentTransportPolicy common.AgentTransportPolicy
+	requireAgentAuth     bool
 }
 
 type ServerConfig struct {
@@ -34,7 +37,37 @@ type ServerConfig struct {
 	Database *persistence.Database
 }
 
+// NewServerManager creates a server manager with the production-safe transport
+// policy. Focused tests that require plaintext HTTP must explicitly call
+// NewServerManagerForIsolatedLab.
 func NewServerManager(config *ServerConfig) (*ServerManager, error) {
+	return newServerManager(config, common.AgentTransportPolicy{}, true)
+}
+
+// NewServerManagerForIsolatedLab creates a server manager whose listener
+// policy explicitly permits plaintext HTTP.
+func NewServerManagerForIsolatedLab(config *ServerConfig) (*ServerManager, error) {
+	return newServerManager(
+		config,
+		common.IsolatedLabAgentTransportPolicy(),
+		false,
+	)
+}
+
+// NewProductionServerManager creates a server manager with the explicitly
+// configured production agent-transport policy. The zero value fails closed.
+func NewProductionServerManager(
+	config *ServerConfig,
+	agentTransportPolicy common.AgentTransportPolicy,
+) (*ServerManager, error) {
+	return newServerManager(config, agentTransportPolicy, true)
+}
+
+func newServerManager(
+	config *ServerConfig,
+	agentTransportPolicy common.AgentTransportPolicy,
+	requireAgentAuth bool,
+) (*ServerManager, error) {
 	if err := os.MkdirAll(config.UploadDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create upload directory: %v", err)
 	}
@@ -51,9 +84,27 @@ func NewServerManager(config *ServerConfig) (*ServerManager, error) {
 	)
 	switch config.ProtocolType {
 	case "http":
-		if config.Database == nil {
+		switch {
+		case requireAgentAuth && config.Database == nil:
+			return nil, errors.New(
+				"authenticated agent server requires durable storage",
+			)
+		case requireAgentAuth:
+			protocol, err =
+				behaviour.NewAuthenticatedHTTPPollingProtocolWithPersistence(
+					baseConfig,
+					config.Database,
+					"operator-default",
+				)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"load authenticated default protocol state: %w",
+					err,
+				)
+			}
+		case config.Database == nil:
 			protocol = behaviour.NewHTTPPollingProtocol(baseConfig)
-		} else {
+		default:
 			protocol, err = behaviour.NewHTTPPollingProtocolWithPersistence(
 				baseConfig,
 				config.Database,
@@ -74,23 +125,31 @@ func NewServerManager(config *ServerConfig) (*ServerManager, error) {
 	}
 
 	var listenerManager *listeners.ListenerManager
-	if config.Database == nil {
-		listenerManager = listeners.NewListenerManager(protocol)
-	} else {
-		listenerManager, err = listeners.NewListenerManagerWithPersistence(
+	if requireAgentAuth {
+		listenerManager, err = listeners.NewProductionListenerManager(
 			protocol,
 			filepath.Join(config.StaticDir, "listeners"),
 			config.Database,
+			agentTransportPolicy,
 		)
-		if err != nil {
-			return nil, fmt.Errorf("load listener manager: %w", err)
-		}
+	} else {
+		listenerManager, err =
+			listeners.NewListenerManagerWithPersistenceForIsolatedLab(
+				protocol,
+				filepath.Join(config.StaticDir, "listeners"),
+				config.Database,
+			)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load listener manager: %w", err)
 	}
 
 	return &ServerManager{
-		protocol:        protocol,
-		config:          config,
-		listenerManager: listenerManager,
+		protocol:             protocol,
+		config:               config,
+		listenerManager:      listenerManager,
+		agentTransportPolicy: agentTransportPolicy,
+		requireAgentAuth:     requireAgentAuth,
 	}, nil
 }
 
@@ -100,6 +159,20 @@ func (sm *ServerManager) GetProtocol() common.Protocol {
 }
 
 func (sm *ServerManager) Start() error {
+	if strings.EqualFold(sm.config.ProtocolType, "http") {
+		if err := sm.agentTransportPolicy.ValidateListener("http", false); err != nil {
+			return fmt.Errorf("start plaintext agent server: %w", err)
+		}
+		if sm.requireAgentAuth {
+			httpProtocol, ok := sm.protocol.(*behaviour.HTTPPollingProtocol)
+			if !ok || !httpProtocol.RequiresAgentAuthentication() {
+				return errors.New(
+					"agent server protocol does not enforce authenticated enrollment",
+				)
+			}
+		}
+	}
+
 	mux := http.NewServeMux()
 
 	// Register protocol-specific routes

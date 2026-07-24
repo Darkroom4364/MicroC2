@@ -18,8 +18,9 @@ authorized lab environments.
   possible.
 - Treat the web UI, API, server, and agent as one product surface.
 - Keep extension points narrow and documented before adding more protocols.
-- Preserve reproducibility: every important workflow should have a local test,
-  scripted check, or documented manual verification path.
+- Preserve reproducibility for non-secret decisions: every important workflow
+  should have a local test, scripted check, or documented manual verification
+  path. Fresh enrollment credentials remain deliberately random and unrecorded.
 
 ## Quality Bar
 
@@ -145,10 +146,9 @@ Candidate issues:
   result schemas` — shell task contract v1, bounded summary pages, and
   on-demand full results are the completed Phase 1 foundation.
 - #104 `[Security] Bind agent tasking to authenticated enrollment sessions` —
-  P0 gate before task listeners are exposed beyond an isolated lab.
+  complete for the `dev` integration line.
 - #97 `[Server] Add durable storage for agents, tasks, results, payloads, and
-  listener events` — implementation is in progress on the development branch;
-  review and CI are still required before merging it into `dev`.
+  listener events` — merged into `dev`.
 - #100 `[Server] Add structured audit events for operator actions and agent
   tasking`
 - #88 `[Agent] Wire file transfer and pivot controls into command dispatch` —
@@ -200,7 +200,9 @@ Focus areas:
 
 Exit criteria:
 
-- Payload builds are reproducible from documented commands.
+- Non-secret payload configuration and mutation choices are reproducible from
+  documented commands. Production artifacts also contain a fresh enrollment
+  bootstrap and are not byte-identical from source revision and seed alone.
 - Optional agent features can be enabled without bloating the default agent.
 - Agent command dispatch is testable without live C2 infrastructure.
 
@@ -337,9 +339,11 @@ Research tracks:
   (Sysmon/ETW ground truth vs. EDR verdict). Includes a cross-layer ablation:
   static-only vs. behavioral-only vs. transport-only mutation, attributing
   which detector layer each axis moves. Every mutation decision derives from
-  one per-build seed recorded in build provenance, so any payload is
-  reproducible from (source revision, seed) — this resolves the tension
-  between Phase 3 reproducibility and mutation.
+  one per-build seed recorded in build provenance, so mutation decisions are
+  reproducible from (source revision, seed). The production binary still
+  embeds a fresh, deliberately unrecorded enrollment bootstrap; recreating an
+  exact credential-bearing artifact from source and seed alone is intentionally
+  out of scope.
 - **R2: LLMjacking emulation module** (Phase 4 module SDK). No academic
   baseline exists for AI-compute monetization ("LLMjacking"; industry-only
   reporting from Sysdig, Microsoft, Permiso). Build a module that emulates the
@@ -373,18 +377,14 @@ detection, Internet-scale botnet market measurement.
 
 Recommended next sequence:
 
-1. Review, validate, and merge #97 into `dev` so agents, task lifecycles,
-   results, payload metadata, and listener events survive restart. This follows
-   the completed #98 typed task/result foundation.
-2. Complete #104 so agent lifecycle and tasking are bound to authenticated
-   enrollment sessions before listener exposure expands or any stable
-   promotion is considered.
-3. Add #100 on the durable model so operator and agent actions have causal,
+1. Add #100 on the durable model so operator and agent actions have causal,
    reviewable audit events.
-4. Tackle #88 after #98, adding file transfer and pivot operations as explicit
+2. Tackle #88 after #98, adding file transfer and pivot operations as explicit
    task types instead of new string commands.
+3. Continue the bounded #99 payload-quality track alongside the data path.
 
-The data path is **#98 → #97 → #100**, but the operational priority after #97
-is the #104 P0 security gate. It must be completed before considering any
-`dev` to `main` promotion; no such promotion is part of this sequence. Issue
-#99 remains a bounded P1 payload-quality track that can proceed alongside it.
+The data path is **#98 → #97 → #100**. Issues #98 and #97 are complete, and
+#104 closes the authenticated-enrollment boundary for the `dev` integration
+line. No `dev` to `main` promotion is part of this sequence, and the #104
+implementation does not imply that one is ready. Issue #99 remains a bounded
+P1 payload-quality track that can proceed alongside it.

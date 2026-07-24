@@ -1,6 +1,7 @@
 package payload
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -11,6 +12,7 @@ import (
 	"io"
 	"log"
 	"mime"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -21,6 +23,8 @@ import (
 
 	"github.com/google/uuid"
 
+	"microc2/server/internal/common"
+	"microc2/server/internal/enrollment"
 	"microc2/server/internal/listeners"
 	"microc2/server/internal/persistence"
 )
@@ -33,8 +37,12 @@ const (
 	payloadStateMissing     = "missing"
 	payloadStateCorrupt     = "corrupt"
 
-	payloadFailedDetail      = "payload build failed before completion"
-	payloadInterruptedDetail = "server restarted before payload build completed"
+	payloadFailedDetail       = "payload build failed before completion"
+	payloadInterruptedDetail  = "server restarted before payload build completed"
+	defaultPayloadMaxSessions = 1
+	maxPayloadRequestBytes    = 64 << 10
+	maxPayloadRevokeBodyBytes = 1
+	privateCargoBuildRoot     = ".microc2-build"
 )
 
 type payloadBuildRecord struct {
@@ -52,24 +60,55 @@ type payloadBuildRecord struct {
 	ProvenanceJSON []byte
 }
 
-// NewPayloadHandler is the compatibility constructor for callers that do not
-// yet provide durable storage. It derives the legacy listeners directory from
-// payloadsDir instead of relying on the process working directory.
+// NewPayloadHandler creates a non-durable handler with the production-safe
+// transport policy. Authenticated production builds require durable storage.
 func NewPayloadHandler(payloadsDir, agentSourceDir string) *PayloadHandler {
+	return newCompatibilityPayloadHandler(
+		payloadsDir,
+		agentSourceDir,
+		false,
+	)
+}
+
+// NewPayloadHandlerForIsolatedLab creates a non-durable compatibility handler
+// that explicitly permits plaintext HTTP payload builds.
+func NewPayloadHandlerForIsolatedLab(
+	payloadsDir string,
+	agentSourceDir string,
+) *PayloadHandler {
+	return newCompatibilityPayloadHandler(
+		payloadsDir,
+		agentSourceDir,
+		true,
+	)
+}
+
+func newCompatibilityPayloadHandler(
+	payloadsDir string,
+	agentSourceDir string,
+	allowInsecureIsolatedLab bool,
+) *PayloadHandler {
 	lookup := filesystemListenerLookup{
 		listenersDir: filepath.Join(filepath.Dir(payloadsDir), "listeners"),
 	}
-	handler, err := newPayloadHandler(payloadsDir, agentSourceDir, lookup, nil)
+	handler, err := newPayloadHandler(
+		payloadsDir,
+		agentSourceDir,
+		lookup,
+		nil,
+		allowInsecureIsolatedLab,
+	)
 	if err == nil {
 		return handler
 	}
 	log.Printf("[ERROR] Failed to initialize payload handler: %v", err)
 	return &PayloadHandler{
-		payloadsDir:    payloadsDir,
-		agentSourceDir: agentSourceDir,
-		listenerLookup: lookup,
-		initErr:        err,
-		payloads:       make(map[string]PayloadResult),
+		payloadsDir:              payloadsDir,
+		agentSourceDir:           agentSourceDir,
+		listenerLookup:           lookup,
+		allowInsecureIsolatedLab: allowInsecureIsolatedLab,
+		initErr:                  err,
+		payloads:                 make(map[string]PayloadResult),
 	}
 }
 
@@ -81,10 +120,67 @@ func NewPayloadHandlerWithPersistence(
 	lookup ListenerLookup,
 	database *persistence.Database,
 ) (*PayloadHandler, error) {
+	return newPayloadHandlerWithPersistence(
+		payloadsDir,
+		agentSourceDir,
+		lookup,
+		database,
+		false,
+	)
+}
+
+// NewPayloadHandlerWithPersistenceForIsolatedLab constructs a durable handler
+// that explicitly permits plaintext HTTP payload builds.
+func NewPayloadHandlerWithPersistenceForIsolatedLab(
+	payloadsDir string,
+	agentSourceDir string,
+	lookup ListenerLookup,
+	database *persistence.Database,
+) (*PayloadHandler, error) {
+	return newPayloadHandlerWithPersistence(
+		payloadsDir,
+		agentSourceDir,
+		lookup,
+		database,
+		true,
+	)
+}
+
+// NewProductionPayloadHandler constructs the production handler with the same
+// explicit agent-transport policy used by listener creation.
+func NewProductionPayloadHandler(
+	payloadsDir string,
+	agentSourceDir string,
+	lookup ListenerLookup,
+	database *persistence.Database,
+	transportPolicy common.AgentTransportPolicy,
+) (*PayloadHandler, error) {
+	return newPayloadHandlerWithPersistence(
+		payloadsDir,
+		agentSourceDir,
+		lookup,
+		database,
+		transportPolicy.AllowInsecureIsolatedLab,
+	)
+}
+
+func newPayloadHandlerWithPersistence(
+	payloadsDir string,
+	agentSourceDir string,
+	lookup ListenerLookup,
+	database *persistence.Database,
+	allowInsecureIsolatedLab bool,
+) (*PayloadHandler, error) {
 	if database == nil {
 		return nil, errors.New("payload persistence database is required")
 	}
-	handler, err := newPayloadHandler(payloadsDir, agentSourceDir, lookup, database)
+	handler, err := newPayloadHandler(
+		payloadsDir,
+		agentSourceDir,
+		lookup,
+		database,
+		allowInsecureIsolatedLab,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -99,6 +195,7 @@ func newPayloadHandler(
 	agentSourceDir string,
 	lookup ListenerLookup,
 	database *persistence.Database,
+	allowInsecureIsolatedLab bool,
 ) (*PayloadHandler, error) {
 	if lookup == nil {
 		return nil, errors.New("listener lookup is required")
@@ -112,16 +209,28 @@ func newPayloadHandler(
 		filepath.Join(absolutePayloadsDir, "debug"),
 		filepath.Join(absolutePayloadsDir, "release"),
 	} {
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		if err := os.MkdirAll(dir, 0700); err != nil {
 			return nil, fmt.Errorf("create payload directory %s: %w", dir, err)
+		}
+		if err := os.Chmod(dir, 0700); err != nil {
+			return nil, fmt.Errorf("restrict payload directory %s: %w", dir, err)
+		}
+	}
+	var enrollmentStore *enrollment.Store
+	if database != nil {
+		enrollmentStore, err = enrollment.NewStore(context.Background(), database)
+		if err != nil {
+			return nil, fmt.Errorf("initialize payload enrollment store: %w", err)
 		}
 	}
 	return &PayloadHandler{
-		payloadsDir:    absolutePayloadsDir,
-		agentSourceDir: agentSourceDir,
-		listenerLookup: lookup,
-		database:       database,
-		payloads:       make(map[string]PayloadResult),
+		payloadsDir:              absolutePayloadsDir,
+		agentSourceDir:           agentSourceDir,
+		listenerLookup:           lookup,
+		database:                 database,
+		enrollment:               enrollmentStore,
+		allowInsecureIsolatedLab: allowInsecureIsolatedLab,
+		payloads:                 make(map[string]PayloadResult),
 	}, nil
 }
 
@@ -181,8 +290,9 @@ func gitRevision(dir string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// writeProvenance records the build inputs needed to reproduce a payload next
-// to the built artifact (issue #99).
+// writeProvenance records non-secret build context next to the artifact. The
+// high-entropy enrollment credential is intentionally not retained, so this
+// metadata does not promise byte-for-byte reproduction (issue #99).
 func writeProvenance(artifactDir string, provenance map[string]interface{}) error {
 	data, err := json.MarshalIndent(provenance, "", "  ")
 	if err != nil {
@@ -217,8 +327,17 @@ func (h *PayloadHandler) HandleGeneratePayload(w http.ResponseWriter, r *http.Re
 	}
 
 	var config PayloadConfig
-	if err := json.NewDecoder(r.Body).Decode(&config); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
+	if err := decodePayloadRequest(w, r, &config); err != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			http.Error(
+				w,
+				"Invalid request body: request body too large",
+				http.StatusRequestEntityTooLarge,
+			)
+			return
+		}
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -226,6 +345,10 @@ func (h *PayloadHandler) HandleGeneratePayload(w http.ResponseWriter, r *http.Re
 	if config.ListenerID == "" {
 		http.Error(w, "Listener selection is required. You must select a listener for agent communication.", http.StatusBadRequest)
 		log.Printf("[ERROR] Payload generation aborted: no listener selected.")
+		return
+	}
+	if _, err := resolvedPayloadMaxSessions(config.MaxSessions); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -250,6 +373,342 @@ func (h *PayloadHandler) HandleGeneratePayload(w http.ResponseWriter, r *http.Re
 	// payload root. Never disclose the server host's absolute filesystem path.
 	response.Path = result.relativePath
 	json.NewEncoder(w).Encode(response)
+}
+
+func resolvedPayloadMaxSessions(configured int) (int, error) {
+	if configured == 0 {
+		return defaultPayloadMaxSessions, nil
+	}
+	if configured < 1 || configured > enrollment.MaxPayloadSessions {
+		return 0, fmt.Errorf(
+			"max_sessions must be between 1 and %d",
+			enrollment.MaxPayloadSessions,
+		)
+	}
+	return configured, nil
+}
+
+func redactBuildDiagnostic(value string, bootstrapCredential string) string {
+	if value == "" || bootstrapCredential == "" {
+		return value
+	}
+	return strings.ReplaceAll(value, bootstrapCredential, "[REDACTED]")
+}
+
+func decodePayloadRequest(
+	w http.ResponseWriter,
+	r *http.Request,
+	destination interface{},
+) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxPayloadRequestBytes)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return err
+	}
+	var trailing interface{}
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("request body must contain exactly one JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
+func normalizeAdvertisedHost(value string) (string, error) {
+	if value == "" {
+		return "", errors.New("advertised host is required")
+	}
+	if value != strings.TrimSpace(value) {
+		return "", errors.New("advertised host must not contain surrounding whitespace")
+	}
+
+	host := value
+	bracketed := false
+	if strings.HasPrefix(host, "[") || strings.HasSuffix(host, "]") {
+		if !strings.HasPrefix(host, "[") || !strings.HasSuffix(host, "]") {
+			return "", errors.New("advertised host has mismatched IPv6 brackets")
+		}
+		bracketed = true
+		host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsUnspecified() {
+			return "", errors.New(
+				"advertised host must not be an unspecified address; configure listener hosts[0]",
+			)
+		}
+		return host, nil
+	}
+	if bracketed {
+		return "", errors.New("only an IPv6 address may use host brackets")
+	}
+
+	name := strings.TrimSuffix(host, ".")
+	if name == "" || len(host) > 253 {
+		return "", errors.New("advertised host is not a valid DNS name or IP address")
+	}
+	for _, label := range strings.Split(name, ".") {
+		if len(label) == 0 || len(label) > 63 ||
+			!isASCIIAlphaNumeric(label[0]) ||
+			!isASCIIAlphaNumeric(label[len(label)-1]) {
+			return "", errors.New("advertised host is not a valid DNS name or IP address")
+		}
+		for index := 1; index < len(label)-1; index++ {
+			if !isASCIIAlphaNumeric(label[index]) && label[index] != '-' {
+				return "", errors.New(
+					"advertised host is not a valid DNS name or IP address",
+				)
+			}
+		}
+	}
+	return host, nil
+}
+
+func isASCIIAlphaNumeric(value byte) bool {
+	return value >= 'a' && value <= 'z' ||
+		value >= 'A' && value <= 'Z' ||
+		value >= '0' && value <= '9'
+}
+
+func advertisedListenerEndpoint(
+	listener listeners.ListenerConfig,
+) (string, string, string, error) {
+	protocol := strings.ToLower(strings.TrimSpace(listener.Protocol))
+	if protocol != "http" && protocol != "https" {
+		return "", "", "", fmt.Errorf(
+			"listener protocol %q cannot be embedded in an agent payload",
+			listener.Protocol,
+		)
+	}
+	if listener.Port < 1 || listener.Port > 65535 {
+		return "", "", "", fmt.Errorf(
+			"listener port %d cannot be embedded in an agent payload",
+			listener.Port,
+		)
+	}
+
+	rawHost := listener.BindHost
+	if len(listener.Hosts) > 0 {
+		rawHost = listener.Hosts[0]
+	}
+	host, err := normalizeAdvertisedHost(rawHost)
+	if err != nil {
+		return "", "", "", fmt.Errorf("invalid listener advertised host: %w", err)
+	}
+	serverURL := protocol + "://" +
+		net.JoinHostPort(host, strconv.Itoa(listener.Port))
+	return host, protocol, serverURL, nil
+}
+
+// runSerializedBuild protects the shared agent source tree and build-script
+// sidecars until the script has copied the artifact from its private Cargo
+// target into the build-specific output directory.
+func (h *PayloadHandler) runSerializedBuild(cmd *exec.Cmd) ([]byte, error) {
+	h.buildMutex.Lock()
+	defer h.buildMutex.Unlock()
+	if h.runBuild != nil {
+		return h.runBuild(cmd)
+	}
+	return cmd.CombinedOutput()
+}
+
+func ensurePrivateCargoBuildDirectories(paths ...string) error {
+	for _, path := range paths {
+		info, err := os.Lstat(path)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			if err := os.Mkdir(path, 0700); err != nil {
+				return fmt.Errorf(
+					"create private Cargo build directory %s: %w",
+					path,
+					err,
+				)
+			}
+			info, err = os.Lstat(path)
+			if err != nil {
+				return fmt.Errorf(
+					"inspect private Cargo build directory %s: %w",
+					path,
+					err,
+				)
+			}
+		case err != nil:
+			return fmt.Errorf(
+				"inspect private Cargo build directory %s: %w",
+				path,
+				err,
+			)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf(
+				"private Cargo build path is not a directory: %s",
+				path,
+			)
+		}
+		if err := os.Chmod(path, 0700); err != nil {
+			return fmt.Errorf(
+				"restrict private Cargo build directory %s: %w",
+				path,
+				err,
+			)
+		}
+	}
+	return nil
+}
+
+func removePrivateCargoBuildDirectory(
+	root string,
+	buildDir string,
+	targetDir string,
+) error {
+	rootInfo, err := os.Lstat(root)
+	if err != nil {
+		return fmt.Errorf("inspect private Cargo build root: %w", err)
+	}
+	if rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() {
+		return errors.New("private Cargo build root is not a directory")
+	}
+
+	buildInfo, err := os.Lstat(buildDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect private Cargo build directory: %w", err)
+	}
+	if buildInfo.Mode()&os.ModeSymlink != 0 || !buildInfo.IsDir() {
+		return errors.New("private Cargo build path is not a directory")
+	}
+
+	targetInfo, err := os.Lstat(targetDir)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+	case err != nil:
+		return fmt.Errorf("inspect private Cargo target directory: %w", err)
+	case targetInfo.Mode()&os.ModeSymlink != 0 || !targetInfo.IsDir():
+		return errors.New("private Cargo target path is not a directory")
+	}
+	return os.RemoveAll(buildDir)
+}
+
+func parsePayloadEnrollmentRevokePath(
+	path string,
+) (payloadID string, matched bool, valid bool) {
+	const (
+		prefix = "/api/payload/"
+		suffix = "/enrollment/revoke"
+	)
+	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+		return "", false, false
+	}
+	payloadID = strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix)
+	if strings.Contains(payloadID, "/") || !validPayloadID(payloadID) {
+		return "", true, false
+	}
+	return payloadID, true, true
+}
+
+// HandleRevokePayloadEnrollment retires a build's embedded bootstrap while
+// preserving sessions that were already issued. Production registers this
+// route only on the operator mux, outside the listener-owned agent surface.
+func (h *PayloadHandler) HandleRevokePayloadEnrollment(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	w.Header().Set("Cache-Control", "no-store")
+
+	payloadID, matched, valid := parsePayloadEnrollmentRevokePath(r.URL.Path)
+	if !matched {
+		http.NotFound(w, r)
+		return
+	}
+	if !valid {
+		http.Error(w, "Invalid payload enrollment path", http.StatusBadRequest)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if r.URL.RawQuery != "" {
+		http.Error(
+			w,
+			"Payload enrollment revocation does not accept query parameters",
+			http.StatusBadRequest,
+		)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxPayloadRevokeBodyBytes)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			http.Error(
+				w,
+				"Payload enrollment revocation body is too large",
+				http.StatusRequestEntityTooLarge,
+			)
+			return
+		}
+		http.Error(
+			w,
+			"Invalid payload enrollment revocation body",
+			http.StatusBadRequest,
+		)
+		return
+	}
+	if len(body) != 0 {
+		http.Error(
+			w,
+			"Payload enrollment revocation requires an empty body",
+			http.StatusBadRequest,
+		)
+		return
+	}
+	if h.initErr != nil || h.enrollment == nil {
+		http.Error(
+			w,
+			"Payload enrollment management is unavailable",
+			http.StatusServiceUnavailable,
+		)
+		return
+	}
+	if err := h.enrollment.RevokePayloadCredential(
+		r.Context(),
+		payloadID,
+	); err != nil {
+		switch {
+		case errors.Is(err, enrollment.ErrNotFound):
+			http.Error(
+				w,
+				"Payload enrollment credential not found",
+				http.StatusNotFound,
+			)
+		case errors.Is(err, enrollment.ErrInvalidArgument):
+			http.Error(
+				w,
+				"Invalid payload enrollment request",
+				http.StatusBadRequest,
+			)
+		default:
+			log.Printf(
+				"[ERROR] Failed to revoke payload enrollment credential %s: %v",
+				payloadID,
+				err,
+			)
+			http.Error(
+				w,
+				"Payload enrollment revocation failed",
+				http.StatusInternalServerError,
+			)
+		}
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // HandleDownloadPayload serves a generated payload for download
@@ -378,6 +837,22 @@ func (h *PayloadHandler) GeneratePayload(
 		log.Printf("[ERROR] Failed to get listener %s: %v", config.ListenerID, err)
 		return PayloadResult{}, fmt.Errorf("failed to get listener: %w", err)
 	}
+	transportPolicy := common.AgentTransportPolicy{
+		AllowInsecureIsolatedLab: h.allowInsecureIsolatedLab,
+	}
+	if err := transportPolicy.ValidateListener(
+		listener.Protocol,
+		listener.TLSConfig != nil && listener.TLSConfig.RequireClientCert,
+	); err != nil {
+		return PayloadResult{}, fmt.Errorf(
+			"listener cannot be used for an agent payload: %w",
+			err,
+		)
+	}
+	connectHost, protocol, serverURL, err := advertisedListenerEndpoint(listener)
+	if err != nil {
+		return PayloadResult{}, err
+	}
 	if listener.Port == 8080 {
 		log.Printf("[WARNING] Listener port is 8080 (web server port). This is not recommended for agent communication.")
 	}
@@ -386,6 +861,14 @@ func (h *PayloadHandler) GeneratePayload(
 	payloadID := uuid.NewString()
 	buildStartedAt := time.Now().UTC()
 	log.Printf("[INFO] Generated payload build ID %s for listener %s", payloadID, listener.ID)
+	maxSessions, err := resolvedPayloadMaxSessions(config.MaxSessions)
+	if err != nil {
+		return PayloadResult{}, err
+	}
+	bootstrap, err := enrollment.GenerateBootstrapCredential()
+	if err != nil {
+		return PayloadResult{}, fmt.Errorf("generate payload enrollment credential: %w", err)
+	}
 
 	// Resolve the mutation seed: use the caller-supplied one for reproduction
 	// builds, otherwise generate a random seed per payload (issue #67).
@@ -408,39 +891,48 @@ func (h *PayloadHandler) GeneratePayload(
 
 	// Create a directory for build artifacts
 	outputDir := filepath.Join(h.payloadsDir, buildType, payloadID)
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
+	if err := os.MkdirAll(outputDir, 0700); err != nil {
 		log.Printf("[ERROR] Failed to create output directory %s: %v", outputDir, err)
 		return PayloadResult{}, fmt.Errorf("failed to create output directory: %w", err)
 	}
+	if err := os.Chmod(outputDir, 0700); err != nil {
+		return PayloadResult{}, fmt.Errorf(
+			"failed to restrict output directory: %w",
+			err,
+		)
+	}
 	log.Printf("[INFO] Created output directory: %s", outputDir)
 	payloadPath := filepath.Join(outputDir, payloadFileName)
+	cargoBuildRoot := filepath.Join(
+		h.agentSourceDir,
+		privateCargoBuildRoot,
+	)
+	cargoBuildDir := filepath.Join(
+		cargoBuildRoot,
+		payloadID,
+	)
+	cargoTargetDir := filepath.Join(
+		privateCargoBuildRoot,
+		payloadID,
+		"target",
+	)
+	cargoTargetPath := filepath.Join(h.agentSourceDir, cargoTargetDir)
 
 	// Create agent config file
 	configPath := filepath.Join(outputDir, "config.json")
 
-	// Determine the protocol prefix
-	protocolPrefix := "http://"
-	if listener.Protocol == "https" {
-		protocolPrefix = "https://"
-	}
-
-	// Choose the advertised host: prefer Hosts[0] if set, else BindHost
-	var connectHost string
-	if len(listener.Hosts) > 0 {
-		connectHost = listener.Hosts[0]
-	} else {
-		connectHost = listener.BindHost
-	}
-	serverUrl := fmt.Sprintf("%s%s:%d", protocolPrefix, connectHost, listener.Port)
+	allowInsecureIsolatedLab :=
+		protocol == "http" && h.allowInsecureIsolatedLab
 
 	agentConfig := map[string]interface{}{
-		"server_url":     serverUrl,
-		"sleep_interval": config.Sleep,
-		"jitter":         2, // Default jitter value
-		"payload_id":     payloadID,
-		"agent_id":       "",
-		"listener_id":    listener.ID,
-		"protocol":       listener.Protocol,
+		"server_url":                  serverURL,
+		"sleep_interval":              config.Sleep,
+		"jitter":                      2, // Default jitter value
+		"payload_id":                  payloadID,
+		"agent_id":                    "",
+		"listener_id":                 listener.ID,
+		"protocol":                    protocol,
+		"allow_insecure_isolated_lab": allowInsecureIsolatedLab,
 	}
 
 	// Include SOCKS5 proxy settings if requested
@@ -528,7 +1020,7 @@ func (h *PayloadHandler) GeneratePayload(
 		"--payload-id", payloadID,
 		"--listener-host", connectHost, // Use advertised host for build args
 		"--listener-port", fmt.Sprintf("%d", listener.Port),
-		"--protocol", listener.Protocol,
+		"--protocol", protocol,
 	}
 
 	// Add additional build arguments based on configuration
@@ -561,8 +1053,10 @@ func (h *PayloadHandler) GeneratePayload(
 	cmd.Env = append(os.Environ(),
 		fmt.Sprintf("TARGET=%s", buildTarget),
 		fmt.Sprintf("OUTPUT_DIR=%s", outputDir),
+		fmt.Sprintf("CARGO_TARGET_DIR=%s", cargoTargetDir),
 		fmt.Sprintf("BUILD_TYPE=%s", buildType),
-		fmt.Sprintf("PROTOCOL=%s", listener.Protocol),
+		fmt.Sprintf("PROTOCOL=%s", protocol),
+		fmt.Sprintf("SERVER_URL=%s", serverURL),
 		fmt.Sprintf("LISTENER_HOST=%s", connectHost),
 		fmt.Sprintf("LISTENER_PORT=%d", listener.Port),
 		fmt.Sprintf("LISTENER_ID=%s", listener.ID),
@@ -571,6 +1065,12 @@ func (h *PayloadHandler) GeneratePayload(
 		fmt.Sprintf("SOCKS5_HOST=%s", config.Socks5Host),
 		fmt.Sprintf("SOCKS5_PORT=%d", config.Socks5Port),
 		fmt.Sprintf("MUTATION_SEED=%s", mutationSeed),
+		"ENROLLMENT_CREDENTIAL="+bootstrap.Public,
+		fmt.Sprintf(
+			"ALLOW_INSECURE_ISOLATED_LAB=%t",
+			allowInsecureIsolatedLab,
+		),
+		"ALLOW_INVALID_CERTS=false",
 
 		// Add OPSEC ENV VARS
 		fmt.Sprintf("PROC_SCAN_INTERVAL_SECS=%d", config.ProcScanIntervalSecs),
@@ -616,29 +1116,59 @@ func (h *PayloadHandler) GeneratePayload(
 	}
 
 	log.Printf("[INFO] Starting build process...")
-	// Execute build command
-	var output []byte
-	if h.runBuild != nil {
-		output, err = h.runBuild(cmd)
-	} else {
-		output, err = cmd.CombinedOutput()
+	if err := ensurePrivateCargoBuildDirectories(
+		cargoBuildRoot,
+		cargoBuildDir,
+		cargoTargetPath,
+	); err != nil {
+		return PayloadResult{}, err
 	}
+	output, err := h.runSerializedBuild(cmd)
+	if cleanupErr := removePrivateCargoBuildDirectory(
+		cargoBuildRoot,
+		cargoBuildDir,
+		cargoTargetPath,
+	); cleanupErr != nil {
+		cleanupErr = fmt.Errorf(
+			"remove private Cargo build intermediates: %w",
+			cleanupErr,
+		)
+		if err == nil {
+			err = cleanupErr
+		} else {
+			err = errors.Join(err, cleanupErr)
+		}
+	}
+	// Build scripts and dependencies are not allowed to turn the bootstrap
+	// credential into a log, error, or operator-facing diagnostic. Scrub the
+	// exact secret immediately after the child exits, before using either
+	// output stream or the returned error anywhere.
+	safeOutput := redactBuildDiagnostic(string(output), bootstrap.Public)
 	if err != nil {
-		log.Printf("[ERROR] Build command failed: %v\nOutput: %s", err, output)
+		safeBuildError := redactBuildDiagnostic(err.Error(), bootstrap.Public)
+		log.Printf(
+			"[ERROR] Build command failed: %s\nOutput: %s",
+			safeBuildError,
+			safeOutput,
+		)
 
 		// Log each line of the output separately for better visibility in logs
-		outputLines := strings.Split(string(output), "\n")
+		outputLines := strings.Split(safeOutput, "\n")
 		for _, line := range outputLines {
 			if line != "" {
 				log.Printf("[ERROR] Build output: %s", line)
 			}
 		}
 
-		return PayloadResult{}, fmt.Errorf("build failed: %v - %s", err, output)
+		return PayloadResult{}, fmt.Errorf(
+			"build failed: %s - %s",
+			safeBuildError,
+			safeOutput,
+		)
 	}
 
 	// Log the first few lines of the output and summarize the rest
-	outputLines := strings.Split(string(output), "\n")
+	outputLines := strings.Split(safeOutput, "\n")
 	// Log ALL lines, not just the first 10
 	for _, line := range outputLines {
 		if line != "" {
@@ -702,18 +1232,26 @@ func (h *PayloadHandler) GeneratePayload(
 		}
 	}
 
+	if err := os.Chmod(payloadPath, 0700); err != nil {
+		return PayloadResult{}, fmt.Errorf(
+			"restrict generated payload artifact permissions: %w",
+			err,
+		)
+	}
 	completedAt := time.Now().UTC()
 
-	// Persist build provenance next to the artifact so any payload is
-	// reproducible from (git revision, seed) (issue #99).
+	// Persist non-secret provenance. Enrollment uses a fresh, deliberately
+	// unrecorded high-entropy build input, so revision and mutation seed
+	// reproduce mutation choices but not the credential-bearing artifact.
 	provenance := map[string]interface{}{
-		"mutation_seed":            mutationSeed,
-		"seed_generated_by_server": seedGenerated,
-		"git_revision":             gitRevision(h.agentSourceDir),
-		"target":                   buildTarget,
-		"built_at":                 completedAt.Format(time.RFC3339Nano),
-		"config_sha256":            fmt.Sprintf("%x", sha256.Sum256(configJSON)),
-		"mutation_flags":           []string{"config-xor-key", "junk-code", "surface-strings"},
+		"mutation_seed":                mutationSeed,
+		"seed_generated_by_server":     seedGenerated,
+		"git_revision":                 gitRevision(h.agentSourceDir),
+		"target":                       buildTarget,
+		"built_at":                     completedAt.Format(time.RFC3339Nano),
+		"config_sha256":                fmt.Sprintf("%x", sha256.Sum256(configJSON)),
+		"mutation_flags":               []string{"config-xor-key", "junk-code", "surface-strings"},
+		"enrollment_credential_source": "server-generated-ephemeral",
 	}
 	if err := writeProvenance(filepath.Dir(payloadPath), provenance); err != nil {
 		log.Printf("[WARNING] Failed to write build provenance: %v", err)
@@ -749,6 +1287,23 @@ func (h *PayloadHandler) GeneratePayload(
 		),
 	}
 	if durableBuildStarted {
+		if h.enrollment == nil {
+			return PayloadResult{}, errors.New("payload enrollment store is unavailable")
+		}
+		if err := h.enrollment.ActivatePayloadCredential(
+			context.Background(),
+			enrollment.PayloadCredentialActivation{
+				PayloadBuildID:  payloadID,
+				ListenerID:      listener.ID,
+				BootstrapSHA256: bootstrap.SHA256,
+				MaxSessions:     maxSessions,
+			},
+		); err != nil {
+			return PayloadResult{}, fmt.Errorf(
+				"activate payload enrollment credential: %w",
+				err,
+			)
+		}
 		if err := h.completePayloadBuild(result); err != nil {
 			return PayloadResult{}, fmt.Errorf("persist completed payload state: %w", err)
 		}
@@ -1103,6 +1658,10 @@ func (h *PayloadHandler) openVerifiedPayload(
 		}
 		return nil, payloadStateCorrupt, "artifact cannot be opened", ""
 	}
+	if err := file.Chmod(0700); err != nil {
+		_ = file.Close()
+		return nil, payloadStateCorrupt, "artifact permissions cannot be restricted", ""
+	}
 	closeAsCorrupt := func(detail string) (*os.File, string, string, string) {
 		_ = file.Close()
 		return nil, payloadStateCorrupt, detail, ""
@@ -1293,6 +1852,7 @@ func openPayloadArtifact(path string) (*os.File, error) {
 func (h *PayloadHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/payload/generate", h.HandleGeneratePayload)
 	mux.HandleFunc("/api/payload/download/", h.HandleDownloadPayload)
+	mux.HandleFunc("/api/payload/", h.HandleRevokePayloadEnrollment)
 }
 
 // SetupRoutes registers payload routes on the default mux for legacy callers.

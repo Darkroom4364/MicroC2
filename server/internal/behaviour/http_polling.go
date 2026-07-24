@@ -2,12 +2,14 @@
 package behaviour
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"microc2/server/internal/common"
+	"microc2/server/internal/enrollment"
 	"microc2/server/internal/filestore"
 	"microc2/server/internal/persistence"
 	"microc2/server/internal/tasks"
@@ -22,12 +24,14 @@ import (
 )
 
 type HTTPPollingProtocol struct {
-	config     common.BaseProtocolConfig
-	mux        *http.ServeMux
-	taskStore  taskStateStore
-	database   *persistence.Database
-	listenerID string
-	results    struct {
+	config      common.BaseProtocolConfig
+	mux         *http.ServeMux
+	taskStore   taskStateStore
+	database    *persistence.Database
+	listenerID  string
+	enrollment  *enrollment.Store
+	requireAuth bool
+	results     struct {
 		sync.Mutex
 		history map[string][]CommandResult // AgentID -> []CommandResult
 	}
@@ -73,7 +77,11 @@ type CommandResult struct {
 
 const maxAgentHeartbeatBodyBytes = 64 << 10
 
-var errAgentHeartbeatPersistence = errors.New("agent heartbeat persistence failed")
+const maxAgentAuthorizationHeaderBytes = 256
+
+var (
+	errAgentHeartbeatPersistence = errors.New("agent heartbeat persistence failed")
+)
 
 type Agent struct {
 	ID         string    `json:"id"`
@@ -114,6 +122,36 @@ func NewHTTPPollingProtocolWithPersistence(
 	if err := p.loadPersistedAgents(); err != nil {
 		return nil, err
 	}
+	return p, nil
+}
+
+// NewAuthenticatedHTTPPollingProtocolWithPersistence constructs the
+// production polling protocol. It starts with no process-local active agents:
+// durable rows remain available to the operator API, but every agent must
+// authenticate a fresh heartbeat after server restart before it can receive
+// tasking.
+func NewAuthenticatedHTTPPollingProtocolWithPersistence(
+	config common.BaseProtocolConfig,
+	database *persistence.Database,
+	listenerID string,
+) (*HTTPPollingProtocol, error) {
+	if database == nil {
+		return nil, errors.New("authenticated polling protocol requires a database")
+	}
+	if err := tasks.ValidateIdentifier("listener_id", listenerID); err != nil {
+		return nil, err
+	}
+	taskStore, err := tasks.NewDurableStore(database, listenerID, time.Now)
+	if err != nil {
+		return nil, err
+	}
+	enrollmentStore, err := enrollment.NewStore(context.Background(), database)
+	if err != nil {
+		return nil, fmt.Errorf("initialize enrollment store: %w", err)
+	}
+	p := newHTTPPollingProtocol(config, taskStore, database, listenerID)
+	p.enrollment = enrollmentStore
+	p.requireAuth = true
 	return p, nil
 }
 
@@ -163,6 +201,12 @@ func (p *HTTPPollingProtocol) GetHTTPHandler() http.Handler {
 	return p.mux
 }
 
+// RequiresAgentAuthentication reports whether this protocol rejects all
+// agent lifecycle requests until a durable enrollment session is established.
+func (p *HTTPPollingProtocol) RequiresAgentAuthentication() bool {
+	return p != nil && p.requireAuth && p.enrollment != nil
+}
+
 func (p *HTTPPollingProtocol) handleAgentRequests(w http.ResponseWriter, r *http.Request) {
 	p.enableCors(w, r)
 
@@ -182,6 +226,19 @@ func (p *HTTPPollingProtocol) handleAgentRequests(w http.ResponseWriter, r *http
 		return
 	}
 	action := parts[3]
+	if p.requireAuth {
+		w.Header().Set("Cache-Control", "no-store")
+		if action != "heartbeat" {
+			if err := p.authenticateAgentRequest(r, agentID); err != nil {
+				p.writeAgentAuthenticationError(w, err)
+				return
+			}
+			if !p.agentActiveThisBoot(agentID) {
+				p.writeAgentAuthenticationError(w, enrollment.ErrUnauthorized)
+				return
+			}
+		}
+	}
 	switch action {
 	case "heartbeat":
 		if len(parts) != 4 {
@@ -226,7 +283,71 @@ func (p *HTTPPollingProtocol) HandleAgentRequests(w http.ResponseWriter, r *http
 	p.handleAgentRequests(w, r)
 }
 
-func (p *HTTPPollingProtocol) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request, AgentID string) {
+func (p *HTTPPollingProtocol) authenticateAgentRequest(
+	r *http.Request,
+	agentID string,
+) error {
+	if p.enrollment == nil {
+		return errors.New("agent enrollment store is unavailable")
+	}
+	credential, ok := agentBearerCredential(r)
+	if !ok {
+		return enrollment.ErrUnauthorized
+	}
+	_, err := p.enrollment.Authenticate(
+		r.Context(),
+		p.listenerID,
+		agentID,
+		credential,
+	)
+	return err
+}
+
+func (p *HTTPPollingProtocol) agentActiveThisBoot(agentID string) bool {
+	p.agents.Lock()
+	defer p.agents.Unlock()
+	return p.agents.activeThisBoot[agentID]
+}
+
+func agentBearerCredential(r *http.Request) (string, bool) {
+	values := r.Header.Values("Authorization")
+	if len(values) != 1 ||
+		len(values[0]) == 0 ||
+		len(values[0]) > maxAgentAuthorizationHeaderBytes {
+		return "", false
+	}
+	scheme, credential, found := strings.Cut(values[0], " ")
+	if !found ||
+		!strings.EqualFold(scheme, "Bearer") ||
+		credential == "" ||
+		strings.ContainsAny(credential, " \t\r\n") {
+		return "", false
+	}
+	return credential, true
+}
+
+func (p *HTTPPollingProtocol) writeAgentAuthenticationError(
+	w http.ResponseWriter,
+	err error,
+) {
+	w.Header().Set("Cache-Control", "no-store")
+	switch {
+	case errors.Is(err, enrollment.ErrUnauthorized):
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+	case errors.Is(err, enrollment.ErrEnrollmentCapacity):
+		http.Error(w, "Agent enrollment capacity reached", http.StatusConflict)
+	default:
+		log.Printf("[ERROR] Agent authentication state unavailable: %v", err)
+		http.Error(w, "Agent authentication unavailable", http.StatusInternalServerError)
+	}
+}
+
+func (p *HTTPPollingProtocol) handleAgentHeartbeat(
+	w http.ResponseWriter,
+	r *http.Request,
+	agentID string,
+) {
 	p.enableCors(w, r)
 
 	// Handle preflight OPTIONS request
@@ -236,16 +357,24 @@ func (p *HTTPPollingProtocol) handleAgentHeartbeat(w http.ResponseWriter, r *htt
 	}
 
 	if r.Method != http.MethodPost {
-		log.Printf("[ERROR] Invalid method %s for agent %s heartbeat", r.Method, AgentID)
+		log.Printf("[ERROR] Invalid method %s for agent heartbeat", r.Method)
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// log.Printf("[DEBUG] Processing heartbeat from agent %s", AgentID)
+	credential := ""
+	if p.requireAuth {
+		var ok bool
+		credential, ok = agentBearerCredential(r)
+		if !ok {
+			p.writeAgentAuthenticationError(w, enrollment.ErrUnauthorized)
+			return
+		}
+	}
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxAgentHeartbeatBodyBytes))
 	if err != nil {
-		log.Printf("[ERROR] Failed to read heartbeat body from agent %s: %v", AgentID, err)
+		log.Printf("[ERROR] Failed to read bounded agent heartbeat body: %v", err)
 		var maxBytesError *http.MaxBytesError
 		if errors.As(err, &maxBytesError) {
 			http.Error(w, "Heartbeat request body too large", http.StatusRequestEntityTooLarge)
@@ -255,28 +384,93 @@ func (p *HTTPPollingProtocol) handleAgentHeartbeat(w http.ResponseWriter, r *htt
 		return
 	}
 
-	if err := p.processAgentHeartbeat(body, AgentID); err != nil {
-		log.Printf("[ERROR] Failed to process heartbeat from agent %s: %v", AgentID, err)
+	agent, err := decodeAgentHeartbeat(body, agentID)
+	if err != nil {
+		http.Error(w, "Invalid agent heartbeat", http.StatusBadRequest)
+		return
+	}
+
+	sessionCredential := ""
+	if p.requireAuth {
+		if p.enrollment == nil {
+			p.writeAgentAuthenticationError(
+				w,
+				errors.New("agent enrollment store is unavailable"),
+			)
+			return
+		}
+		if agent.ListenerID != p.listenerID || agent.PayloadID == "" {
+			p.writeAgentAuthenticationError(w, enrollment.ErrUnauthorized)
+			return
+		}
+		authentication, authErr := p.enrollment.Authenticate(
+			r.Context(),
+			p.listenerID,
+			agentID,
+			credential,
+		)
+		switch {
+		case authErr == nil:
+			if authentication.PayloadBuildID != agent.PayloadID {
+				p.writeAgentAuthenticationError(w, enrollment.ErrUnauthorized)
+				return
+			}
+			sessionCredential = authentication.ReplacementCredential
+		case errors.Is(authErr, enrollment.ErrUnauthorized):
+			enrolled, enrollErr := p.enrollment.Enroll(
+				r.Context(),
+				enrollment.EnrollRequest{
+					ListenerID:     p.listenerID,
+					AgentID:        agentID,
+					PayloadBuildID: agent.PayloadID,
+					Bootstrap:      credential,
+				},
+			)
+			if enrollErr != nil {
+				p.writeAgentAuthenticationError(w, enrollErr)
+				return
+			}
+			sessionCredential = enrolled.Credential
+		default:
+			p.writeAgentAuthenticationError(w, authErr)
+			return
+		}
+	}
+
+	if err := p.recordAgentHeartbeat(agent); err != nil {
+		log.Printf("[ERROR] Failed to record authenticated agent heartbeat: %v", err)
 		if errors.Is(err, errAgentHeartbeatPersistence) {
 			http.Error(w, "Failed to persist agent heartbeat", http.StatusInternalServerError)
 			return
 		}
-		http.Error(w, fmt.Sprintf("Error processing agent data: %v", err), http.StatusBadRequest)
+		http.Error(w, "Invalid agent heartbeat", http.StatusBadRequest)
 		return
 	}
 
-	log.Printf("[INFO] Successfully processed heartbeat from agent %s", AgentID)
-	// Build JSON response and include Content-Length
-	response := map[string]string{"status": "connected", "time": time.Now().UTC().Format(time.RFC3339)}
+	if p.requireAuth {
+		log.Printf("[INFO] Successfully processed authenticated heartbeat for agent %s", agentID)
+	} else {
+		log.Printf("[INFO] Successfully processed heartbeat for agent %s", agentID)
+	}
+	response := map[string]string{
+		"status": "connected",
+		"time":   time.Now().UTC().Format(time.RFC3339),
+	}
+	if sessionCredential != "" {
+		response["session_credential"] = sessionCredential
+	}
 	respBytes, err := json.Marshal(response)
 	if err != nil {
-		log.Printf("[ERROR] Failed to marshal response for agent %s: %v", AgentID, err)
+		log.Printf("[ERROR] Failed to marshal agent heartbeat response: %v", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Length", strconv.Itoa(len(respBytes)))
-	w.Write(respBytes)
+	if _, err := w.Write(respBytes); err != nil {
+		log.Printf("[ERROR] Failed to write agent heartbeat response: %v", err)
+	}
 }
 
 func (p *HTTPPollingProtocol) handleAgentTasks(w http.ResponseWriter, r *http.Request, agentID string) {
@@ -417,27 +611,42 @@ func (p *HTTPPollingProtocol) HandleFileDownload(filename string) (io.Reader, er
 }
 
 func (p *HTTPPollingProtocol) processAgentHeartbeat(agentData []byte, expectedAgentID string) error {
+	agent, err := decodeAgentHeartbeat(agentData, expectedAgentID)
+	if err != nil {
+		return err
+	}
+	return p.recordAgentHeartbeat(agent)
+}
+
+func decodeAgentHeartbeat(agentData []byte, expectedAgentID string) (Agent, error) {
 	var agent Agent
 	if err := json.Unmarshal(agentData, &agent); err != nil {
 		log.Printf("[ERROR] Failed to unmarshal agent heartbeat: %v", err)
-		return fmt.Errorf("failed to unmarshal agent data: %w", err)
+		return Agent{}, fmt.Errorf("failed to unmarshal agent data: %w", err)
 	}
 	if strings.TrimSpace(agent.ID) == "" {
-		return fmt.Errorf("agent id is required")
+		return Agent{}, fmt.Errorf("agent id is required")
 	}
 	if expectedAgentID != "" && agent.ID != expectedAgentID {
-		return fmt.Errorf("agent id mismatch: path %q, body %q", expectedAgentID, agent.ID)
+		return Agent{}, fmt.Errorf("agent id mismatch")
 	}
 	if err := validateAgentHeartbeat(agent); err != nil {
-		return err
+		return Agent{}, err
 	}
+	return agent, nil
+}
 
+func (p *HTTPPollingProtocol) recordAgentHeartbeat(agent Agent) error {
 	p.agents.Lock()
 	defer p.agents.Unlock()
+	_, alreadyPresent := p.agents.list[agent.ID]
 	agent.ListenerID = p.listenerID
 	agent.LastSeen = time.Now().UTC().Round(0)
 	if err := p.persistAgent(agent); err != nil {
 		return fmt.Errorf("%w: %w", errAgentHeartbeatPersistence, err)
+	}
+	if !alreadyPresent && len(p.agents.list) >= enrollment.MaxListenerSessions {
+		p.evictOldestRuntimeAgentLocked()
 	}
 	p.agents.list[agent.ID] = &agent
 	p.agents.activeThisBoot[agent.ID] = true
@@ -445,8 +654,42 @@ func (p *HTTPPollingProtocol) processAgentHeartbeat(agentData []byte, expectedAg
 	return nil
 }
 
+// evictOldestRuntimeAgentLocked bounds process-local presence without deleting
+// durable history. The evicted session remains valid, but must heartbeat again
+// before it can receive tasking in this process. Caller must hold agents.Lock.
+func (p *HTTPPollingProtocol) evictOldestRuntimeAgentLocked() {
+	oldestID := ""
+	var oldestSeen time.Time
+	for agentID, agent := range p.agents.list {
+		lastSeen := time.Time{}
+		if agent != nil {
+			lastSeen = agent.LastSeen
+		}
+		if oldestID == "" ||
+			lastSeen.Before(oldestSeen) ||
+			lastSeen.Equal(oldestSeen) && agentID < oldestID {
+			oldestID = agentID
+			oldestSeen = lastSeen
+		}
+	}
+	if oldestID == "" {
+		return
+	}
+	delete(p.agents.list, oldestID)
+	delete(p.agents.activeThisBoot, oldestID)
+	log.Printf(
+		"[INFO] Evicted least-recently-seen runtime agent %s; durable history retained",
+		oldestID,
+	)
+}
+
 // Restore the interface method for Protocol compatibility
 func (p *HTTPPollingProtocol) HandleAgentHeartbeat(agentData []byte) error {
+	if p.requireAuth {
+		return errors.New(
+			"authenticated heartbeats must use the HTTP enrollment path",
+		)
+	}
 	return p.processAgentHeartbeat(agentData, "")
 }
 
@@ -506,7 +749,10 @@ func (p *HTTPPollingProtocol) enableCors(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Filename, X-Command")
+	w.Header().Set(
+		"Access-Control-Allow-Headers",
+		"Authorization, Content-Type, X-Filename, X-Command",
+	)
 	w.Header().Set("Access-Control-Max-Age", "86400")
 }
 
@@ -668,8 +914,8 @@ func (p *HTTPPollingProtocol) AgentLastSeen(agentID string) (time.Time, bool) {
 	}
 	if !p.agents.activeThisBoot[agentID] {
 		// Persisted agents are historical after restart. A fresh heartbeat is
-		// required before operator dispatch until #104 adds authenticated
-		// enrollment sessions.
+		// required before operator dispatch; durable enrollment state does not
+		// prove that the runtime is active in this process lifetime.
 		return time.Time{}, true
 	}
 	return agent.LastSeen, true

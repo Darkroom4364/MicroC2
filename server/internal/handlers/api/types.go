@@ -1,6 +1,7 @@
 package api
 
 import (
+	"microc2/server/internal/enrollment"
 	"microc2/server/internal/filestore"
 	"microc2/server/internal/listeners" // Updated from `networking`
 	"microc2/server/internal/protocols" // Updated from `networking`
@@ -21,7 +22,9 @@ type FileHandlers struct {
 
 // ListenerHandlers manages HTTP handlers for listener operations
 type ListenerHandlers struct {
-	manager *listeners.ListenerManager
+	manager       *listeners.ListenerManager
+	enrollment    *enrollment.Store
+	enrollmentErr error
 }
 
 // SOCKS5Handler handles SOCKS5 management API endpoints

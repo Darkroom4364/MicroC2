@@ -297,19 +297,23 @@ test('agent metadata is text-only and actions preserve the original ID', async (
     installDocument({elements: {'agent-list': agents}});
     const injection = `agent'"><svg onload="globalThis.__dashboardXssTriggered=true">`;
     globalThis.__dashboardXssTriggered = false;
-    global.fetch = async () => response({
-        body: {
-            malicious: {
-                id: injection,
-                type: injection,
-                ip: injection,
-                hostname: injection,
-                os: injection,
-                connected: true,
-                last_seen: '2026-07-23T16:30:00Z'
+    let requestURL;
+    global.fetch = async url => {
+        requestURL = url;
+        return response({
+            body: {
+                malicious: {
+                    id: injection,
+                    type: injection,
+                    ip: injection,
+                    hostname: injection,
+                    os: injection,
+                    connected: true,
+                    last_seen: '2026-07-23T16:30:00Z'
+                }
             }
-        }
-    });
+        });
+    };
 
     const calls = [];
     const manager = createManager();
@@ -318,6 +322,7 @@ test('agent metadata is text-only and actions preserve the original ID', async (
 
     await manager.loadActiveAgents();
 
+    assert.equal(requestURL, '/api/agents/list?limit=100&offset=0');
     assert.equal(globalThis.__dashboardXssTriggered, false);
     assert.equal(agents.innerHTMLWrites, 0);
     assert.equal(agents.children.length, 1);

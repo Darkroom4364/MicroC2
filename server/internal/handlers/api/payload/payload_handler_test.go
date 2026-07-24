@@ -2,9 +2,13 @@ package payload
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,8 +17,12 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"microc2/server/internal/common"
+	"microc2/server/internal/enrollment"
 	"microc2/server/internal/listeners"
 	"microc2/server/internal/persistence"
 )
@@ -31,7 +39,7 @@ func TestGeneratePayloadCreatesBuildIDsDistinctFromListenerID(t *testing.T) {
 		Port:     9001,
 	})
 
-	handler := NewPayloadHandler(filepath.Join(tempDir, "static", "payloads"), agentDir)
+	handler := NewPayloadHandlerForIsolatedLab(filepath.Join(tempDir, "static", "payloads"), agentDir)
 	config := PayloadConfig{
 		ListenerID: "listener-one",
 		AgentType:  "debugAgent",
@@ -92,7 +100,7 @@ func TestGeneratePayloadGeneratesSeedAndWritesProvenance(t *testing.T) {
 		Port:     9001,
 	})
 
-	handler := NewPayloadHandler(filepath.Join(tempDir, "static", "payloads"), agentDir)
+	handler := NewPayloadHandlerForIsolatedLab(filepath.Join(tempDir, "static", "payloads"), agentDir)
 	config := PayloadConfig{
 		ListenerID: "listener-one",
 		AgentType:  "debugAgent",
@@ -138,6 +146,13 @@ func TestGeneratePayloadGeneratesSeedAndWritesProvenance(t *testing.T) {
 	if provenance["built_at"] == nil || provenance["built_at"] == "" {
 		t.Fatalf("provenance should record a build timestamp: %#v", provenance["built_at"])
 	}
+	if provenance["enrollment_credential_source"] !=
+		"server-generated-ephemeral" {
+		t.Fatalf(
+			"provenance enrollment source = %#v, want non-secret mode",
+			provenance["enrollment_credential_source"],
+		)
+	}
 	flags, ok := provenance["mutation_flags"].([]interface{})
 	if !ok || len(flags) == 0 {
 		t.Fatalf("provenance should list mutation flags: %#v", provenance["mutation_flags"])
@@ -149,6 +164,1201 @@ func TestGeneratePayloadGeneratesSeedAndWritesProvenance(t *testing.T) {
 	}
 	if second.MutationSeed == first.MutationSeed {
 		t.Fatalf("distinct payloads should get distinct random seeds: %q", first.MutationSeed)
+	}
+}
+
+func TestAdvertisedListenerEndpointValidatesAndBracketsHosts(t *testing.T) {
+	testCases := []struct {
+		name       string
+		listener   listeners.ListenerConfig
+		wantHost   string
+		wantScheme string
+		wantURL    string
+		wantError  bool
+	}{
+		{
+			name: "dns name",
+			listener: listeners.ListenerConfig{
+				Protocol: "HTTPS",
+				BindHost: "127.0.0.1",
+				Hosts:    []string{"c2.example.test"},
+				Port:     8443,
+			},
+			wantHost:   "c2.example.test",
+			wantScheme: "https",
+			wantURL:    "https://c2.example.test:8443",
+		},
+		{
+			name: "unbracketed IPv6",
+			listener: listeners.ListenerConfig{
+				Protocol: "https",
+				BindHost: "2001:db8::1",
+				Port:     443,
+			},
+			wantHost:   "2001:db8::1",
+			wantScheme: "https",
+			wantURL:    "https://[2001:db8::1]:443",
+		},
+		{
+			name: "bracketed IPv6",
+			listener: listeners.ListenerConfig{
+				Protocol: "http",
+				BindHost: "[::1]",
+				Port:     8081,
+			},
+			wantHost:   "::1",
+			wantScheme: "http",
+			wantURL:    "http://[::1]:8081",
+		},
+		{
+			name: "userinfo rejected",
+			listener: listeners.ListenerConfig{
+				Protocol: "https",
+				BindHost: "operator@c2.example",
+				Port:     443,
+			},
+			wantError: true,
+		},
+		{
+			name: "path rejected",
+			listener: listeners.ListenerConfig{
+				Protocol: "https",
+				BindHost: "c2.example/agent",
+				Port:     443,
+			},
+			wantError: true,
+		},
+		{
+			name: "quote rejected",
+			listener: listeners.ListenerConfig{
+				Protocol: "https",
+				BindHost: `c2.example"`,
+				Port:     443,
+			},
+			wantError: true,
+		},
+		{
+			name: "control rejected",
+			listener: listeners.ListenerConfig{
+				Protocol: "https",
+				BindHost: "c2.example\ninjected",
+				Port:     443,
+			},
+			wantError: true,
+		},
+		{
+			name: "scheme rejected",
+			listener: listeners.ListenerConfig{
+				Protocol: "https",
+				BindHost: "https://c2.example",
+				Port:     443,
+			},
+			wantError: true,
+		},
+		{
+			name: "embedded port rejected",
+			listener: listeners.ListenerConfig{
+				Protocol: "https",
+				BindHost: "c2.example:443",
+				Port:     443,
+			},
+			wantError: true,
+		},
+		{
+			name: "unspecified bind address rejected",
+			listener: listeners.ListenerConfig{
+				Protocol: "https",
+				BindHost: "0.0.0.0",
+				Port:     443,
+			},
+			wantError: true,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			host, protocol, serverURL, err := advertisedListenerEndpoint(
+				testCase.listener,
+			)
+			if testCase.wantError {
+				if err == nil {
+					t.Fatalf(
+						"advertised endpoint unexpectedly accepted as %s",
+						serverURL,
+					)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validate advertised endpoint: %v", err)
+			}
+			if host != testCase.wantHost ||
+				protocol != testCase.wantScheme ||
+				serverURL != testCase.wantURL {
+				t.Fatalf(
+					"advertised endpoint = (%q, %q, %q), want (%q, %q, %q)",
+					host,
+					protocol,
+					serverURL,
+					testCase.wantHost,
+					testCase.wantScheme,
+					testCase.wantURL,
+				)
+			}
+		})
+	}
+}
+
+func TestPayloadBuildReceivesCanonicalIPv6ServerURL(t *testing.T) {
+	tempDir := t.TempDir()
+	agentDir := filepath.Join(tempDir, "agent")
+	writePlaceholderBuildScript(t, agentDir)
+	handler, err := newPayloadHandler(
+		filepath.Join(tempDir, "payloads"),
+		agentDir,
+		staticListenerLookup{
+			"listener-one": {
+				ID:       "listener-one",
+				Name:     "ipv6-listener",
+				Protocol: "https",
+				BindHost: "::",
+				Hosts:    []string{"2001:db8::1"},
+				Port:     8443,
+			},
+		},
+		nil,
+		false,
+	)
+	if err != nil {
+		t.Fatalf("create payload handler: %v", err)
+	}
+
+	var serverURL, listenerHost string
+	handler.runBuild = func(command *exec.Cmd) ([]byte, error) {
+		for _, entry := range command.Env {
+			name, value, found := strings.Cut(entry, "=")
+			if !found {
+				continue
+			}
+			switch name {
+			case "SERVER_URL":
+				serverURL = value
+			case "LISTENER_HOST":
+				listenerHost = value
+			}
+		}
+		for index := 0; index+1 < len(command.Args); index++ {
+			if command.Args[index] != "--output" {
+				continue
+			}
+			return []byte("hook build complete"), os.WriteFile(
+				filepath.Join(command.Args[index+1], "agent"),
+				[]byte("fake agent"),
+				0o600,
+			)
+		}
+		return nil, errors.New("build command omitted --output")
+	}
+
+	result, err := handler.GeneratePayload(testPayloadConfig())
+	if err != nil {
+		t.Fatalf("generate IPv6 payload: %v", err)
+	}
+	if serverURL != "https://[2001:db8::1]:8443" {
+		t.Fatalf("SERVER_URL = %q, want canonical IPv6 URL", serverURL)
+	}
+	if listenerHost != "2001:db8::1" {
+		t.Fatalf("LISTENER_HOST = %q, want unbracketed IPv6 host", listenerHost)
+	}
+	projected := readJSONFile(
+		t,
+		filepath.Join(filepath.Dir(result.Path), "config.json"),
+	)
+	if projected["server_url"] != serverURL {
+		t.Fatalf(
+			"projected server_url = %#v, want %q",
+			projected["server_url"],
+			serverURL,
+		)
+	}
+}
+
+func TestPersistentPayloadEnrollmentCredentialIsHashOnlyAndNotProjected(
+	t *testing.T,
+) {
+	tempDir := t.TempDir()
+	payloadsDir := filepath.Join(tempDir, "payload-root")
+	agentDir := filepath.Join(tempDir, "agent")
+	writePlaceholderBuildScript(t, agentDir)
+	database, err := persistence.Open(filepath.Join(tempDir, "state.db"))
+	if err != nil {
+		t.Fatalf("open persistence database: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close persistence database: %v", err)
+		}
+	})
+	handler, err := NewPayloadHandlerWithPersistenceForIsolatedLab(
+		payloadsDir,
+		agentDir,
+		testListenerLookup(),
+		database,
+	)
+	if err != nil {
+		t.Fatalf("create persistent payload handler: %v", err)
+	}
+
+	var (
+		bootstrapCredential string
+		labOverride         string
+		buildOutput         []byte
+		logOutput           bytes.Buffer
+	)
+	handler.runBuild = func(command *exec.Cmd) ([]byte, error) {
+		for _, entry := range command.Env {
+			name, value, found := strings.Cut(entry, "=")
+			if !found {
+				continue
+			}
+			switch name {
+			case "ENROLLMENT_CREDENTIAL":
+				bootstrapCredential = value
+			case "ALLOW_INSECURE_ISOLATED_LAB":
+				labOverride = value
+			}
+		}
+		outputDir := ""
+		for index := 0; index+1 < len(command.Args); index++ {
+			if command.Args[index] == "--output" {
+				outputDir = command.Args[index+1]
+				break
+			}
+		}
+		if outputDir == "" {
+			t.Fatal("build command omitted --output")
+		}
+		if err := os.WriteFile(
+			filepath.Join(outputDir, "agent"),
+			[]byte("fake agent"),
+			0o600,
+		); err != nil {
+			t.Fatalf("write hooked payload artifact: %v", err)
+		}
+		buildOutput = []byte(
+			"hook build complete; credential=" + bootstrapCredential,
+		)
+		return buildOutput, nil
+	}
+
+	previousLogWriter := log.Writer()
+	log.SetOutput(&logOutput)
+	t.Cleanup(func() {
+		log.SetOutput(previousLogWriter)
+	})
+	result, err := handler.GeneratePayload(testPayloadConfig())
+	log.SetOutput(previousLogWriter)
+	if err != nil {
+		t.Fatalf("generate authenticated payload: %v", err)
+	}
+	decodedBootstrap, err := base64.RawURLEncoding.DecodeString(
+		bootstrapCredential,
+	)
+	if err != nil {
+		t.Fatalf("decode generated bootstrap credential: %v", err)
+	}
+	if len(decodedBootstrap) != 32 {
+		t.Fatalf("bootstrap entropy bytes = %d, want 32", len(decodedBootstrap))
+	}
+	if !bytes.Contains(buildOutput, []byte(bootstrapCredential)) {
+		t.Fatal("test build output did not exercise credential redaction")
+	}
+	if labOverride != "true" {
+		t.Fatalf("HTTP lab build override = %q, want true", labOverride)
+	}
+
+	var storedHash []byte
+	var maxSessions int
+	if err := database.SQL().QueryRow(
+		`SELECT bootstrap_sha256, max_sessions
+		 FROM payload_bootstrap_credentials
+		 WHERE payload_build_id = ?`,
+		result.ID,
+	).Scan(&storedHash, &maxSessions); err != nil {
+		t.Fatalf("read stored payload enrollment credential: %v", err)
+	}
+	wantHash := sha256.Sum256(decodedBootstrap)
+	if !bytes.Equal(storedHash, wantHash[:]) {
+		t.Fatal("stored bootstrap hash does not match the generated credential")
+	}
+	if maxSessions != defaultPayloadMaxSessions {
+		t.Fatalf(
+			"stored max_sessions = %d, want %d",
+			maxSessions,
+			defaultPayloadMaxSessions,
+		)
+	}
+
+	configBytes, err := os.ReadFile(
+		filepath.Join(filepath.Dir(result.Path), "config.json"),
+	)
+	if err != nil {
+		t.Fatalf("read projected payload config: %v", err)
+	}
+	provenanceBytes, err := os.ReadFile(
+		filepath.Join(filepath.Dir(result.Path), "provenance.json"),
+	)
+	if err != nil {
+		t.Fatalf("read payload provenance: %v", err)
+	}
+	responseBytes, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("marshal payload response: %v", err)
+	}
+	for name, content := range map[string][]byte{
+		"config projection": configBytes,
+		"provenance":        provenanceBytes,
+		"operator response": responseBytes,
+		"server logs":       logOutput.Bytes(),
+	} {
+		if bytes.Contains(content, []byte(bootstrapCredential)) {
+			t.Fatalf("%s exposed the bootstrap credential", name)
+		}
+	}
+	if !bytes.Contains(logOutput.Bytes(), []byte("[REDACTED]")) {
+		t.Fatal("server logs did not retain a redacted build diagnostic")
+	}
+	if bytes.Contains(configBytes, []byte("enrollment_credential")) {
+		t.Fatal("ordinary payload config contains an enrollment credential field")
+	}
+}
+
+func TestPayloadBuildFailureRedactsEnrollmentCredentialFromLogsAndResponse(
+	t *testing.T,
+) {
+	tempDir := t.TempDir()
+	payloadsDir := filepath.Join(tempDir, "payload-root")
+	agentDir := filepath.Join(tempDir, "agent")
+	writePlaceholderBuildScript(t, agentDir)
+	database, err := persistence.Open(filepath.Join(tempDir, "state.db"))
+	if err != nil {
+		t.Fatalf("open persistence database: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close persistence database: %v", err)
+		}
+	})
+	handler, err := NewPayloadHandlerWithPersistenceForIsolatedLab(
+		payloadsDir,
+		agentDir,
+		testListenerLookup(),
+		database,
+	)
+	if err != nil {
+		t.Fatalf("create persistent payload handler: %v", err)
+	}
+
+	var bootstrapCredential string
+	handler.runBuild = func(command *exec.Cmd) ([]byte, error) {
+		for _, entry := range command.Env {
+			name, value, found := strings.Cut(entry, "=")
+			if found && name == "ENROLLMENT_CREDENTIAL" {
+				bootstrapCredential = value
+				break
+			}
+		}
+		return []byte("child output leaked " + bootstrapCredential),
+			errors.New("compiler error leaked " + bootstrapCredential)
+	}
+
+	requestBody, err := json.Marshal(testPayloadConfig())
+	if err != nil {
+		t.Fatalf("marshal payload request: %v", err)
+	}
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/payload/generate",
+		bytes.NewReader(requestBody),
+	)
+	response := httptest.NewRecorder()
+	var logOutput bytes.Buffer
+	previousLogWriter := log.Writer()
+	log.SetOutput(&logOutput)
+	t.Cleanup(func() {
+		log.SetOutput(previousLogWriter)
+	})
+	handler.HandleGeneratePayload(response, request)
+	log.SetOutput(previousLogWriter)
+
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf(
+			"payload failure status = %d, want %d: %s",
+			response.Code,
+			http.StatusInternalServerError,
+			response.Body.String(),
+		)
+	}
+	if bootstrapCredential == "" {
+		t.Fatal("test build did not receive an enrollment credential")
+	}
+	for name, content := range map[string]string{
+		"server logs":       logOutput.String(),
+		"operator response": response.Body.String(),
+	} {
+		if strings.Contains(content, bootstrapCredential) {
+			t.Fatalf("%s exposed the bootstrap credential", name)
+		}
+		if !strings.Contains(content, "[REDACTED]") {
+			t.Fatalf("%s omitted the redaction marker: %q", name, content)
+		}
+	}
+}
+
+func TestConcurrentPayloadBuildsSerializeSharedAgentWorkspace(t *testing.T) {
+	tempDir := t.TempDir()
+	payloadsDir := filepath.Join(tempDir, "payload-root")
+	agentDir := filepath.Join(tempDir, "agent")
+	writePlaceholderBuildScript(t, agentDir)
+	database, err := persistence.Open(filepath.Join(tempDir, "state.db"))
+	if err != nil {
+		t.Fatalf("open persistence database: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close persistence database: %v", err)
+		}
+	})
+	handler, err := NewPayloadHandlerWithPersistenceForIsolatedLab(
+		payloadsDir,
+		agentDir,
+		testListenerLookup(),
+		database,
+	)
+	if err != nil {
+		t.Fatalf("create persistent payload handler: %v", err)
+	}
+
+	sharedArtifact := filepath.Join(agentDir, "target", "shared-agent")
+	if err := os.MkdirAll(filepath.Dir(sharedArtifact), 0o755); err != nil {
+		t.Fatalf("create simulated shared Cargo target: %v", err)
+	}
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			close(releaseFirst)
+		})
+	}
+	t.Cleanup(release)
+
+	var stateMutex sync.Mutex
+	invocations := 0
+	expectedByOutput := make(map[string]string)
+	handler.runBuild = func(command *exec.Cmd) ([]byte, error) {
+		var credential, outputDir string
+		for _, entry := range command.Env {
+			name, value, found := strings.Cut(entry, "=")
+			if found && name == "ENROLLMENT_CREDENTIAL" {
+				credential = value
+			}
+		}
+		for index := 0; index+1 < len(command.Args); index++ {
+			if command.Args[index] == "--output" {
+				outputDir = command.Args[index+1]
+				break
+			}
+		}
+		if credential == "" || outputDir == "" {
+			return nil, errors.New("build hook is missing credential or output")
+		}
+
+		stateMutex.Lock()
+		invocations++
+		invocation := invocations
+		expectedByOutput[outputDir] = credential
+		stateMutex.Unlock()
+
+		if err := os.WriteFile(
+			sharedArtifact,
+			[]byte(credential),
+			0o600,
+		); err != nil {
+			return nil, fmt.Errorf("write simulated shared artifact: %w", err)
+		}
+		if invocation == 1 {
+			close(firstEntered)
+			<-releaseFirst
+		}
+		artifact, err := os.ReadFile(sharedArtifact)
+		if err != nil {
+			return nil, fmt.Errorf("read simulated shared artifact: %w", err)
+		}
+		if err := os.WriteFile(
+			filepath.Join(outputDir, "agent"),
+			artifact,
+			0o600,
+		); err != nil {
+			return nil, fmt.Errorf("copy simulated shared artifact: %w", err)
+		}
+		return []byte("hook build complete"), nil
+	}
+
+	type buildResponse struct {
+		result PayloadResult
+		err    error
+	}
+	responses := make(chan buildResponse, 2)
+	startBuild := func() {
+		result, err := handler.GeneratePayload(testPayloadConfig())
+		responses <- buildResponse{result: result, err: err}
+	}
+	go startBuild()
+	select {
+	case <-firstEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first payload build did not enter the build hook")
+	}
+	go startBuild()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var building int
+		if err := database.SQL().QueryRow(
+			`SELECT COUNT(*) FROM payload_builds WHERE state = ?`,
+			payloadStateBuilding,
+		).Scan(&building); err != nil {
+			release()
+			t.Fatalf("count concurrent building payloads: %v", err)
+		}
+		if building == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			release()
+			t.Fatalf(
+				"second payload did not reach serialized build boundary; building=%d",
+				building,
+			)
+		}
+		runtime.Gosched()
+	}
+
+	if handler.buildMutex.TryLock() {
+		handler.buildMutex.Unlock()
+		release()
+		t.Fatal("shared build mutex was not held for the full child build")
+	}
+	stateMutex.Lock()
+	enteredBeforeRelease := invocations
+	stateMutex.Unlock()
+	if enteredBeforeRelease != 1 {
+		release()
+		t.Fatalf(
+			"concurrent build hook entries before release = %d, want 1",
+			enteredBeforeRelease,
+		)
+	}
+	release()
+
+	results := make([]PayloadResult, 0, 2)
+	for range 2 {
+		select {
+		case response := <-responses:
+			if response.err != nil {
+				t.Fatalf("generate concurrent payload: %v", response.err)
+			}
+			results = append(results, response.result)
+		case <-time.After(5 * time.Second):
+			t.Fatal("concurrent payload build did not complete")
+		}
+	}
+
+	for _, result := range results {
+		outputDir := filepath.Dir(result.Path)
+		stateMutex.Lock()
+		expectedCredential := expectedByOutput[outputDir]
+		stateMutex.Unlock()
+		if expectedCredential == "" {
+			t.Fatalf("no credential recorded for build output %s", outputDir)
+		}
+		artifact, err := os.ReadFile(result.Path)
+		if err != nil {
+			t.Fatalf("read generated artifact %s: %v", result.Path, err)
+		}
+		if string(artifact) != expectedCredential {
+			t.Fatalf(
+				"artifact %s was copied from another build's shared output",
+				result.ID,
+			)
+		}
+		decodedCredential, err := base64.RawURLEncoding.DecodeString(
+			expectedCredential,
+		)
+		if err != nil {
+			t.Fatalf("decode credential for build %s: %v", result.ID, err)
+		}
+		wantHash := sha256.Sum256(decodedCredential)
+		var storedHash []byte
+		if err := database.SQL().QueryRow(
+			`SELECT bootstrap_sha256
+			 FROM payload_bootstrap_credentials
+			 WHERE payload_build_id = ?`,
+			result.ID,
+		).Scan(&storedHash); err != nil {
+			t.Fatalf("read credential hash for build %s: %v", result.ID, err)
+		}
+		if !bytes.Equal(storedHash, wantHash[:]) {
+			t.Fatalf(
+				"artifact and durable credential disagree for build %s",
+				result.ID,
+			)
+		}
+	}
+}
+
+func TestPayloadArtifactsRemainDownloadableWithPrivatePermissions(t *testing.T) {
+	tempDir := t.TempDir()
+	payloadsDir := filepath.Join(tempDir, "payload-root")
+	if err := os.MkdirAll(payloadsDir, 0o755); err != nil {
+		t.Fatalf("create permissive payload root: %v", err)
+	}
+	if err := os.Chmod(payloadsDir, 0o755); err != nil {
+		t.Fatalf("make payload root permissive: %v", err)
+	}
+	agentDir := filepath.Join(tempDir, "agent")
+	writePlaceholderBuildScript(t, agentDir)
+	database, err := persistence.Open(filepath.Join(tempDir, "state.db"))
+	if err != nil {
+		t.Fatalf("open persistence database: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close persistence database: %v", err)
+		}
+	})
+	handler, err := NewPayloadHandlerWithPersistenceForIsolatedLab(
+		payloadsDir,
+		agentDir,
+		testListenerLookup(),
+		database,
+	)
+	if err != nil {
+		t.Fatalf("create persistent payload handler: %v", err)
+	}
+	var (
+		cargoTargetDir  string
+		cargoTargetPath string
+		cargoTargetMode os.FileMode
+	)
+	handler.runBuild = func(command *exec.Cmd) ([]byte, error) {
+		for _, entry := range command.Env {
+			name, value, found := strings.Cut(entry, "=")
+			if found && name == "CARGO_TARGET_DIR" {
+				cargoTargetDir = value
+				break
+			}
+		}
+		if cargoTargetDir == "" {
+			return nil, errors.New("build command omitted CARGO_TARGET_DIR")
+		}
+		cargoTargetPath = filepath.Join(command.Dir, cargoTargetDir)
+		targetInfo, err := os.Stat(cargoTargetPath)
+		if err != nil {
+			return nil, fmt.Errorf("stat private Cargo target: %w", err)
+		}
+		cargoTargetMode = targetInfo.Mode().Perm()
+		if err := os.MkdirAll(cargoTargetPath, 0o755); err != nil {
+			return nil, fmt.Errorf("create simulated Cargo target: %w", err)
+		}
+		if err := os.WriteFile(
+			filepath.Join(cargoTargetPath, "credential-bearing-object"),
+			[]byte("simulated build intermediate"),
+			0o644,
+		); err != nil {
+			return nil, fmt.Errorf("write simulated Cargo intermediate: %w", err)
+		}
+		for index := 0; index+1 < len(command.Args); index++ {
+			if command.Args[index] != "--output" {
+				continue
+			}
+			return []byte("hook build complete"), os.WriteFile(
+				filepath.Join(command.Args[index+1], "agent"),
+				[]byte("private agent"),
+				0o644,
+			)
+		}
+		return nil, errors.New("build command omitted --output")
+	}
+
+	result, err := handler.GeneratePayload(testPayloadConfig())
+	if err != nil {
+		t.Fatalf("generate private payload: %v", err)
+	}
+	wantCargoTargetDir := filepath.Join(
+		privateCargoBuildRoot,
+		result.ID,
+		"target",
+	)
+	if cargoTargetDir != wantCargoTargetDir {
+		t.Fatalf(
+			"CARGO_TARGET_DIR = %q, want relative private per-build path %q",
+			cargoTargetDir,
+			wantCargoTargetDir,
+		)
+	}
+	if filepath.IsAbs(cargoTargetDir) {
+		t.Fatalf("CARGO_TARGET_DIR = %q, want a Cross-visible relative path", cargoTargetDir)
+	}
+	wantCargoTargetPath := filepath.Join(agentDir, wantCargoTargetDir)
+	if cargoTargetPath != wantCargoTargetPath {
+		t.Fatalf(
+			"resolved Cargo target = %q, want %q inside agent source",
+			cargoTargetPath,
+			wantCargoTargetPath,
+		)
+	}
+	wantCargoBuildDir := filepath.Join(
+		agentDir,
+		privateCargoBuildRoot,
+		result.ID,
+	)
+	if _, err := os.Stat(wantCargoBuildDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf(
+			"private Cargo intermediates remained after build: %v",
+			err,
+		)
+	}
+	if _, err := os.Stat(filepath.Join(agentDir, "target")); !errors.Is(
+		err,
+		os.ErrNotExist,
+	) {
+		t.Fatalf("server build used shared agent target directory: %v", err)
+	}
+	if runtime.GOOS != "windows" {
+		if cargoTargetMode != 0o700 {
+			t.Fatalf(
+				"private Cargo target permissions = %04o, want 0700",
+				cargoTargetMode,
+			)
+		}
+		for _, path := range []string{
+			payloadsDir,
+			filepath.Join(payloadsDir, "debug"),
+			filepath.Join(payloadsDir, "release"),
+			filepath.Join(agentDir, privateCargoBuildRoot),
+			filepath.Dir(result.Path),
+			result.Path,
+		} {
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatalf("stat private payload path %s: %v", path, err)
+			}
+			if info.Mode().Perm() != 0o700 {
+				t.Fatalf(
+					"payload path %s permissions = %04o, want 0700",
+					path,
+					info.Mode().Perm(),
+				)
+			}
+		}
+	}
+
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"/api/payload/download/"+result.ID,
+		nil,
+	)
+	response := httptest.NewRecorder()
+	handler.HandleDownloadPayload(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf(
+			"download private payload status = %d, want 200: %s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	if response.Body.String() != "private agent" {
+		t.Fatalf("downloaded private payload = %q", response.Body.String())
+	}
+}
+
+func TestPrivateCargoBuildPathsRejectSymlinkRedirection(t *testing.T) {
+	t.Run("setup", func(t *testing.T) {
+		agentDir := t.TempDir()
+		outsideDir := t.TempDir()
+		sentinel := filepath.Join(outsideDir, "sentinel")
+		if err := os.WriteFile(sentinel, []byte("outside"), 0o600); err != nil {
+			t.Fatalf("write outside sentinel: %v", err)
+		}
+		buildRoot := filepath.Join(agentDir, privateCargoBuildRoot)
+		if err := os.Symlink(outsideDir, buildRoot); err != nil {
+			t.Skipf("filesystem does not permit symlink test: %v", err)
+		}
+
+		err := ensurePrivateCargoBuildDirectories(
+			buildRoot,
+			filepath.Join(buildRoot, "build-one"),
+			filepath.Join(buildRoot, "build-one", "target"),
+		)
+		if err == nil || !strings.Contains(err.Error(), "not a directory") {
+			t.Fatalf("symlinked private build root error = %v", err)
+		}
+		if contents, err := os.ReadFile(sentinel); err != nil {
+			t.Fatalf("symlink refusal removed outside sentinel: %v", err)
+		} else if string(contents) != "outside" {
+			t.Fatalf("outside sentinel changed to %q", contents)
+		}
+	})
+
+	t.Run("cleanup", func(t *testing.T) {
+		agentDir := t.TempDir()
+		outsideDir := t.TempDir()
+		sentinel := filepath.Join(outsideDir, "sentinel")
+		if err := os.WriteFile(sentinel, []byte("outside"), 0o600); err != nil {
+			t.Fatalf("write outside sentinel: %v", err)
+		}
+		buildRoot := filepath.Join(agentDir, privateCargoBuildRoot)
+		buildDir := filepath.Join(buildRoot, "build-one")
+		targetDir := filepath.Join(buildDir, "target")
+		if err := ensurePrivateCargoBuildDirectories(
+			buildRoot,
+			buildDir,
+			targetDir,
+		); err != nil {
+			t.Fatalf("create private Cargo build paths: %v", err)
+		}
+		if err := os.RemoveAll(buildRoot); err != nil {
+			t.Fatalf("remove private Cargo root before swap: %v", err)
+		}
+		if err := os.Symlink(outsideDir, buildRoot); err != nil {
+			t.Skipf("filesystem does not permit symlink test: %v", err)
+		}
+
+		err := removePrivateCargoBuildDirectory(
+			buildRoot,
+			buildDir,
+			targetDir,
+		)
+		if err == nil || !strings.Contains(err.Error(), "not a directory") {
+			t.Fatalf("symlinked cleanup root error = %v", err)
+		}
+		if contents, err := os.ReadFile(sentinel); err != nil {
+			t.Fatalf("symlink-safe cleanup removed outside sentinel: %v", err)
+		} else if string(contents) != "outside" {
+			t.Fatalf("outside sentinel changed to %q", contents)
+		}
+	})
+}
+
+func TestPayloadGenerateRequestRequiresOneBoundedStrictJSONValue(
+	t *testing.T,
+) {
+	handler := NewPayloadHandlerForIsolatedLab(t.TempDir(), t.TempDir())
+	testCases := []struct {
+		name       string
+		body       string
+		wantStatus int
+	}{
+		{
+			name:       "unknown field",
+			body:       `{"listener":"listener-one","unexpected":true}`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "trailing value",
+			body:       `{"listener":"listener-one"} {}`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "oversized",
+			body: `{"listener":"` +
+				strings.Repeat("a", maxPayloadRequestBytes) +
+				`"}`,
+			wantStatus: http.StatusRequestEntityTooLarge,
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"/api/payload/generate",
+				strings.NewReader(testCase.body),
+			)
+			response := httptest.NewRecorder()
+			handler.HandleGeneratePayload(response, request)
+			if response.Code != testCase.wantStatus {
+				t.Fatalf(
+					"payload request status = %d, want %d: %s",
+					response.Code,
+					testCase.wantStatus,
+					response.Body.String(),
+				)
+			}
+		})
+	}
+}
+
+func TestPayloadEnrollmentRevokeOperatorRoute(t *testing.T) {
+	tempDir := t.TempDir()
+	payloadsDir := filepath.Join(tempDir, "payload-root")
+	agentDir := filepath.Join(tempDir, "agent")
+	writePlaceholderBuildScript(t, agentDir)
+	database, err := persistence.Open(filepath.Join(tempDir, "state.db"))
+	if err != nil {
+		t.Fatalf("open persistence database: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close persistence database: %v", err)
+		}
+	})
+	handler, err := NewPayloadHandlerWithPersistenceForIsolatedLab(
+		payloadsDir,
+		agentDir,
+		testListenerLookup(),
+		database,
+	)
+	if err != nil {
+		t.Fatalf("create persistent payload handler: %v", err)
+	}
+
+	var bootstrapCredential string
+	handler.runBuild = func(command *exec.Cmd) ([]byte, error) {
+		for _, entry := range command.Env {
+			name, value, found := strings.Cut(entry, "=")
+			if found && name == "ENROLLMENT_CREDENTIAL" {
+				bootstrapCredential = value
+			}
+		}
+		for index := 0; index+1 < len(command.Args); index++ {
+			if command.Args[index] != "--output" {
+				continue
+			}
+			return []byte("hook build complete"), os.WriteFile(
+				filepath.Join(command.Args[index+1], "agent"),
+				[]byte("fake agent"),
+				0o600,
+			)
+		}
+		return nil, errors.New("build command omitted --output")
+	}
+	result, err := handler.GeneratePayload(testPayloadConfig())
+	if err != nil {
+		t.Fatalf("generate revocable payload: %v", err)
+	}
+	if bootstrapCredential == "" {
+		t.Fatal("payload build omitted its bootstrap credential")
+	}
+	enrolled, err := handler.enrollment.Enroll(
+		context.Background(),
+		enrollment.EnrollRequest{
+			ListenerID:     "listener-one",
+			AgentID:        "agent-one",
+			PayloadBuildID: result.ID,
+			Bootstrap:      bootstrapCredential,
+		},
+	)
+	if err != nil {
+		t.Fatalf("enroll existing session: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	handler.RegisterRoutes(mux)
+	revokePath := "/api/payload/" + result.ID + "/enrollment/revoke"
+	serve := func(
+		t *testing.T,
+		method string,
+		path string,
+		body string,
+	) *httptest.ResponseRecorder {
+		t.Helper()
+		request := httptest.NewRequest(method, path, strings.NewReader(body))
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, request)
+		if response.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf(
+				"%s %s Cache-Control = %q, want no-store",
+				method,
+				path,
+				response.Header().Get("Cache-Control"),
+			)
+		}
+		if strings.Contains(response.Body.String(), bootstrapCredential) {
+			t.Fatalf("%s %s exposed the bootstrap credential", method, path)
+		}
+		return response
+	}
+
+	testCases := []struct {
+		name       string
+		method     string
+		path       string
+		body       string
+		wantStatus int
+	}{
+		{
+			name:       "method",
+			method:     http.MethodGet,
+			path:       revokePath,
+			wantStatus: http.StatusMethodNotAllowed,
+		},
+		{
+			name:       "query",
+			method:     http.MethodPost,
+			path:       revokePath + "?force=true",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "nonempty body",
+			method:     http.MethodPost,
+			path:       revokePath,
+			body:       "x",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "oversized body",
+			method:     http.MethodPost,
+			path:       revokePath,
+			body:       "xx",
+			wantStatus: http.StatusRequestEntityTooLarge,
+		},
+		{
+			name:       "invalid payload ID",
+			method:     http.MethodPost,
+			path:       "/api/payload/bad$id/enrollment/revoke",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "trailing slash",
+			method:     http.MethodPost,
+			path:       revokePath + "/",
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "unknown payload",
+			method:     http.MethodPost,
+			path:       "/api/payload/unknown-build/enrollment/revoke",
+			wantStatus: http.StatusNotFound,
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			response := serve(
+				t,
+				testCase.method,
+				testCase.path,
+				testCase.body,
+			)
+			if response.Code != testCase.wantStatus {
+				t.Fatalf(
+					"status = %d, want %d: %s",
+					response.Code,
+					testCase.wantStatus,
+					response.Body.String(),
+				)
+			}
+			if testCase.name == "method" &&
+				response.Header().Get("Allow") != http.MethodPost {
+				t.Fatalf(
+					"Allow = %q, want POST",
+					response.Header().Get("Allow"),
+				)
+			}
+		})
+	}
+
+	for attempt := 0; attempt < 2; attempt++ {
+		response := serve(t, http.MethodPost, revokePath, "")
+		if response.Code != http.StatusNoContent {
+			t.Fatalf(
+				"revocation attempt %d status = %d, want 204: %s",
+				attempt+1,
+				response.Code,
+				response.Body.String(),
+			)
+		}
+		if response.Body.Len() != 0 {
+			t.Fatalf(
+				"revocation attempt %d returned a body: %q",
+				attempt+1,
+				response.Body.String(),
+			)
+		}
+	}
+
+	for _, agentID := range []string{"agent-one", "agent-two"} {
+		_, err := handler.enrollment.Enroll(
+			context.Background(),
+			enrollment.EnrollRequest{
+				ListenerID:     "listener-one",
+				AgentID:        agentID,
+				PayloadBuildID: result.ID,
+				Bootstrap:      bootstrapCredential,
+			},
+		)
+		if !errors.Is(err, enrollment.ErrUnauthorized) {
+			t.Fatalf(
+				"bootstrap after retirement for %s error = %v, want unauthorized",
+				agentID,
+				err,
+			)
+		}
+	}
+	if _, err := handler.enrollment.Authenticate(
+		context.Background(),
+		"listener-one",
+		"agent-one",
+		enrolled.Credential,
+	); err != nil {
+		t.Fatalf("existing session after build retirement: %v", err)
+	}
+}
+
+func TestPayloadGenerationRejectsInvalidSessionAllowance(t *testing.T) {
+	handler := NewPayloadHandlerForIsolatedLab(t.TempDir(), t.TempDir())
+	body, err := json.Marshal(PayloadConfig{
+		ListenerID:  "listener-one",
+		MaxSessions: 65,
+	})
+	if err != nil {
+		t.Fatalf("marshal invalid payload request: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/payload/generate",
+		bytes.NewReader(body),
+	)
+	handler.HandleGeneratePayload(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf(
+			"invalid max_sessions status = %d, want 400: %s",
+			recorder.Code,
+			recorder.Body.String(),
+		)
+	}
+}
+
+func TestPayloadHandlerRequiresExplicitLabOverrideForHTTP(t *testing.T) {
+	tempDir := withTempWorkingDir(t)
+	agentDir := filepath.Join(tempDir, "agent")
+	writeFakeBuildScript(t, agentDir)
+	writeListenerConfig(t, listeners.ListenerConfig{
+		ID:       "listener-one",
+		Name:     "lab-listener",
+		Protocol: "http",
+		BindHost: "127.0.0.1",
+		Port:     9001,
+	})
+	handler := NewPayloadHandler(
+		filepath.Join(tempDir, "static", "payloads"),
+		agentDir,
+	)
+	_, err := handler.GeneratePayload(testPayloadConfig())
+	if !errors.Is(err, common.ErrInsecureHTTPAgentTransport) {
+		t.Fatalf("HTTP payload error = %v, want explicit-lab rejection", err)
 	}
 }
 
@@ -164,7 +1374,7 @@ func TestGeneratePayloadHonoursSuppliedMutationSeed(t *testing.T) {
 		Port:     9001,
 	})
 
-	handler := NewPayloadHandler(filepath.Join(tempDir, "static", "payloads"), agentDir)
+	handler := NewPayloadHandlerForIsolatedLab(filepath.Join(tempDir, "static", "payloads"), agentDir)
 	config := PayloadConfig{
 		ListenerID:   "listener-one",
 		AgentType:    "debugAgent",
@@ -220,7 +1430,7 @@ func TestPayloadMetadataAndDownloadSurviveRestartWithCustomRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open first persistence database: %v", err)
 	}
-	firstHandler, err := NewPayloadHandlerWithPersistence(
+	firstHandler, err := NewPayloadHandlerWithPersistenceForIsolatedLab(
 		payloadsDir,
 		agentDir,
 		lookup,
@@ -305,7 +1515,7 @@ func TestPayloadMetadataAndDownloadSurviveRestartWithCustomRoot(t *testing.T) {
 			t.Errorf("close second persistence database: %v", err)
 		}
 	})
-	secondHandler, err := NewPayloadHandlerWithPersistence(
+	secondHandler, err := NewPayloadHandlerWithPersistenceForIsolatedLab(
 		payloadsDir,
 		agentDir,
 		lookup,
@@ -387,7 +1597,7 @@ func TestPayloadRestartRetainsMissingAndCorruptMetadata(t *testing.T) {
 			if err != nil {
 				t.Fatalf("open first persistence database: %v", err)
 			}
-			firstHandler, err := NewPayloadHandlerWithPersistence(
+			firstHandler, err := NewPayloadHandlerWithPersistenceForIsolatedLab(
 				payloadsDir,
 				agentDir,
 				lookup,
@@ -414,7 +1624,7 @@ func TestPayloadRestartRetainsMissingAndCorruptMetadata(t *testing.T) {
 					t.Errorf("close second persistence database: %v", err)
 				}
 			})
-			secondHandler, err := NewPayloadHandlerWithPersistence(
+			secondHandler, err := NewPayloadHandlerWithPersistenceForIsolatedLab(
 				payloadsDir,
 				agentDir,
 				lookup,
@@ -487,7 +1697,7 @@ func TestPayloadDownloadRevalidatesArtifactAfterStartup(t *testing.T) {
 			t.Errorf("close persistence database: %v", err)
 		}
 	})
-	handler, err := NewPayloadHandlerWithPersistence(
+	handler, err := NewPayloadHandlerWithPersistenceForIsolatedLab(
 		payloadsDir,
 		agentDir,
 		lookup,
@@ -543,7 +1753,7 @@ func TestPersistentBuildFailureRecordsBoundedFailedState(t *testing.T) {
 			t.Errorf("close persistence database: %v", err)
 		}
 	})
-	handler, err := NewPayloadHandlerWithPersistence(
+	handler, err := NewPayloadHandlerWithPersistenceForIsolatedLab(
 		payloadsDir,
 		agentDir,
 		testListenerLookup(),
@@ -635,7 +1845,7 @@ func TestBuildingPayloadBecomesInterruptedExactlyOnceOnRestart(t *testing.T) {
 		t.Fatalf("insert building payload metadata: %v", err)
 	}
 
-	if _, err := NewPayloadHandlerWithPersistence(
+	if _, err := NewPayloadHandlerWithPersistenceForIsolatedLab(
 		payloadsDir,
 		filepath.Join(tempDir, "agent"),
 		testListenerLookup(),
@@ -668,7 +1878,7 @@ func TestBuildingPayloadBecomesInterruptedExactlyOnceOnRestart(t *testing.T) {
 	); err != nil {
 		t.Fatalf("set interrupted sentinel detail: %v", err)
 	}
-	if _, err := NewPayloadHandlerWithPersistence(
+	if _, err := NewPayloadHandlerWithPersistenceForIsolatedLab(
 		payloadsDir,
 		filepath.Join(tempDir, "agent"),
 		testListenerLookup(),
@@ -746,7 +1956,7 @@ func TestDownloadStreamsVerifiedHandleAcrossPathSwap(t *testing.T) {
 	); err != nil {
 		t.Fatalf("insert completed payload metadata: %v", err)
 	}
-	handler, err := NewPayloadHandlerWithPersistence(
+	handler, err := NewPayloadHandlerWithPersistenceForIsolatedLab(
 		payloadsDir,
 		filepath.Join(tempDir, "agent"),
 		testListenerLookup(),

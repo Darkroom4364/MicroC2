@@ -1,22 +1,257 @@
 package listeners
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"microc2/server/internal/common"
+	"microc2/server/internal/persistence"
 )
+
+func TestProductionTransportPolicyRejectsHTTPWithoutOverride(t *testing.T) {
+	manager, err := NewProductionListenerManager(
+		nil,
+		filepath.Join(t.TempDir(), "listeners"),
+		nil,
+		common.AgentTransportPolicy{},
+	)
+	if err != nil {
+		t.Fatalf("create production listener manager: %v", err)
+	}
+
+	_, err = manager.CreateListener(ListenerConfig{
+		Name:     "plaintext",
+		Protocol: "http",
+		BindHost: "127.0.0.1",
+		Port:     12345,
+	})
+	if !errors.Is(err, common.ErrInsecureHTTPAgentTransport) {
+		t.Fatalf("HTTP listener error = %v, want insecure transport rejection", err)
+	}
+	if got := manager.ListListeners(); len(got) != 0 {
+		t.Fatalf("rejected HTTP listener was registered: %#v", got)
+	}
+}
+
+func TestDefaultConstructorsRejectHTTPWithoutOverride(t *testing.T) {
+	withTempWorkingDir(t)
+
+	manager := NewListenerManager(nil)
+	_, err := manager.CreateListener(ListenerConfig{
+		Name:     "default-plaintext",
+		Protocol: "http",
+		BindHost: "127.0.0.1",
+		Port:     12345,
+	})
+	if !errors.Is(err, common.ErrInsecureHTTPAgentTransport) {
+		t.Fatalf("default manager HTTP error = %v, want transport rejection", err)
+	}
+
+	_, err = NewListener(ListenerConfig{
+		ID:       "default-listener",
+		Name:     "default-listener",
+		Protocol: "http",
+		BindHost: "127.0.0.1",
+		Port:     12345,
+	})
+	if !errors.Is(err, common.ErrInsecureHTTPAgentTransport) {
+		t.Fatalf("default listener HTTP error = %v, want transport rejection", err)
+	}
+}
+
+func TestProductionTransportPolicyAllowsExplicitIsolatedLabHTTP(t *testing.T) {
+	database := openListenerManagerTestDatabase(t)
+	manager, err := NewProductionListenerManager(
+		nil,
+		filepath.Join(t.TempDir(), "listeners"),
+		database,
+		common.AgentTransportPolicy{AllowInsecureIsolatedLab: true},
+	)
+	if err != nil {
+		t.Fatalf("create isolated-lab listener manager: %v", err)
+	}
+
+	listener, err := manager.CreateListener(ListenerConfig{
+		Name:     "lab-http",
+		Protocol: "http",
+		BindHost: "127.0.0.1",
+		Port:     freeTCPPort(t),
+	})
+	if err != nil {
+		t.Fatalf("explicit isolated-lab HTTP listener was rejected: %v", err)
+	}
+	if err := manager.DeleteListener(listener.Config.ID); err != nil {
+		t.Fatalf("delete isolated-lab HTTP listener: %v", err)
+	}
+}
+
+func TestHTTPListenerRejectsTLSConfigurationInIsolatedLab(t *testing.T) {
+	config := ListenerConfig{
+		ID:       "mismatched-http-tls",
+		Name:     "mismatched-http-tls",
+		Protocol: "http",
+		BindHost: "127.0.0.1",
+		Port:     freeTCPPort(t),
+		TLSConfig: &TLSConfig{
+			CertFile: "server.crt",
+			KeyFile:  "server.key",
+		},
+	}
+
+	manager := NewListenerManagerForIsolatedLab(nil)
+	if _, err := manager.CreateListener(config); err == nil ||
+		!strings.Contains(err.Error(), `requires protocol "https"`) {
+		t.Fatalf(
+			"manager HTTP/TLS mismatch error = %v, want protocol rejection",
+			err,
+		)
+	}
+	if got := manager.ListListeners(); len(got) != 0 {
+		t.Fatalf("mismatched HTTP/TLS listener was registered: %#v", got)
+	}
+
+	if _, err := NewListenerForIsolatedLab(config); err == nil ||
+		!strings.Contains(err.Error(), `requires protocol "https"`) {
+		t.Fatalf(
+			"standalone HTTP/TLS mismatch error = %v, want protocol rejection",
+			err,
+		)
+	}
+}
+
+func TestProductionTransportPolicyAcceptsHTTPSWithTLS12Minimum(t *testing.T) {
+	database := openListenerManagerTestDatabase(t)
+	manager, err := NewProductionListenerManager(
+		nil,
+		filepath.Join(t.TempDir(), "listeners"),
+		database,
+		common.AgentTransportPolicy{},
+	)
+	if err != nil {
+		t.Fatalf("create production listener manager: %v", err)
+	}
+	certFile, keyFile := writeTestTLSCertificate(t)
+
+	listener, err := manager.CreateListener(ListenerConfig{
+		Name:     "secure-https",
+		Protocol: "https",
+		BindHost: "127.0.0.1",
+		Port:     freeTCPPort(t),
+		TLSConfig: &TLSConfig{
+			CertFile: certFile,
+			KeyFile:  keyFile,
+		},
+	})
+	if err != nil {
+		t.Fatalf("HTTPS listener was rejected: %v", err)
+	}
+	listener.mu.RLock()
+	serverTLSConfig := listener.server.TLSConfig
+	listener.mu.RUnlock()
+	if serverTLSConfig == nil {
+		t.Fatal("HTTPS listener has no TLS configuration")
+	}
+	if serverTLSConfig.MinVersion < tls.VersionTLS12 {
+		t.Fatalf(
+			"HTTPS minimum TLS version = %x, want at least TLS 1.2",
+			serverTLSConfig.MinVersion,
+		)
+	}
+	if err := manager.DeleteListener(listener.Config.ID); err != nil {
+		t.Fatalf("delete HTTPS listener: %v", err)
+	}
+}
+
+func openListenerManagerTestDatabase(t *testing.T) *persistence.Database {
+	t.Helper()
+	database, err := persistence.Open(
+		filepath.Join(t.TempDir(), "microc2.db"),
+	)
+	if err != nil {
+		t.Fatalf("open listener-manager test database: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close listener-manager test database: %v", err)
+		}
+	})
+	return database
+}
+
+func TestProductionTransportPolicyRejectsRequireClientCert(t *testing.T) {
+	manager, err := NewProductionListenerManager(
+		nil,
+		filepath.Join(t.TempDir(), "listeners"),
+		nil,
+		common.AgentTransportPolicy{},
+	)
+	if err != nil {
+		t.Fatalf("create production listener manager: %v", err)
+	}
+
+	_, err = manager.CreateListener(ListenerConfig{
+		Name:     "unsupported-mtls",
+		Protocol: "https",
+		BindHost: "127.0.0.1",
+		Port:     12345,
+		TLSConfig: &TLSConfig{
+			CertFile:          "unused.crt",
+			KeyFile:           "unused.key",
+			RequireClientCert: true,
+		},
+	})
+	if !errors.Is(err, common.ErrClientCertificateValidationUnavailable) {
+		t.Fatalf("requireClientCert error = %v, want unsupported mTLS rejection", err)
+	}
+}
+
+func TestAddListenerRejectsAlreadyActiveRuntime(t *testing.T) {
+	withTempWorkingDir(t)
+
+	manager := NewListenerManagerForIsolatedLab(nil)
+	listener, err := NewListenerForIsolatedLab(ListenerConfig{
+		ID:       "already-active",
+		Name:     "already-active",
+		Protocol: "http",
+		BindHost: "127.0.0.1",
+		Port:     freeTCPPort(t),
+	})
+	if err != nil {
+		t.Fatalf("create isolated-lab listener: %v", err)
+	}
+	if err := listener.Start(); err != nil {
+		t.Fatalf("start isolated-lab listener: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = listener.Stop()
+	})
+
+	err = manager.AddListener(listener)
+	if err == nil || !strings.Contains(err.Error(), "must be stopped") {
+		t.Fatalf("add active listener error = %v, want stopped-state rejection", err)
+	}
+	if got := manager.ListListeners(); len(got) != 0 {
+		t.Fatalf("active listener was imported: %#v", got)
+	}
+}
 
 func TestHTTPListenerLifecycle(t *testing.T) {
 	withTempWorkingDir(t)
 
-	manager := NewListenerManager(nil)
+	manager := NewListenerManagerForIsolatedLab(nil)
 	port := freeTCPPort(t)
 	config := ListenerConfig{
 		Name:     "lifecycle",
@@ -70,7 +305,7 @@ func TestCreateListenerBindFailureDoesNotRegister(t *testing.T) {
 	defer held.Close()
 	port := held.Addr().(*net.TCPAddr).Port
 
-	manager := NewListenerManager(nil)
+	manager := NewListenerManagerForIsolatedLab(nil)
 	_, err := manager.CreateListener(ListenerConfig{
 		Name:     "conflict",
 		Protocol: "http",
@@ -91,7 +326,7 @@ func TestCreateListenerBindFailureDoesNotRegister(t *testing.T) {
 func TestCreateListenerRejectsDuplicateName(t *testing.T) {
 	withTempWorkingDir(t)
 
-	manager := NewListenerManager(nil)
+	manager := NewListenerManagerForIsolatedLab(nil)
 	first, err := manager.CreateListener(ListenerConfig{
 		Name:     "duplicate",
 		Protocol: "http",
@@ -122,7 +357,7 @@ func TestCreateListenerRejectsDuplicateName(t *testing.T) {
 func TestCreateListenerRejectsUnsafeStorageName(t *testing.T) {
 	withTempWorkingDir(t)
 
-	manager := NewListenerManager(nil)
+	manager := NewListenerManagerForIsolatedLab(nil)
 	for _, name := range []string{
 		"../escape",
 		`..\escape`,
@@ -186,10 +421,10 @@ func TestCreateListenerRejectsUnsafeStorageName(t *testing.T) {
 func TestAllAgentsUsesUnambiguousScopedKeys(t *testing.T) {
 	withTempWorkingDir(t)
 
-	manager := NewListenerManager(nil)
+	manager := NewListenerManagerForIsolatedLab(nil)
 	addAgent := func(listenerID, name, agentID string, port int) {
 		t.Helper()
-		listener, err := NewListener(ListenerConfig{
+		listener, err := NewListenerForIsolatedLab(ListenerConfig{
 			ID:       listenerID,
 			Name:     name,
 			Protocol: "http",
@@ -233,7 +468,7 @@ func TestAllAgentsUsesUnambiguousScopedKeys(t *testing.T) {
 func TestCreateHTTPSListenerWithMissingCertDoesNotRegister(t *testing.T) {
 	withTempWorkingDir(t)
 
-	manager := NewListenerManager(nil)
+	manager := NewListenerManagerForIsolatedLab(nil)
 	_, err := manager.CreateListener(ListenerConfig{
 		Name:     "bad-tls",
 		Protocol: "https",
@@ -258,7 +493,7 @@ func TestCreateHTTPSListenerWithMissingCertDoesNotRegister(t *testing.T) {
 func TestConcurrentStartAndDeleteDoesNotLeavePortOpen(t *testing.T) {
 	withTempWorkingDir(t)
 
-	manager := NewListenerManager(nil)
+	manager := NewListenerManagerForIsolatedLab(nil)
 	port := freeTCPPort(t)
 	listener, err := manager.CreateListener(ListenerConfig{
 		Name:     "concurrent",
@@ -305,7 +540,7 @@ func TestConcurrentStartAndDeleteDoesNotLeavePortOpen(t *testing.T) {
 func TestListListenersJSONDuringLifecycle(t *testing.T) {
 	withTempWorkingDir(t)
 
-	manager := NewListenerManager(nil)
+	manager := NewListenerManagerForIsolatedLab(nil)
 	listener, err := manager.CreateListener(ListenerConfig{
 		Name:     "json-race",
 		Protocol: "http",
@@ -413,4 +648,35 @@ func assertTCPClosed(t *testing.T, port int) {
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatalf("expected %s to be closed", addr)
+}
+
+func writeTestTLSCertificate(t *testing.T) (string, string) {
+	t.Helper()
+	tlsServer := httptest.NewTLSServer(http.HandlerFunc(
+		func(http.ResponseWriter, *http.Request) {},
+	))
+	certificate := tlsServer.TLS.Certificates[0]
+	tlsServer.Close()
+
+	keyDER, err := x509.MarshalPKCS8PrivateKey(certificate.PrivateKey)
+	if err != nil {
+		t.Fatalf("marshal test TLS private key: %v", err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: certificate.Certificate[0],
+	})
+	keyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "PRIVATE KEY",
+		Bytes: keyDER,
+	})
+	certFile := filepath.Join(t.TempDir(), "listener.crt")
+	keyFile := filepath.Join(filepath.Dir(certFile), "listener.key")
+	if err := os.WriteFile(certFile, certPEM, 0o600); err != nil {
+		t.Fatalf("write test TLS certificate: %v", err)
+	}
+	if err := os.WriteFile(keyFile, keyPEM, 0o600); err != nil {
+		t.Fatalf("write test TLS private key: %v", err)
+	}
+	return certFile, keyFile
 }

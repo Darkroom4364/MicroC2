@@ -10,6 +10,7 @@ import (
 
 	"microc2/server/config"
 	"microc2/server/internal/behaviour"
+	"microc2/server/internal/common"
 	"microc2/server/internal/filestore"
 	"microc2/server/internal/handlers"
 	"microc2/server/internal/handlers/api"
@@ -102,7 +103,19 @@ func main() {
 	}
 
 	// Create and start server manager
-	serverManager, err := communication.NewServerManager(serverConfig)
+	agentTransportPolicy := common.AgentTransportPolicy{
+		AllowInsecureIsolatedLab: cfg.Security.AgentTransport.AllowInsecureIsolatedLab,
+	}
+	if agentTransportPolicy.AllowInsecureIsolatedLab {
+		log.Printf(
+			"[SECURITY WARNING] Plaintext HTTP agent listeners are enabled; " +
+				"use this override only on an isolated lab network",
+		)
+	}
+	serverManager, err := communication.NewProductionServerManager(
+		serverConfig,
+		agentTransportPolicy,
+	)
 	if err != nil {
 		log.Fatalf("Failed to create server manager: %v", err)
 	}
@@ -124,6 +137,7 @@ func main() {
 		agentSourceDir,
 		serverManager.GetListenerManager(),
 		stateDatabase,
+		agentTransportPolicy,
 	)
 	if err != nil {
 		log.Fatalf("Failed to initialize payload handler: %v", err)

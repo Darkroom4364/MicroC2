@@ -23,6 +23,48 @@ func TestLoadConfigDefaultsDurableStorageOutsideStaticRoot(t *testing.T) {
 	}
 }
 
+func TestLoadConfigDefaultsAgentTransportToSecure(t *testing.T) {
+	t.Setenv("MICROC2_STORAGE_PATH", "")
+	root := t.TempDir()
+	configPath := filepath.Join(root, "settings.yaml")
+	writeTestConfig(t, configPath, "", filepath.Join(root, "static"))
+
+	loaded, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if loaded.Security.AgentTransport.AllowInsecureIsolatedLab {
+		t.Fatal("plaintext HTTP agent transport was enabled by default")
+	}
+}
+
+func TestLoadConfigAllowsExplicitInsecureIsolatedLabOverride(t *testing.T) {
+	t.Setenv("MICROC2_STORAGE_PATH", "")
+	root := t.TempDir()
+	configPath := filepath.Join(root, "settings.yaml")
+	writeTestConfig(t, configPath, "", filepath.Join(root, "static"))
+
+	content, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read test config: %v", err)
+	}
+	content = append(
+		content,
+		[]byte("security:\n  agentTransport:\n    allowInsecureIsolatedLab: true\n")...,
+	)
+	if err := os.WriteFile(configPath, content, 0o600); err != nil {
+		t.Fatalf("write transport override: %v", err)
+	}
+
+	loaded, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if !loaded.Security.AgentTransport.AllowInsecureIsolatedLab {
+		t.Fatal("explicit isolated-lab transport override was ignored")
+	}
+}
+
 func TestLoadConfigRejectsDatabaseInsideWebStaticRoot(t *testing.T) {
 	t.Setenv("MICROC2_STORAGE_PATH", "")
 	root := t.TempDir()

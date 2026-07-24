@@ -1,5 +1,5 @@
 {
-  "manifest_version": "1.0",
+  "manifest_version": "1.1",
   "study_id": "r1-pilot-2026-07",
   "generated_by": "lab/build_matrix.sh",
   "generated_at": "2026-07-22T12:00:00Z",
@@ -11,6 +11,7 @@
       "artifact": {
         "path": "seed_5eed000000000001/agent.exe",
         "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "server_enrolled": true,
         "provenance_path": "seed_5eed000000000001/provenance.json"
       },
       "edr": {
@@ -34,7 +35,7 @@
         "agent_network_log": "r1-pilot-2026-07/slot-a/5eed000000000001/c2.log",
         "edr_export": "r1-pilot-2026-07/slot-a/5eed000000000001/edr_alerts.csv"
       },
-      "notes": "Blocked at execution (behavioral, not static): on-write scan was clean, alert fired 42 s into dwell after first beacon. Sysmon confirms process + network + DNS events present."
+      "notes": "Server-driven build. Blocked at execution (behavioral, not static): on-write scan was clean, alert fired 42 s into dwell after first beacon. Sysmon confirms process + network + DNS events present."
     },
     {
       "cell_id": "5eed000000000002@slot-a",
@@ -43,7 +44,8 @@
       "artifact": {
         "path": "seed_5eed000000000002/agent.exe",
         "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "provenance_path": "seed_5eed000000000002/provenance.json"
+        "server_enrolled": false,
+        "provenance_path": null
       },
       "edr": {
         "slot_id": "slot-a",
@@ -63,7 +65,7 @@
         "agent_network_log": null,
         "edr_export": null
       },
-      "notes": ""
+      "notes": "Standalone matrix build; not server-enrolled and therefore not eligible for a live beacon/tasking cell."
     }
   ]
 }

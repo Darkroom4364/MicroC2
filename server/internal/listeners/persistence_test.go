@@ -2,6 +2,7 @@ package listeners
 
 import (
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -9,8 +10,76 @@ import (
 	"strings"
 	"testing"
 
+	"microc2/server/internal/common"
 	"microc2/server/internal/persistence"
 )
+
+func TestDurableHTTPListenerRestartRequiresExplicitLabOverride(t *testing.T) {
+	root := t.TempDir()
+	listenersDir := filepath.Join(root, "static", "listeners")
+	database, err := persistence.Open(filepath.Join(root, "state", "microc2.db"))
+	if err != nil {
+		t.Fatalf("open persistence database: %v", err)
+	}
+	defer database.Close()
+
+	labManager, err := NewListenerManagerWithPersistenceForIsolatedLab(
+		nil,
+		listenersDir,
+		database,
+	)
+	if err != nil {
+		t.Fatalf("create isolated-lab listener manager: %v", err)
+	}
+	listener, err := labManager.CreateListener(ListenerConfig{
+		Name:     "durable-http",
+		Protocol: "http",
+		BindHost: "127.0.0.1",
+		Port:     freeTCPPort(t),
+	})
+	if err != nil {
+		t.Fatalf("create durable HTTP listener: %v", err)
+	}
+	if err := listener.Stop(); err != nil {
+		t.Fatalf("stop runtime before simulated restart: %v", err)
+	}
+
+	_, err = NewListenerManagerWithPersistence(
+		nil,
+		listenersDir,
+		database,
+	)
+	if !errors.Is(err, common.ErrInsecureHTTPAgentTransport) {
+		t.Fatalf("default secure restart error = %v, want insecure transport rejection", err)
+	}
+
+	_, err = NewProductionListenerManager(
+		nil,
+		listenersDir,
+		database,
+		common.AgentTransportPolicy{},
+	)
+	if !errors.Is(err, common.ErrInsecureHTTPAgentTransport) {
+		t.Fatalf("secure restart error = %v, want insecure transport rejection", err)
+	}
+
+	restarted, err := NewProductionListenerManager(
+		nil,
+		listenersDir,
+		database,
+		common.AgentTransportPolicy{AllowInsecureIsolatedLab: true},
+	)
+	if err != nil {
+		t.Fatalf("restart with explicit isolated-lab override: %v", err)
+	}
+	reloaded, err := restarted.GetListener(listener.Config.ID)
+	if err != nil {
+		t.Fatalf("get reloaded HTTP listener: %v", err)
+	}
+	if got := reloaded.GetStatus(); got != StatusStopped {
+		t.Fatalf("reloaded HTTP listener status = %s, want %s", got, StatusStopped)
+	}
+}
 
 func TestListenerLifecycleEventsSurviveRestartAndRecoverStopped(t *testing.T) {
 	root := t.TempDir()
@@ -21,7 +90,7 @@ func TestListenerLifecycleEventsSurviveRestartAndRecoverStopped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open persistence database: %v", err)
 	}
-	manager, err := NewListenerManagerWithPersistence(nil, listenersDir, database)
+	manager, err := NewListenerManagerWithPersistenceForIsolatedLab(nil, listenersDir, database)
 	if err != nil {
 		t.Fatalf("create durable listener manager: %v", err)
 	}
@@ -56,7 +125,7 @@ func TestListenerLifecycleEventsSurviveRestartAndRecoverStopped(t *testing.T) {
 		t.Fatalf("reopen persistence database: %v", err)
 	}
 	defer database.Close()
-	restarted, err := NewListenerManagerWithPersistence(nil, listenersDir, database)
+	restarted, err := NewListenerManagerWithPersistenceForIsolatedLab(nil, listenersDir, database)
 	if err != nil {
 		t.Fatalf("reload durable listener manager: %v", err)
 	}
@@ -75,7 +144,7 @@ func TestListenerLifecycleEventsSurviveRestartAndRecoverStopped(t *testing.T) {
 
 	// Reconciliation is idempotent: a second reload does not append another
 	// recovery transition.
-	reloadedAgain, err := NewListenerManagerWithPersistence(nil, listenersDir, database)
+	reloadedAgain, err := NewListenerManagerWithPersistenceForIsolatedLab(nil, listenersDir, database)
 	if err != nil {
 		t.Fatalf("reload listener manager twice: %v", err)
 	}
@@ -96,7 +165,7 @@ func TestDeletedListenerIsNotResurrectedByStaleConfig(t *testing.T) {
 	}
 	defer database.Close()
 
-	manager, err := NewListenerManagerWithPersistence(nil, listenersDir, database)
+	manager, err := NewListenerManagerWithPersistenceForIsolatedLab(nil, listenersDir, database)
 	if err != nil {
 		t.Fatalf("create durable listener manager: %v", err)
 	}
@@ -128,7 +197,7 @@ func TestDeletedListenerIsNotResurrectedByStaleConfig(t *testing.T) {
 		t.Fatalf("write stale config: %v", err)
 	}
 
-	restarted, err := NewListenerManagerWithPersistence(nil, listenersDir, database)
+	restarted, err := NewListenerManagerWithPersistenceForIsolatedLab(nil, listenersDir, database)
 	if err != nil {
 		t.Fatalf("reload listener manager: %v", err)
 	}
@@ -157,7 +226,7 @@ func TestFailedDurableCreateIsTombstonedBeforeSameNameRetry(t *testing.T) {
 	}
 	port := heldPort.Addr().(*net.TCPAddr).Port
 
-	manager, err := NewListenerManagerWithPersistence(nil, listenersDir, database)
+	manager, err := NewListenerManagerWithPersistenceForIsolatedLab(nil, listenersDir, database)
 	if err != nil {
 		t.Fatalf("create durable listener manager: %v", err)
 	}
@@ -228,7 +297,7 @@ func TestFailedDurableCreateIsTombstonedBeforeSameNameRetry(t *testing.T) {
 	if err := retried.Stop(); err != nil {
 		t.Fatalf("close retried listener socket: %v", err)
 	}
-	restarted, err := NewListenerManagerWithPersistence(nil, listenersDir, database)
+	restarted, err := NewListenerManagerWithPersistenceForIsolatedLab(nil, listenersDir, database)
 	if err != nil {
 		t.Fatalf("restart after same-name retry: %v", err)
 	}
@@ -326,7 +395,7 @@ func TestDurableCreateRejectsSymlinkedListenerDirectory(t *testing.T) {
 		t.Fatalf("open persistence database: %v", err)
 	}
 	defer database.Close()
-	manager, err := NewListenerManagerWithPersistence(nil, listenersDir, database)
+	manager, err := NewListenerManagerWithPersistenceForIsolatedLab(nil, listenersDir, database)
 	if err != nil {
 		t.Fatalf("create durable listener manager: %v", err)
 	}
@@ -377,7 +446,7 @@ func TestDurableStartupRejectsNonPortableListenerNames(t *testing.T) {
 				Port:     41601,
 			}, StatusStopped, "")
 			listenersDir := filepath.Join(root, "static", "listeners")
-			if _, err := NewListenerManagerWithPersistence(
+			if _, err := NewListenerManagerWithPersistenceForIsolatedLab(
 				nil,
 				listenersDir,
 				database,
@@ -416,7 +485,7 @@ func TestDurableStartupFailsExplicitlyForUnsafeDiskOnlyName(t *testing.T) {
 		t.Fatalf("open persistence database: %v", err)
 	}
 	defer database.Close()
-	if _, err := NewListenerManagerWithPersistence(
+	if _, err := NewListenerManagerWithPersistenceForIsolatedLab(
 		nil,
 		listenersDir,
 		database,
@@ -477,7 +546,7 @@ func TestDurableListenersLoadWithoutConfigDirectoryAndRecoverGlobally(t *testing
 	insertDurableListenerForTest(t, database, configs[1], StatusError, "listen failed")
 	insertDurableListenerForTest(t, database, configs[2], StatusStopped, "")
 
-	manager, err := NewListenerManagerWithPersistence(nil, listenersDir, database)
+	manager, err := NewListenerManagerWithPersistenceForIsolatedLab(nil, listenersDir, database)
 	if err != nil {
 		t.Fatalf("load database-only listeners: %v", err)
 	}
@@ -552,7 +621,7 @@ func TestDurableListenersLoadWithoutConfigDirectoryAndRecoverGlobally(t *testing
 	}
 	assertListenerEventTypes(t, stoppedEvents)
 
-	restarted, err := NewListenerManagerWithPersistence(nil, listenersDir, database)
+	restarted, err := NewListenerManagerWithPersistenceForIsolatedLab(nil, listenersDir, database)
 	if err != nil {
 		t.Fatalf("reload recovered listeners: %v", err)
 	}
@@ -600,7 +669,7 @@ func TestDurableListenerRecoveryRollsBackAsOneUnit(t *testing.T) {
 		t.Fatalf("corrupt durable listener checksum: %v", err)
 	}
 
-	if _, err := NewListenerManagerWithPersistence(
+	if _, err := NewListenerManagerWithPersistenceForIsolatedLab(
 		nil,
 		filepath.Join(root, "static", "listeners"),
 		database,
@@ -661,7 +730,7 @@ func TestDurableListenerConfigOverridesStaleProjection(t *testing.T) {
 	}
 	writeProjectionForTest(t, listenersDir, stale)
 
-	manager, err := NewListenerManagerWithPersistence(nil, listenersDir, database)
+	manager, err := NewListenerManagerWithPersistenceForIsolatedLab(nil, listenersDir, database)
 	if err != nil {
 		t.Fatalf("load authoritative durable listener: %v", err)
 	}
@@ -729,7 +798,7 @@ func TestDiskOnlyListenerIsImportedThenProjectionIsRedacted(t *testing.T) {
 	}
 	writeProjectionForTest(t, listenersDir, config)
 
-	manager, err := NewListenerManagerWithPersistence(nil, listenersDir, database)
+	manager, err := NewListenerManagerWithPersistenceForIsolatedLab(nil, listenersDir, database)
 	if err != nil {
 		t.Fatalf("import disk-only listener: %v", err)
 	}
@@ -789,7 +858,7 @@ func TestLegacySpacedListenerNameImportsAndRestarts(t *testing.T) {
 	}
 	writeProjectionForTest(t, listenersDir, config)
 
-	manager, err := NewListenerManagerWithPersistence(nil, listenersDir, database)
+	manager, err := NewListenerManagerWithPersistenceForIsolatedLab(nil, listenersDir, database)
 	if err != nil {
 		t.Fatalf("import legacy spaced listener: %v", err)
 	}
@@ -802,7 +871,7 @@ func TestLegacySpacedListenerNameImportsAndRestarts(t *testing.T) {
 	}
 	assertListenerEventTypes(t, events, "imported")
 
-	restarted, err := NewListenerManagerWithPersistence(nil, listenersDir, database)
+	restarted, err := NewListenerManagerWithPersistenceForIsolatedLab(nil, listenersDir, database)
 	if err != nil {
 		t.Fatalf("restart with legacy spaced listener: %v", err)
 	}

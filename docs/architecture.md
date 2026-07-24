@@ -41,6 +41,7 @@ multi-user authorization system.
 | `server/cmd/server.go` | Server entry point, config loading, route registration, TLS startup. |
 | `server/config/` | YAML config types and defaults for the Go server. |
 | `server/internal/persistence/` | Process-wide SQLite bootstrap, durability settings, and embedded migrations. |
+| `server/internal/enrollment/` | Bootstrap verification, durable listener-scoped sessions, rotation, revocation, and re-enrollment. |
 | `server/internal/tasks/` | Typed in-memory test store and listener-scoped durable task/result store. |
 | `server/internal/listeners/` | Listener lifecycle, configuration persistence, start/stop/delete logic. |
 | `server/internal/behaviour/` | HTTP polling protocol used by active agents. |
@@ -94,6 +95,9 @@ are visible during development.
 | `/api/listeners/{id}/start` | `internal/handlers/api` | Start a stopped listener. |
 | `/api/listeners/{id}/stop` | `internal/handlers/api` | Stop a running listener. |
 | `/api/listeners/{id}/events` | `internal/handlers/api` | List the listener's durable lifecycle events in sequence order. |
+| `/api/listeners/{id}/agents/{agent_id}/session/rotate` | `internal/handlers/api` | Begin two-phase session-credential rotation; returns metadata, never a bearer. |
+| `/api/listeners/{id}/agents/{agent_id}/session/revoke` | `internal/handlers/api` | Immediately revoke an agent session. |
+| `/api/listeners/{id}/agents/{agent_id}/session/re-enroll` | `internal/handlers/api` | Explicitly authorize the next valid bootstrap to replace the session. |
 | `/api/agents/list` | `internal/handlers/api` | Aggregate agents across listeners. |
 | `/api/agents/{id}/tasks` | `internal/handlers/api` | `POST` a typed task or `GET` a bounded, paginated page of newest-first task summaries. |
 | `/api/agents/{id}/tasks/{task_id}` | `internal/handlers/api` | Get one full Task v1 resource, including terminal stdout/stderr. |
@@ -107,6 +111,7 @@ are visible during development.
 | `/api/file_drop/delete/{name}` | `internal/handlers/api` | Delete a file-drop item. |
 | `/api/payload/generate` | `internal/handlers/api/payload` | Build an agent payload from a listener and payload config. |
 | `/api/payload/download/{id}` | `internal/handlers/api/payload` | Revalidate and download a generated payload tracked by durable metadata. |
+| `/api/payload/{id}/enrollment/revoke` | `internal/handlers/api/payload` | Idempotently retire future bootstrap enrollment while preserving issued sessions. |
 | `/ws/logs` | `internal/handlers/ws` | Stream recent and live server logs. |
 | `/ws/terminal` | `internal/handlers/ws` | Browser-accessible shell on the server host. |
 
@@ -166,19 +171,22 @@ bound host and port.
 
 | Route | Method | Purpose |
 | --- | --- | --- |
-| `/api/agent/{agent_id}/heartbeat` | `POST` | Agent reports ID, OS, host, IPs, and last-seen data. |
+| `/api/agent/{agent_id}/heartbeat` | `POST` | Authenticate or enroll, then report ID, listener/payload binding, OS, host, IPs, and last-seen data. |
 | `/api/agent/{agent_id}/tasks` | `GET` | Dispatch the next Task v1 resource, or return `204 No Content`. |
 | `/api/agent/{agent_id}/tasks/{task_id}/status` | `POST` | Accept a Task Status Update v1; the initial contract supports `running`. |
 | `/api/agent/{agent_id}/results` | `POST` | Accept a terminal Task Result v1 correlated by task and agent ID. |
 | `/api/agent/{agent_id}/command` | `GET` | Deprecated raw-command poll adapter; it dispatches only tasks created through legacy operator routes. |
 | `/api/agent/{agent_id}/result` | `POST` | Deprecated raw-result adapter into the typed lifecycle store. |
 
-Runtime agent IDs currently provide correlation, not authentication. Until
-authenticated enrollment tracked by #104 lands, listener ports must be exposed
-only inside an isolated, authorized lab; an untrusted client that learns an
-agent ID could otherwise poll its task or forge a status/result. Verified TLS
-protects transport confidentiality but does not by itself bind a request to an
-enrolled runtime identity.
+Every non-preflight agent route requires a bearer credential bound to the
+listener, runtime agent ID, payload/build ID, opaque session, and generation.
+The first heartbeat exchanges a per-build bootstrap for a session credential;
+task polls, status updates, typed results, and legacy adapters accept only a
+valid session credential after a fresh authenticated heartbeat in the current
+server process. Cross-agent, cross-listener, stale, revoked, and
+post-confirmation bootstrap replays fail closed. See
+[agent-enrollment.md](agent-enrollment.md) for confirmation, rotation, and
+recovery semantics.
 
 The active protocol stores agents, task queues, lifecycle state, and results in
 listener-scoped SQLite records. Server restart preserves this history. A
@@ -205,22 +213,31 @@ listener tombstone prevents a stale config file from resurrecting it.
 HTTP and HTTPS listener protocols are implemented. DNS and DNS-over-HTTPS are
 explicitly rejected as not implemented. SOCKS5 code exists under
 `server/internal/protocols`, but the primary listener creation path supports
-HTTP(S) today.
+HTTP(S) today. Production composition rejects plain HTTP unless the explicit
+isolated-lab policy is enabled, and generated payloads always verify HTTPS
+servers through the system trust store. `requireClientCert` is rejected until
+CA-backed mTLS verification exists.
 
 ### Payload Builder
 
 The payload generator is a server-side wrapper around the Rust agent build
 script. It requires a selected listener, derives the connection URL from that
-listener, writes an agent `config.json`, invokes `agent/build.sh`, and tracks the
-generated payload's metadata, size, SHA-256 digest, relative artifact path, and
-provenance in SQLite. The artifact itself remains under the configured payload
-root.
+listener, invokes `agent/build.sh`, and tracks the generated payload's metadata,
+size, SHA-256 digest, relative artifact path, and provenance in SQLite. Each
+build also receives a fresh random enrollment bootstrap through the build
+subprocess environment. Only its SHA-256 digest is persisted; the raw value is
+embedded in the payload and excluded from logs, responses, provenance, and
+sidecar configuration. The artifact itself remains under the configured
+payload root with owner-only directory and artifact permissions.
 
 Listener, payload/build, and runtime agent IDs are distinct. A selected listener
 provides connection configuration, each build receives its own payload ID, and
 each execution enrolls with a runtime agent ID. Build provenance is present but
 still partial; issue #99 tracks supported-profile validation, canonical output
-paths, and the complete inspectable manifest. The build row begins in
+paths, and the complete inspectable manifest. A source revision and mutation
+seed reproduce mutation choices, but cannot recreate the exact production
+artifact without its deliberately unrecorded random bootstrap secret. The build
+row begins in
 `building`, then transitions to `completed` or `failed`; startup turns a
 leftover build into `interrupted` without resuming it. Startup and download-time
 revalidation keep a completed indexed artifact in `completed`, `missing`, or
@@ -236,7 +253,8 @@ filesystem artifacts:
 - Durable database: configured by `storage.path`, default
   `data/microc2.db`, with `MICROC2_STORAGE_PATH` as the environment override.
 - SQLite records: listeners and lifecycle events, historical agents, typed
-  tasks and results, legacy result projections, and payload-build metadata.
+  tasks and results, legacy result projections, payload-build metadata,
+  bootstrap hashes/allowances, the enrollment HMAC key, and durable sessions.
 - Listener compatibility configs: redacted, regenerable JSON projections under
   `{server.staticDir}/listeners/`.
 - Operator uploads: configured server upload directory, default `uploads`.
@@ -254,24 +272,38 @@ restore, and upgrade guidance.
 ## Agent
 
 The Rust agent loads an embedded build-time config generated by `agent/build.rs`.
-If no valid embedded config exists, it falls back to `.config/config.json` beside
-the executable. Config includes the server URL, payload ID, protocol, sleep and
-jitter settings, SOCKS5 settings, TLS verification behavior, user-agent, and
-OPSEC threshold parameters.
+If no valid embedded config exists, it falls back to `.config/config.json`
+beside the executable. Config includes the server URL, listener and payload IDs,
+the embedded bootstrap credential, protocol, sleep and jitter settings, SOCKS5
+settings, TLS verification behavior, user-agent, and OPSEC threshold
+parameters. Secret-aware debug formatting redacts the bootstrap. Sidecar
+configs deliberately contain an empty enrollment field.
 
 At runtime the agent:
 
 1. Runs a Windows-only dormant startup gate before initialization.
 2. Loads config and creates the HTTP client.
-3. Starts SOCKS5/pivot background tasks when configured.
-4. Enters an OPSEC assessment loop.
-5. Sends heartbeat data when allowed.
-6. Polls for one typed task at a time.
-7. Retains the task until an exact running acknowledgement is accepted.
-8. Dispatches by task type and executes shell tasks with their configured
+3. Resolves its runtime ID and loads a matching tuple-bound session from the
+   current user's platform state directory, if present.
+4. Starts SOCKS5/pivot background tasks when configured.
+5. Enters an OPSEC assessment loop and, when allowed, sends an authenticated
+   heartbeat with the stored session or embedded bootstrap.
+6. Persists a returned session credential atomically and uses it on all
+   lifecycle requests.
+7. Polls for one typed task at a time.
+8. Retains the task until an exact running acknowledgement is accepted.
+9. Dispatches by task type and executes shell tasks with their configured
    process-group/job-object timeout and bounded output capture.
-9. Retains and retries the exact correlated result until the listener accepts
+10. Retains and retries the exact correlated result until the listener accepts
    it, without executing the task again.
+
+Agent state is rooted at `$XDG_STATE_HOME/microc2/agent` on Linux (falling back
+to `$HOME/.local/state/microc2/agent`), at
+`$HOME/Library/Application Support/microc2/agent` on macOS, and at
+`%LOCALAPPDATA%\microc2\agent` on Windows. Listener, payload, and agent IDs are
+encoded as separate unpadded-base64url path components. Windows protects the
+session bearer with current-user DPAPI; Unix state directories and files use
+`0700` and `0600` permissions.
 
 Shell Task v1 is the active end-to-end format. File transfer, pivot control, and
 future modules must add explicit task types and schemas rather than parse
@@ -330,10 +362,9 @@ The main remaining gaps are tracked as issues:
 
 - #98: typed shell task/result v1 is complete; deprecated raw-command adapters
   remain only for compatibility.
-- #97: durable storage is implemented on the current development branch and
-  remains subject to review, CI, and merge into `dev`.
-- #104: bind tasking to authenticated agent enrollment before any promotion
-  beyond an isolated lab.
+- #97: durable storage is merged into `dev`.
+- #104: authenticated agent enrollment is complete for the `dev` integration
+  line; it does not imply a `dev` to `main` promotion.
 - #100: add structured, durable audit events.
 - #88: add file transfer and pivot controls as typed task families after #98.
 - #99: finish payload validation and manifests; current provenance is partial.
