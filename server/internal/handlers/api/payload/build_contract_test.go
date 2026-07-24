@@ -1,0 +1,335 @@
+package payload
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestValidateAndResolvePayloadConfigSupportedProfiles(t *testing.T) {
+	testCases := []struct {
+		name       string
+		agentType  string
+		format     string
+		wantTarget string
+		wantOS     string
+		wantFile   string
+		wantBuild  string
+	}{
+		{
+			name:       "Linux release ELF",
+			agentType:  "agent",
+			format:     "linux_elf",
+			wantTarget: "x86_64-unknown-linux-gnu",
+			wantOS:     "linux",
+			wantFile:   "agent",
+			wantBuild:  "release",
+		},
+		{
+			name:       "Windows debug executable",
+			agentType:  "debugAgent",
+			format:     "windows_exe",
+			wantTarget: "x86_64-pc-windows-gnu",
+			wantOS:     "windows",
+			wantFile:   "agent.exe",
+			wantBuild:  "debug",
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			config := validPayloadBuildConfig()
+			config.AgentType = testCase.agentType
+			config.Format = testCase.format
+			plan, err := validateAndResolvePayloadConfig(config)
+			if err != nil {
+				t.Fatalf("resolve supported profile: %v", err)
+			}
+			if plan.profile.targetTriple != testCase.wantTarget ||
+				plan.profile.targetOS != testCase.wantOS ||
+				plan.profile.filename != testCase.wantFile ||
+				plan.buildType != testCase.wantBuild {
+				t.Fatalf("resolved profile = %#v, want target=%q os=%q file=%q build=%q",
+					plan,
+					testCase.wantTarget,
+					testCase.wantOS,
+					testCase.wantFile,
+					testCase.wantBuild,
+				)
+			}
+			if plan.config.Socks5Host != "127.0.0.1" ||
+				plan.config.Socks5Port != 9050 ||
+				plan.config.SleepTechnique != "standard" {
+				t.Fatalf("resolved defaults are incomplete: %#v", plan.config)
+			}
+		})
+	}
+}
+
+func TestValidateAndResolvePayloadConfigRejectsUnsupportedOptions(
+	t *testing.T,
+) {
+	testCases := []struct {
+		name   string
+		field  string
+		mutate func(*PayloadConfig)
+	}{
+		{
+			name:  "unknown agent type",
+			field: "agentType",
+			mutate: func(config *PayloadConfig) {
+				config.AgentType = "stealth"
+			},
+		},
+		{
+			name:  "x86 architecture",
+			field: "architecture/format",
+			mutate: func(config *PayloadConfig) {
+				config.Architecture = "x86"
+			},
+		},
+		{
+			name:  "ARM64 architecture",
+			field: "architecture/format",
+			mutate: func(config *PayloadConfig) {
+				config.Architecture = "arm64"
+			},
+		},
+		{
+			name:  "DLL format",
+			field: "architecture/format",
+			mutate: func(config *PayloadConfig) {
+				config.Format = "windows_dll"
+			},
+		},
+		{
+			name:  "service format",
+			field: "architecture/format",
+			mutate: func(config *PayloadConfig) {
+				config.Format = "windows_service"
+			},
+		},
+		{
+			name:  "shellcode format",
+			field: "architecture/format",
+			mutate: func(config *PayloadConfig) {
+				config.Format = "windows_shellcode"
+			},
+		},
+		{
+			name:  "indirect syscalls",
+			field: "indirectSyscall",
+			mutate: func(config *PayloadConfig) {
+				config.IndirectSyscall = true
+			},
+		},
+		{
+			name:  "custom sleep",
+			field: "sleepTechnique",
+			mutate: func(config *PayloadConfig) {
+				config.SleepTechnique = "modified"
+			},
+		},
+		{
+			name:  "DLL sideloading",
+			field: "dllSideloading",
+			mutate: func(config *PayloadConfig) {
+				config.DllSideloading = true
+			},
+		},
+		{
+			name:  "ignored exit threshold",
+			field: "OPSEC exit thresholds",
+			mutate: func(config *PayloadConfig) {
+				config.BaseThresholdExitFullOpsec = 30
+			},
+		},
+		{
+			name:  "zero sleep",
+			field: "sleep",
+			mutate: func(config *PayloadConfig) {
+				config.Sleep = 0
+			},
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			config := validPayloadBuildConfig()
+			testCase.mutate(&config)
+			_, err := validateAndResolvePayloadConfig(config)
+			var validationError *payloadConfigValidationError
+			if !errors.As(err, &validationError) {
+				t.Fatalf("validation error = %v, want typed validation error", err)
+			}
+			if validationError.field != testCase.field {
+				t.Fatalf(
+					"validation field = %q, want %q",
+					validationError.field,
+					testCase.field,
+				)
+			}
+		})
+	}
+}
+
+func TestPayloadGenerateRejectsUnsupportedProfileBeforeBuild(t *testing.T) {
+	handler := NewPayloadHandlerForIsolatedLab(t.TempDir(), t.TempDir())
+	buildCalls := 0
+	handler.runBuild = func(*exec.Cmd) ([]byte, error) {
+		buildCalls++
+		return nil, nil
+	}
+	config := validPayloadBuildConfig()
+	config.Format = "windows_shellcode"
+	body, err := json.Marshal(config)
+	if err != nil {
+		t.Fatalf("marshal payload config: %v", err)
+	}
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/payload/generate",
+		bytes.NewReader(body),
+	)
+	response := httptest.NewRecorder()
+	handler.HandleGeneratePayload(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf(
+			"unsupported profile status = %d, want 400: %s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	if !strings.Contains(response.Body.String(), "architecture/format") {
+		t.Fatalf("validation response is not actionable: %q", response.Body.String())
+	}
+	if buildCalls != 0 {
+		t.Fatalf("invalid profile invoked build %d times", buildCalls)
+	}
+}
+
+func TestManifestUsesExactCredentialFreeConfigExportedByBuild(t *testing.T) {
+	tempDir := t.TempDir()
+	agentDir := filepath.Join(tempDir, "agent")
+	writePlaceholderBuildScript(t, agentDir)
+	handler, err := newPayloadHandler(
+		filepath.Join(tempDir, "payloads"),
+		agentDir,
+		testListenerLookup(),
+		nil,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("create payload handler: %v", err)
+	}
+	handler.runBuild = func(command *exec.Cmd) ([]byte, error) {
+		values := make(map[string]string)
+		for _, entry := range command.Env {
+			name, value, found := strings.Cut(entry, "=")
+			if found {
+				values[name] = value
+			}
+		}
+		outputDir := ""
+		for index := 0; index+1 < len(command.Args); index++ {
+			if command.Args[index] == "--output" {
+				outputDir = command.Args[index+1]
+				break
+			}
+		}
+		if outputDir == "" {
+			return nil, errors.New("build command omitted --output")
+		}
+		if err := os.WriteFile(
+			filepath.Join(outputDir, "agent"),
+			[]byte("fake agent"),
+			0o600,
+		); err != nil {
+			return nil, err
+		}
+		effectivePath := values["EFFECTIVE_CONFIG_PATH"]
+		if !filepath.IsAbs(effectivePath) {
+			effectivePath = filepath.Join(command.Dir, effectivePath)
+		}
+		effective := map[string]interface{}{
+			"server_url":                           values["SERVER_URL"],
+			"payload_id":                           values["PAYLOAD_ID"],
+			"agent_id":                             "",
+			"listener_id":                          values["LISTENER_ID"],
+			"mutation_seed":                        values["MUTATION_SEED"],
+			"protocol":                             values["PROTOCOL"],
+			"socks5_enabled":                       true,
+			"user_agent":                           "seed-selected-user-agent",
+			"mutation_endpoint_segments":           []string{"first-segment", "second-segment"},
+			"allow_invalid_certs":                  false,
+			"allow_insecure_isolated_lab":          true,
+			"c2_failure_threshold_increase_factor": 1.23,
+		}
+		data, err := json.Marshal(effective)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(effectivePath, data, 0o600); err != nil {
+			return nil, err
+		}
+		return []byte("hook build complete"), nil
+	}
+
+	config := testPayloadConfig()
+	config.Socks5Enabled = true
+	config.C2FailureThresholdIncreaseFactor = 1.234
+	result, err := handler.GeneratePayload(config)
+	if err != nil {
+		t.Fatalf("generate payload: %v", err)
+	}
+	if result.Manifest == nil {
+		t.Fatal("generation result omitted its build manifest")
+	}
+	var effective map[string]interface{}
+	if err := json.Unmarshal(result.Manifest.EffectiveConfig, &effective); err != nil {
+		t.Fatalf("decode effective config: %v", err)
+	}
+	if effective["protocol"] != "http" ||
+		effective["socks5_enabled"] != true ||
+		effective["user_agent"] != "seed-selected-user-agent" ||
+		effective["c2_failure_threshold_increase_factor"] != 1.23 {
+		t.Fatalf("manifest did not preserve exact build export: %#v", effective)
+	}
+	publishedConfig, err := os.ReadFile(
+		filepath.Join(filepath.Dir(result.Path), "config.json"),
+	)
+	if err != nil {
+		t.Fatalf("read published effective config: %v", err)
+	}
+	if !bytes.Equal(publishedConfig, result.Manifest.EffectiveConfig) {
+		t.Fatalf(
+			"published config differs from manifest: %s != %s",
+			publishedConfig,
+			result.Manifest.EffectiveConfig,
+		)
+	}
+	sidecar, err := os.ReadFile(
+		filepath.Join(filepath.Dir(result.Path), "provenance.json"),
+	)
+	if err != nil {
+		t.Fatalf("read manifest sidecar: %v", err)
+	}
+	if _, err := decodePayloadBuildManifest(sidecar); err != nil {
+		t.Fatalf("manifest sidecar failed its decoder: %v", err)
+	}
+}
+
+func validPayloadBuildConfig() PayloadConfig {
+	return PayloadConfig{
+		ListenerID:   "listener-one",
+		AgentType:    "debugAgent",
+		Architecture: "x64",
+		Format:       "linux_elf",
+		Sleep:        5,
+	}
+}

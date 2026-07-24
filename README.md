@@ -265,9 +265,12 @@ This framework was built by someone running on way too much caffeine. If you enc
 
 ### Building Payloads
 - Use the Payload Generator in the web UI to generate agent binaries for your
-  target OS/architecture. Each production build receives a new secret
-  enrollment input; source revision and mutation seed reproduce mutation
-  choices, but do not recreate a byte-identical credential-bearing artifact.
+  target OS/architecture. The exact supported profiles, validation rules,
+  deterministic output path, manifest API, and download integrity headers are
+  documented in [Payload build contract](docs/payload-builds.md).
+- Each production build receives a new secret enrollment input; source
+  revision and mutation seed reproduce mutation choices, but do not recreate a
+  byte-identical credential-bearing artifact.
 
 ### File Drop
 - Upload and download files via the File Drop section in the web UI. Folder in codebase is /server/uploads/

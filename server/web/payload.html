@@ -43,8 +43,6 @@
                                 <label for="architecture">Architecture</label>
                                 <select id="architecture" name="architecture" required>
                                     <option value="x64">x64</option>
-                                    <option value="x86">x86</option>
-                                    <option value="arm64">ARM64</option>
                                 </select>
                             </div>
 
@@ -52,9 +50,6 @@
                                 <label for="format">Format</label>
                                 <select id="format" name="format" required>
                                     <option value="windows_exe">Windows EXE</option>
-                                    <option value="windows_dll">Windows DLL</option>
-                                    <option value="windows_shellcode">Windows Shellcode</option>
-                                    <option value="windows_service">Windows Service EXE</option>
                                     <option value="linux_elf">Linux ELF</option>
                                 </select>
                             </div>
@@ -63,48 +58,8 @@
                         <div class="form-section">
                             <h3>Advanced Options</h3>
                             <div class="form-group">
-                                <label class="checkbox-label">
-                                    <input type="checkbox" id="opsec" name="opsec">
-                                    Enable OPSEC
-                                </label>
-                            </div>
-                            <div class="form-group">
                                 <label for="sleep">Sleep Interval (seconds)</label>
                                 <input type="number" id="sleep" name="sleep" value="60">
-                            </div>
-
-                            <div class="form-group">
-                                <label class="checkbox-label">
-                                    <input type="checkbox" id="indirectSyscall" name="indirectSyscall">
-                                    Enable Indirect Syscalls
-                                </label>
-                            </div>
-
-                            <div class="form-group">
-                                <label for="sleepTechnique">Sleep Technique</label>
-                                <select id="sleepTechnique" name="sleepTechnique">
-                                    <option value="standard">Standard</option>
-                                    <option value="winapi">WinAPI</option>
-                                    <option value="modified">Modified/Obfuscated</option>
-                                </select>
-                            </div>
-
-                            <div class="form-group">
-                                <label class="checkbox-label">
-                                    <input type="checkbox" id="dllSideloading" name="dllSideloading">
-                                    Enable DLL Sideloading
-                                </label>
-                            </div>
-
-                            <div id="sideloadingOptions" class="hidden">
-                                <div class="form-group">
-                                    <label for="sideloadDll">Sideload DLL Name</label>
-                                    <input type="text" id="sideloadDll" name="sideloadDll">
-                                </div>
-                                <div class="form-group">
-                                    <label for="exportName">Export Name</label>
-                                    <input type="text" id="exportName" name="exportName">
-                                </div>
                             </div>
                         </div>
 
@@ -138,19 +93,9 @@
                                 <small>Base score (0-100) to transition into Full OPSEC mode.</small>
                             </div>
                             <div class="form-group">
-                                <label for="base_threshold_exit_full_opsec">Score Threshold to Exit Full OPSEC / Enter Reduced</label>
-                                <input type="number" step="0.1" id="base_threshold_exit_full_opsec" name="base_threshold_exit_full_opsec" value="60.0" min="0" max="100">
-                                <small>Base score (0-100) to transition out of Full OPSEC mode (towards Reduced Activity).</small>
-                            </div>
-                             <div class="form-group">
                                 <label for="base_threshold_enter_reduced_activity">Score Threshold to Enter Reduced Activity</label>
                                 <input type="number" step="0.1" id="base_threshold_enter_reduced_activity" name="base_threshold_enter_reduced_activity" value="20.0" min="0" max="100">
                                 <small>Base score (0-100) to transition from Background to Reduced Activity.</small>
-                            </div>
-                            <div class="form-group">
-                                <label for="base_threshold_exit_reduced_activity">Score Threshold to Exit Reduced Activity / Enter Background</label>
-                                <input type="number" step="0.1" id="base_threshold_exit_reduced_activity" name="base_threshold_exit_reduced_activity" value="20.0" min="0" max="100">
-                                <small>Base score (0-100) to transition from Reduced Activity to Background.</small>
                             </div>
                             <div class="form-group">
                                 <label for="min_duration_full_opsec_secs">Min Duration in Full OPSEC (s)</label>
@@ -214,6 +159,7 @@
                         <span class="filesize"></span>
                     </div>
                     <button class="download-button">Download Payload</button>
+                    <a class="manifest-link action-button secondary" hidden>Inspect Build Manifest</a>
                 </div>
             </div>
 

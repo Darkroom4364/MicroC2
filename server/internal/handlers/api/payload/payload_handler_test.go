@@ -43,10 +43,11 @@ func TestGeneratePayloadCreatesBuildIDsDistinctFromListenerID(t *testing.T) {
 
 	handler := NewPayloadHandlerForIsolatedLab(filepath.Join(tempDir, "static", "payloads"), agentDir)
 	config := PayloadConfig{
-		ListenerID: "listener-one",
-		AgentType:  "debugAgent",
-		Format:     "linux_elf",
-		Sleep:      5,
+		ListenerID:   "listener-one",
+		AgentType:    "debugAgent",
+		Architecture: "x64",
+		Format:       "linux_elf",
+		Sleep:        5,
 	}
 
 	first, err := handler.GeneratePayload(config)
@@ -115,10 +116,11 @@ func TestGeneratePayloadGeneratesSeedAndWritesProvenance(t *testing.T) {
 		return command.CombinedOutput()
 	}
 	config := PayloadConfig{
-		ListenerID: "listener-one",
-		AgentType:  "debugAgent",
-		Format:     "linux_elf",
-		Sleep:      5,
+		ListenerID:   "listener-one",
+		AgentType:    "debugAgent",
+		Architecture: "x64",
+		Format:       "linux_elf",
+		Sleep:        5,
 	}
 
 	seedPattern := regexp.MustCompile(`^[0-9a-f]{16}$`)
@@ -139,7 +141,33 @@ func TestGeneratePayloadGeneratesSeedAndWritesProvenance(t *testing.T) {
 		)
 	}
 
-	provenance := readJSONFile(t, filepath.Join(filepath.Dir(first.Path), "provenance.json"))
+	provenancePath := filepath.Join(
+		filepath.Dir(first.Path),
+		"provenance.json",
+	)
+	provenance := readJSONFile(t, provenancePath)
+	sidecarJSON, err := os.ReadFile(provenancePath)
+	if err != nil {
+		t.Fatalf("read payload build manifest sidecar: %v", err)
+	}
+	decodedSidecar, err := decodePayloadBuildManifest(sidecarJSON)
+	if err != nil {
+		t.Fatalf("decode payload build manifest sidecar: %v", err)
+	}
+	if decodedSidecar.PayloadID != first.ID {
+		t.Fatalf(
+			"decoded sidecar payload ID = %q, want %q",
+			decodedSidecar.PayloadID,
+			first.ID,
+		)
+	}
+	if provenance["schema_version"] != payloadBuildManifestSchemaV1 {
+		t.Fatalf("manifest schema = %#v, want %q", provenance["schema_version"], payloadBuildManifestSchemaV1)
+	}
+	if provenance["payload_id"] != first.ID ||
+		provenance["listener_id"] != "listener-one" {
+		t.Fatalf("manifest identity is incomplete: %#v", provenance)
+	}
 	if provenance["mutation_seed"] != first.MutationSeed {
 		t.Fatalf("provenance mutation_seed = %#v, want %q", provenance["mutation_seed"], first.MutationSeed)
 	}
@@ -149,14 +177,45 @@ func TestGeneratePayloadGeneratesSeedAndWritesProvenance(t *testing.T) {
 	if provenance["git_revision"] == nil || provenance["git_revision"] == "" {
 		t.Fatalf("provenance should record a git revision (or \"unknown\"): %#v", provenance["git_revision"])
 	}
-	if provenance["target"] != "x86_64-unknown-linux-gnu" {
-		t.Fatalf("provenance target = %#v, want x86_64-unknown-linux-gnu", provenance["target"])
+	if provenance["source_state"] == nil || provenance["source_state"] == "" {
+		t.Fatalf("manifest should record source state: %#v", provenance["source_state"])
+	}
+	if provenance["target_os"] != "linux" ||
+		provenance["architecture"] != "x64" ||
+		provenance["target_triple"] != "x86_64-unknown-linux-gnu" ||
+		provenance["format"] != "linux_elf" ||
+		provenance["build_type"] != "debug" {
+		t.Fatalf("manifest profile is incomplete: %#v", provenance)
 	}
 	if provenance["config_sha256"] == nil || provenance["config_sha256"] == "" {
 		t.Fatalf("provenance should record the resolved config hash: %#v", provenance["config_sha256"])
 	}
-	if provenance["built_at"] == nil || provenance["built_at"] == "" {
-		t.Fatalf("provenance should record a build timestamp: %#v", provenance["built_at"])
+	if provenance["created_at"] != first.Created {
+		t.Fatalf("manifest created_at = %#v, want %q", provenance["created_at"], first.Created)
+	}
+	effectiveConfig, ok := provenance["effective_config"].(map[string]interface{})
+	if !ok || effectiveConfig["payload_id"] != first.ID ||
+		effectiveConfig["listener_id"] != "listener-one" ||
+		effectiveConfig["mutation_seed"] != first.MutationSeed ||
+		effectiveConfig["protocol"] != "http" ||
+		effectiveConfig["user_agent"] != "test-agent" {
+		t.Fatalf("manifest effective config is incomplete: %#v", provenance["effective_config"])
+	}
+	if _, containsCredential := effectiveConfig["enrollment_credential"]; containsCredential {
+		t.Fatal("manifest effective config retained enrollment credential material")
+	}
+	artifact, ok := provenance["artifact"].(map[string]interface{})
+	if !ok ||
+		artifact["path"] != filepath.ToSlash(filepath.Join("debug", first.ID, "agent")) ||
+		artifact["filename"] != "agent" ||
+		artifact["size"] != float64(first.Size) ||
+		artifact["sha256"] == "" {
+		t.Fatalf("manifest artifact is incomplete: %#v", provenance["artifact"])
+	}
+	if first.Manifest == nil ||
+		first.Manifest.Artifact.SHA256 != artifact["sha256"] ||
+		first.ManifestURL != payloadManifestURL(first.ID) {
+		t.Fatalf("payload result did not expose its manifest: %#v", first)
 	}
 	if provenance["enrollment_credential_source"] !=
 		"server-generated-ephemeral" {
@@ -363,11 +422,17 @@ func TestPayloadBuildReceivesCanonicalIPv6ServerURL(t *testing.T) {
 			if command.Args[index] != "--output" {
 				continue
 			}
-			return []byte("hook build complete"), os.WriteFile(
+			if err := os.WriteFile(
 				filepath.Join(command.Args[index+1], "agent"),
 				[]byte("fake agent"),
 				0o600,
-			)
+			); err != nil {
+				return nil, err
+			}
+			if err := writeTestEffectiveConfig(command); err != nil {
+				return nil, err
+			}
+			return []byte("hook build complete"), nil
 		}
 		return nil, errors.New("build command omitted --output")
 	}
@@ -456,6 +521,9 @@ func TestPersistentPayloadEnrollmentCredentialIsHashOnlyAndNotProjected(
 			0o600,
 		); err != nil {
 			t.Fatalf("write hooked payload artifact: %v", err)
+		}
+		if err := writeTestEffectiveConfig(command); err != nil {
+			t.Fatalf("write hooked effective config: %v", err)
 		}
 		buildOutput = []byte(
 			"hook build complete; credential=" + bootstrapCredential,
@@ -769,6 +837,9 @@ func TestConcurrentPayloadBuildsSerializeSharedAgentWorkspace(t *testing.T) {
 		); err != nil {
 			return nil, fmt.Errorf("copy simulated shared artifact: %w", err)
 		}
+		if err := writeTestEffectiveConfig(command); err != nil {
+			return nil, err
+		}
 		return []byte("hook build complete"), nil
 	}
 
@@ -949,11 +1020,17 @@ func TestPayloadArtifactsRemainDownloadableWithPrivatePermissions(t *testing.T) 
 			if command.Args[index] != "--output" {
 				continue
 			}
-			return []byte("hook build complete"), os.WriteFile(
+			if err := os.WriteFile(
 				filepath.Join(command.Args[index+1], "agent"),
 				[]byte("private agent"),
 				0o644,
-			)
+			); err != nil {
+				return nil, err
+			}
+			if err := writeTestEffectiveConfig(command); err != nil {
+				return nil, err
+			}
+			return []byte("hook build complete"), nil
 		}
 		return nil, errors.New("build command omitted --output")
 	}
@@ -1202,11 +1279,17 @@ func TestPayloadEnrollmentRevokeOperatorRoute(t *testing.T) {
 			if command.Args[index] != "--output" {
 				continue
 			}
-			return []byte("hook build complete"), os.WriteFile(
+			if err := os.WriteFile(
 				filepath.Join(command.Args[index+1], "agent"),
 				[]byte("fake agent"),
 				0o600,
-			)
+			); err != nil {
+				return nil, err
+			}
+			if err := writeTestEffectiveConfig(command); err != nil {
+				return nil, err
+			}
+			return []byte("hook build complete"), nil
 		}
 		return nil, errors.New("build command omitted --output")
 	}
@@ -1578,6 +1661,7 @@ func TestGeneratePayloadHonoursSuppliedMutationSeed(t *testing.T) {
 	config := PayloadConfig{
 		ListenerID:   "listener-one",
 		AgentType:    "debugAgent",
+		Architecture: "x64",
 		Format:       "linux_elf",
 		Sleep:        5,
 		MutationSeed: "0123456789abcdef",
@@ -1712,11 +1796,17 @@ func TestPayloadCompletionAuditFailureRollsBackCredentialActivation(t *testing.T
 			if command.Args[index] != "--output" {
 				continue
 			}
-			return []byte("untrusted compiler output"), os.WriteFile(
+			if err := os.WriteFile(
 				filepath.Join(command.Args[index+1], "agent"),
 				[]byte("fake agent"),
 				0o600,
-			)
+			); err != nil {
+				return nil, err
+			}
+			if err := writeTestEffectiveConfig(command); err != nil {
+				return nil, err
+			}
+			return []byte("untrusted compiler output"), nil
 		}
 		return nil, errors.New("build command omitted --output")
 	}
@@ -1816,6 +1906,9 @@ func TestPayloadBuildAuditRootCompletionAndRedactionSurviveRestart(
 			0o600,
 		); err != nil {
 			return nil, fmt.Errorf("write hooked payload artifact: %w", err)
+		}
+		if err := writeTestEffectiveConfig(command); err != nil {
+			return nil, err
 		}
 		buildOutput = []byte(
 			buildOutputMarker + "; credential=" + bootstrapCredential,
@@ -2011,11 +2104,11 @@ func TestPayloadMetadataAndDownloadSurviveRestartWithCustomRoot(t *testing.T) {
 		firstDatabase.Close()
 		t.Fatalf("decode stored provenance: %v", err)
 	}
-	if provenance["built_at"] != generated.Created {
+	if provenance["created_at"] != generated.Created {
 		firstDatabase.Close()
 		t.Fatalf(
-			"stored provenance built_at = %#v, want %q",
-			provenance["built_at"],
+			"stored manifest created_at = %#v, want %q",
+			provenance["created_at"],
 			generated.Created,
 		)
 	}
@@ -2069,10 +2162,65 @@ func TestPayloadMetadataAndDownloadSurviveRestartWithCustomRoot(t *testing.T) {
 	if recorder.Header().Get("Content-Length") != "10" {
 		t.Fatalf("download content length = %q, want 10", recorder.Header().Get("Content-Length"))
 	}
+	if recorder.Header().Get("X-MicroC2-Artifact-SHA256") != artifactHash {
+		t.Fatalf(
+			"download artifact digest = %q, want %q",
+			recorder.Header().Get("X-MicroC2-Artifact-SHA256"),
+			artifactHash,
+		)
+	}
+	if wantLink := "<" + payloadManifestURL(generated.ID) +
+		">; rel=\"describedby\"; type=\"application/json\""; recorder.Header().Get(
+		"Link",
+	) != wantLink {
+		t.Fatalf(
+			"download manifest link = %q, want %q",
+			recorder.Header().Get("Link"),
+			wantLink,
+		)
+	}
 	if !strings.Contains(recorder.Header().Get("Content-Disposition"), "filename=agent") {
 		t.Fatalf(
 			"download content disposition = %q",
 			recorder.Header().Get("Content-Disposition"),
+		)
+	}
+
+	manifestRecorder := httptest.NewRecorder()
+	manifestRequest := httptest.NewRequest(
+		http.MethodGet,
+		payloadManifestURL(generated.ID),
+		nil,
+	)
+	manifestMux := http.NewServeMux()
+	secondHandler.RegisterRoutes(manifestMux)
+	manifestMux.ServeHTTP(manifestRecorder, manifestRequest)
+	if manifestRecorder.Code != http.StatusOK {
+		t.Fatalf(
+			"manifest after restart: status %d: %s",
+			manifestRecorder.Code,
+			manifestRecorder.Body.String(),
+		)
+	}
+	var manifest PayloadBuildManifest
+	if err := json.Unmarshal(manifestRecorder.Body.Bytes(), &manifest); err != nil {
+		t.Fatalf("decode manifest after restart: %v", err)
+	}
+	if manifest.SchemaVersion != payloadBuildManifestSchemaV1 ||
+		manifest.PayloadID != generated.ID ||
+		manifest.ListenerID != "listener-one" ||
+		manifest.Artifact.Path != relativePath ||
+		manifest.Artifact.SHA256 != artifactHash ||
+		manifest.Artifact.Size != 10 {
+		t.Fatalf("manifest after restart is incomplete: %#v", manifest)
+	}
+	if bytes.Contains(
+		manifestRecorder.Body.Bytes(),
+		[]byte(`"enrollment_credential":`),
+	) {
+		t.Fatalf(
+			"manifest exposed enrollment credential material: %s",
+			manifestRecorder.Body.String(),
 		)
 	}
 }
@@ -2693,6 +2841,79 @@ func TestPayloadDirectoryCreationRejectsSymlinkClass(t *testing.T) {
 	}
 }
 
+func TestGeneratePayloadFailsWhenManifestCannotBePublished(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symlinks requires privileges on Windows")
+	}
+
+	tempDir := t.TempDir()
+	payloadRoot := filepath.Join(tempDir, "payload-root")
+	agentDir := filepath.Join(tempDir, "agent")
+	outsideManifest := filepath.Join(tempDir, "outside-manifest.json")
+	writePlaceholderBuildScript(t, agentDir)
+	if err := os.WriteFile(
+		outsideManifest,
+		[]byte("outside sentinel"),
+		0600,
+	); err != nil {
+		t.Fatalf("write outside manifest sentinel: %v", err)
+	}
+	handler, err := newPayloadHandler(
+		payloadRoot,
+		agentDir,
+		testListenerLookup(),
+		nil,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("create payload handler: %v", err)
+	}
+	handler.runBuild = func(command *exec.Cmd) ([]byte, error) {
+		var outputDir, payloadID string
+		for index := 0; index+1 < len(command.Args); index++ {
+			switch command.Args[index] {
+			case "--output":
+				outputDir = command.Args[index+1]
+			case "--payload-id":
+				payloadID = command.Args[index+1]
+			}
+		}
+		if outputDir == "" || payloadID == "" {
+			return nil, errors.New("build command omitted output or payload ID")
+		}
+		if err := os.WriteFile(
+			filepath.Join(outputDir, "agent"),
+			[]byte("fake agent"),
+			0600,
+		); err != nil {
+			return nil, err
+		}
+		if err := writeTestEffectiveConfig(command); err != nil {
+			return nil, err
+		}
+		return nil, os.Symlink(
+			outsideManifest,
+			filepath.Join(
+				payloadRoot,
+				"debug",
+				payloadID,
+				"provenance.json",
+			),
+		)
+	}
+
+	if _, err := handler.GeneratePayload(testPayloadConfig()); err == nil {
+		t.Fatal("generation succeeded without a publishable build manifest")
+	}
+	contents, err := os.ReadFile(outsideManifest)
+	if err != nil {
+		t.Fatalf("read outside manifest sentinel: %v", err)
+	}
+	if string(contents) != "outside sentinel" {
+		t.Fatalf("outside manifest changed to %q", contents)
+	}
+}
+
 func TestPayloadArtifactParentSwapNeverEscapesRoot(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("creating symlinks requires privileges on Windows")
@@ -3058,6 +3279,7 @@ func generatePayloadOverHTTP(t *testing.T, handler *PayloadHandler) PayloadResul
 	body, err := json.Marshal(PayloadConfig{
 		ListenerID:   "listener-one",
 		AgentType:    "debugAgent",
+		Architecture: "x64",
 		Format:       "linux_elf",
 		Sleep:        5,
 		MutationSeed: "0123456789abcdef",
@@ -3097,6 +3319,7 @@ func testPayloadConfig() PayloadConfig {
 	return PayloadConfig{
 		ListenerID:   "listener-one",
 		AgentType:    "debugAgent",
+		Architecture: "x64",
 		Format:       "linux_elf",
 		Sleep:        5,
 		MutationSeed: "0123456789abcdef",
@@ -3210,6 +3433,12 @@ esac
 mkdir -p "$output"
 printf 'fake agent' > "$output/$artifact"
 printf '%s' "${MUTATION_SEED:-}" > "$output/mutation_seed.env"
+if [[ -n "${EFFECTIVE_CONFIG_PATH:-}" ]]; then
+  mkdir -p "$(dirname "$EFFECTIVE_CONFIG_PATH")"
+  printf '{"server_url":"%s","payload_id":"%s","agent_id":"","listener_id":"%s","mutation_seed":"%s","protocol":"%s","user_agent":"test-agent","mutation_endpoint_segments":["segment-a","segment-b"],"allow_invalid_certs":false}' \
+    "${SERVER_URL:-}" "${PAYLOAD_ID:-}" "${LISTENER_ID:-}" "${MUTATION_SEED:-}" "${PROTOCOL:-https}" \
+    > "$EFFECTIVE_CONFIG_PATH"
+fi
 `
 	if err := os.WriteFile(filepath.Join(agentDir, "build.sh"), []byte(script), 0644); err != nil {
 		t.Fatalf("write fake build script: %v", err)
@@ -3228,6 +3457,42 @@ func writePlaceholderBuildScript(t *testing.T, agentDir string) {
 	); err != nil {
 		t.Fatalf("write placeholder build script: %v", err)
 	}
+}
+
+func writeTestEffectiveConfig(command *exec.Cmd) error {
+	values := make(map[string]string)
+	for _, entry := range command.Env {
+		name, value, found := strings.Cut(entry, "=")
+		if found {
+			values[name] = value
+		}
+	}
+	destination := values["EFFECTIVE_CONFIG_PATH"]
+	if destination == "" {
+		return errors.New("build command omitted EFFECTIVE_CONFIG_PATH")
+	}
+	if !filepath.IsAbs(destination) {
+		destination = filepath.Join(command.Dir, destination)
+	}
+	config := map[string]interface{}{
+		"server_url":                 values["SERVER_URL"],
+		"payload_id":                 values["PAYLOAD_ID"],
+		"agent_id":                   "",
+		"listener_id":                values["LISTENER_ID"],
+		"mutation_seed":              values["MUTATION_SEED"],
+		"protocol":                   values["PROTOCOL"],
+		"user_agent":                 "test-agent",
+		"mutation_endpoint_segments": []string{"segment-a", "segment-b"},
+		"allow_invalid_certs":        false,
+	}
+	data, err := json.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("marshal test effective config: %w", err)
+	}
+	if err := os.WriteFile(destination, data, 0o600); err != nil {
+		return fmt.Errorf("write test effective config: %w", err)
+	}
+	return nil
 }
 
 func installSuccessfulBuildHook(
@@ -3286,6 +3551,9 @@ func installSuccessfulBuildHook(
 			0644,
 		); err != nil {
 			t.Fatalf("write hooked payload artifact: %v", err)
+		}
+		if err := writeTestEffectiveConfig(command); err != nil {
+			t.Fatalf("write hooked effective config: %v", err)
 		}
 		return []byte("hook build complete"), nil
 	}

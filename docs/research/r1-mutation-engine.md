@@ -58,27 +58,36 @@ The agent reports its own seed at startup (debug log) via
 
 ## Provenance
 
-Every server-driven build writes `provenance.json` next to the artifact:
+Every server-driven build writes `provenance.json` next to the artifact. This
+abridged excerpt shows the mutation fields and artifact linkage:
 
 ```json
 {
+  "schema_version": "microc2.payload-build-manifest.v1",
+  "payload_id": "<build-id>",
+  "listener_id": "<listener-id>",
   "mutation_seed": "0123456789abcdef",
   "seed_generated_by_server": true,
   "git_revision": "<commit>",
-  "target": "x86_64-unknown-linux-gnu",
-  "built_at": "<RFC3339>",
-  "config_sha256": "<sha256 of resolved agent config>",
-  "mutation_flags": ["config-xor-key", "junk-code", "surface-strings"]
+  "target_triple": "x86_64-unknown-linux-gnu",
+  "created_at": "<RFC3339>",
+  "artifact": {
+    "path": "release/<build-id>/agent",
+    "filename": "agent",
+    "sha256": "<artifact-sha256>"
+  }
 }
 ```
 
-The seed is also returned in the payload API result (`mutation_seed`) and
-shown in the payload UI log.
+The full schema, effective-config fields, supported profiles, and inspection
+endpoint are documented in the
+[payload build contract](../payload-builds.md). The seed is also returned in
+the payload API result (`mutation_seed`) and shown in the payload UI log.
 
-`config_sha256` records a digest of the resolved configuration; it does not
-contain enough material to reconstruct it. In particular, the raw enrollment
-credential is embedded in the payload but is never written to provenance or
-durable server metadata.
+`effective_config` records the exact embedded configuration after the raw
+enrollment credential is removed, and `config_sha256` protects that sanitized
+object. The raw enrollment credential is embedded in the payload but is never
+written to provenance or durable server metadata.
 
 ## Determinism and reproduction boundary
 

@@ -29,6 +29,7 @@ passthrough = [
     "C2_THRESH_MAX_MULT",
     "PROC_SCAN_INTERVAL_SECS",
     "MUTATION_SEED",
+    "EFFECTIVE_CONFIG_PATH",
 ]
 
 [target.x86_64-pc-windows-gnu]

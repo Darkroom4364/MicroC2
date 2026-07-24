@@ -53,19 +53,54 @@ type PayloadConfig struct {
 
 // PayloadResult contains information about a generated payload
 type PayloadResult struct {
-	ID           string `json:"id"`
-	PayloadID    string `json:"payload_id,omitempty"`
-	ListenerID   string `json:"listener_id,omitempty"`
-	MutationSeed string `json:"mutation_seed,omitempty"`
-	Filename     string `json:"filename"`
-	Path         string `json:"path"`
-	Size         int64  `json:"size"`
-	Created      string `json:"created"`
+	ID           string                `json:"id"`
+	PayloadID    string                `json:"payload_id,omitempty"`
+	ListenerID   string                `json:"listener_id,omitempty"`
+	MutationSeed string                `json:"mutation_seed,omitempty"`
+	Filename     string                `json:"filename"`
+	Path         string                `json:"path"`
+	Size         int64                 `json:"size"`
+	Created      string                `json:"created"`
+	Manifest     *PayloadBuildManifest `json:"manifest,omitempty"`
+	ManifestURL  string                `json:"manifest_url,omitempty"`
 
 	relativePath              string
 	sha256                    string
 	provenanceJSON            json.RawMessage
 	createdAuditEventSequence int64
+}
+
+// PayloadBuildManifest is the versioned, non-secret record of the exact
+// supported profile and effective runtime configuration used for a build.
+// Enrollment credentials are deliberately excluded.
+type PayloadBuildManifest struct {
+	SchemaVersion              string                  `json:"schema_version"`
+	PayloadID                  string                  `json:"payload_id"`
+	ListenerID                 string                  `json:"listener_id"`
+	GitRevision                string                  `json:"git_revision"`
+	SourceState                string                  `json:"source_state"`
+	TargetOS                   string                  `json:"target_os"`
+	Architecture               string                  `json:"architecture"`
+	TargetTriple               string                  `json:"target_triple"`
+	Format                     string                  `json:"format"`
+	BuildType                  string                  `json:"build_type"`
+	EffectiveConfig            json.RawMessage         `json:"effective_config"`
+	ConfigSHA256               string                  `json:"config_sha256"`
+	Artifact                   PayloadArtifactManifest `json:"artifact"`
+	CreatedAt                  string                  `json:"created_at"`
+	MutationSeed               string                  `json:"mutation_seed"`
+	SeedGeneratedByServer      bool                    `json:"seed_generated_by_server"`
+	MutationFlags              []string                `json:"mutation_flags"`
+	EnrollmentCredentialSource string                  `json:"enrollment_credential_source"`
+}
+
+// PayloadArtifactManifest identifies the one canonical artifact published by a
+// payload build. Path is always relative to the configured payload root.
+type PayloadArtifactManifest struct {
+	Path     string `json:"path"`
+	Filename string `json:"filename"`
+	Size     int64  `json:"size"`
+	SHA256   string `json:"sha256"`
 }
 
 // ListenerLookup resolves the authoritative listener configuration used for a

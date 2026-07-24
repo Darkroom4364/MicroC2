@@ -229,12 +229,11 @@ Listener, payload/build, and runtime agent identities are now distinct:
 | Payload/build ID | Indexed build artifact, embedded config, and bootstrap allowance. |
 | Agent runtime ID | One live or historical runtime agent instance. |
 
-Several payload UI options remain aspirational: indirect syscalls, custom sleep
-techniques, DLL sideloading metadata, shellcode output, and an OPSEC checkbox
-are passed through parts of the UI/config/build path but are not a complete
-implemented payload feature set. Issue #99 is therefore only partially complete:
-seed provenance exists, while supported-profile validation, canonical outputs,
-and a complete inspectable build manifest remain.
+Issue #99 defines and implements the bounded payload-build contract. Linux x64
+ELF and Windows x64 EXE builds support debug and release modes; unsupported
+profiles and aspirational options fail validation before build side effects.
+Every successful build has one canonical output and a mandatory, versioned,
+inspectable manifest. See [Payload build contract](payload-builds.md).
 
 Reproducibility has an intentional security boundary. Mutation decisions are
 derived from the source revision and mutation seed, but every production build
@@ -346,8 +345,8 @@ paths.
 
 1. Extend the typed task registry with file transfer and pivot operations now
    that the v1 shell contract in #98 is stable (#88).
-2. Complete payload profile validation and full build manifests; current #99
-   provenance is partial P1 work.
+2. Preserve the implemented #99 payload-profile and manifest contract as new
+   formats or optional capabilities are researched.
 3. Add operator-facing evidence export and reporting on the structured audit
    foundation.
 

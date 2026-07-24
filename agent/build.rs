@@ -172,6 +172,27 @@ fn canonical_server_url(raw: &str, protocol: &str, host: &str, port: &str) -> St
     expected
 }
 
+fn export_effective_config(config_content: &str) {
+    let Some(destination) = env::var_os("EFFECTIVE_CONFIG_PATH") else {
+        return;
+    };
+    let destination = PathBuf::from(destination);
+    let mut config: serde_json::Value = serde_json::from_str(config_content)
+        .unwrap_or_else(|err| panic!("failed to parse embedded config for export: {err}"));
+    let config = config
+        .as_object_mut()
+        .unwrap_or_else(|| panic!("embedded config must be a JSON object"));
+    config.remove("enrollment_credential");
+    let sanitized = serde_json::to_vec(config)
+        .unwrap_or_else(|err| panic!("failed to serialize effective config: {err}"));
+    fs::write(&destination, sanitized)
+        .unwrap_or_else(|err| panic!("failed to write effective config to {destination:?}: {err}"));
+    log_build(&format!(
+        "Wrote credential-free effective config to {:?}",
+        destination
+    ));
+}
+
 // Generate OUT_DIR/mutation.rs: seed-derived decoy functions, random string
 // constants and a random-length padding blob. The agent references
 // mutation_entry() once via std::hint::black_box so LLVM keeps everything.
@@ -272,6 +293,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MIN_BG_OPSEC_SECS");
     println!("cargo:rerun-if-env-changed=REDUCED_ACTIVITY_SLEEP_SECS");
     println!("cargo:rerun-if-env-changed=MUTATION_SEED");
+    println!("cargo:rerun-if-env-changed=EFFECTIVE_CONFIG_PATH");
 
     // Resolve the mutation seed; server-driven builds always set it, manual
     // builds fall back to a fixed dev seed so existing fixtures keep working.
@@ -475,6 +497,8 @@ fn main() {
         .replace("{}", &u64::MAX.to_string())
         .to_string()
     };
+
+    export_effective_config(&config_content);
 
     // Generate Rust code with the embedded config
     let out_dir: PathBuf = match env::var_os("OUT_DIR") {

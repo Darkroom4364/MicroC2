@@ -48,6 +48,7 @@ const (
 	maxPayloadRequestBytes       = 64 << 10
 	maxPayloadRevokeBodyBytes    = 1
 	privateCargoBuildRoot        = ".microc2-build"
+	effectiveConfigFilename      = "effective-config.json"
 )
 
 type payloadBuildRecord struct {
@@ -305,7 +306,34 @@ func gitRevision(dir string) string {
 	if err != nil {
 		return "unknown"
 	}
-	return strings.TrimSpace(string(out))
+	revision := strings.TrimSpace(string(out))
+	if revision == "" {
+		return "unknown"
+	}
+	return revision
+}
+
+func gitSourceState(dir string) (revision string, state string) {
+	revision = gitRevision(dir)
+	if revision == "unknown" {
+		return revision, "unknown"
+	}
+	out, err := exec.Command(
+		"git",
+		"-C",
+		dir,
+		"status",
+		"--porcelain",
+		"--",
+		".",
+	).Output()
+	if err != nil {
+		return revision, "unknown"
+	}
+	if len(strings.TrimSpace(string(out))) > 0 {
+		return revision, "dirty"
+	}
+	return revision, "clean"
 }
 
 // writeProvenance records non-secret build context next to the artifact. The
@@ -314,15 +342,18 @@ func gitRevision(dir string) string {
 func writeProvenance(
 	payloadRoot string,
 	artifactRelativePath string,
-	provenance map[string]interface{},
+	manifest interface{},
 ) error {
-	data, err := json.MarshalIndent(provenance, "", "  ")
+	// Keep the sidecar byte-for-byte equivalent to the durable JSON form.
+	// Pretty-printing an outer object rewrites whitespace inside RawMessage
+	// fields and would invalidate the effective-config digest.
+	data, err := json.Marshal(manifest)
 	if err != nil {
-		return fmt.Errorf("failed to marshal provenance: %w", err)
+		return fmt.Errorf("failed to marshal payload build manifest: %w", err)
 	}
 	nativeArtifactPath, err := containedNativeRelativePath(artifactRelativePath)
 	if err != nil {
-		return fmt.Errorf("invalid artifact path for provenance: %w", err)
+		return fmt.Errorf("invalid artifact path for build manifest: %w", err)
 	}
 	relativePath := filepath.Join(
 		filepath.Dir(nativeArtifactPath),
@@ -334,10 +365,10 @@ func writeProvenance(
 		data,
 		0600,
 	); err != nil {
-		return fmt.Errorf("failed to write provenance: %w", err)
+		return fmt.Errorf("failed to write payload build manifest: %w", err)
 	}
 	log.Printf(
-		"[INFO] Wrote build provenance to %s",
+		"[INFO] Wrote payload build manifest to %s",
 		filepath.Join(payloadRoot, relativePath),
 	)
 	return nil
@@ -378,20 +409,14 @@ func (h *PayloadHandler) HandleGeneratePayload(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Enforce listener selection
-	if config.ListenerID == "" {
-		http.Error(w, "Listener selection is required. You must select a listener for agent communication.", http.StatusBadRequest)
-		log.Printf("[ERROR] Payload generation aborted: no listener selected.")
-		return
-	}
-	if _, err := resolvedPayloadMaxSessions(config.MaxSessions); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
 	// Generate payload
 	result, err := h.GeneratePayloadWithContext(r.Context(), config)
 	if err != nil {
+		var validationError *payloadConfigValidationError
+		if errors.As(err, &validationError) {
+			http.Error(w, validationError.Error(), http.StatusBadRequest)
+			return
+		}
 		log.Print("[ERROR] Payload generation failed")
 		http.Error(w, "Payload generation failed", http.StatusInternalServerError)
 		return
@@ -639,6 +664,122 @@ func parsePayloadEnrollmentRevokePath(
 		return "", true, false
 	}
 	return payloadID, true, true
+}
+
+func payloadManifestURL(payloadID string) string {
+	return "/api/payload/" + payloadID + "/manifest"
+}
+
+func parsePayloadManifestPath(
+	path string,
+) (payloadID string, matched bool, valid bool) {
+	const (
+		prefix = "/api/payload/"
+		suffix = "/manifest"
+	)
+	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+		return "", false, false
+	}
+	payloadID = strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix)
+	if strings.Contains(payloadID, "/") || !validPayloadID(payloadID) {
+		return payloadID, true, false
+	}
+	return payloadID, true, true
+}
+
+func payloadManifestMatchesRecord(
+	manifest PayloadBuildManifest,
+	record payloadBuildRecord,
+) error {
+	switch {
+	case manifest.PayloadID != record.ID ||
+		manifest.PayloadID != record.PayloadID ||
+		manifest.ListenerID != record.ListenerID:
+		return errors.New("payload build manifest identity does not match metadata")
+	case manifest.MutationSeed != record.MutationSeed:
+		return errors.New("payload build manifest mutation seed does not match metadata")
+	case manifest.Artifact.Path != record.RelativePath:
+		return errors.New("payload build manifest path does not match metadata")
+	case manifest.Artifact.Filename != record.Filename:
+		return errors.New("payload build manifest filename does not match metadata")
+	case manifest.Artifact.Size != record.Size:
+		return errors.New("payload build manifest size does not match metadata")
+	case manifest.Artifact.SHA256 != record.SHA256:
+		return errors.New("payload build manifest digest does not match metadata")
+	case manifest.CreatedAt != record.CreatedAt:
+		return errors.New("payload build manifest creation time does not match metadata")
+	}
+	return nil
+}
+
+// HandlePayloadResource dispatches payload subresources registered beneath
+// /api/payload/. More specific download routes remain registered separately.
+func (h *PayloadHandler) HandlePayloadResource(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	if _, matched, _ := parsePayloadManifestPath(r.URL.Path); matched {
+		h.HandlePayloadManifest(w, r)
+		return
+	}
+	h.HandleRevokePayloadEnrollment(w, r)
+}
+
+// HandlePayloadManifest exposes the persisted, non-secret build manifest.
+func (h *PayloadHandler) HandlePayloadManifest(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	w.Header().Set("Cache-Control", "no-store")
+	payloadID, matched, valid := parsePayloadManifestPath(r.URL.Path)
+	if !matched {
+		http.NotFound(w, r)
+		return
+	}
+	if !valid {
+		http.Error(w, "Invalid payload manifest path", http.StatusBadRequest)
+		return
+	}
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if r.URL.RawQuery != "" {
+		http.Error(
+			w,
+			"Payload manifest does not accept query parameters",
+			http.StatusBadRequest,
+		)
+		return
+	}
+	if h.initErr != nil {
+		http.Error(w, "Payload handler is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	record, err := h.lookupPayload(payloadID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "Payload manifest not found", http.StatusNotFound)
+			return
+		}
+		log.Print("[ERROR] Failed to load payload manifest metadata")
+		http.Error(w, "Payload manifest is unavailable", http.StatusInternalServerError)
+		return
+	}
+	if record.State == payloadStateBuilding {
+		http.Error(w, "Payload manifest is not complete", http.StatusConflict)
+		return
+	}
+	manifest, err := decodePayloadBuildManifest(record.ProvenanceJSON)
+	if err != nil || payloadManifestMatchesRecord(manifest, record) != nil {
+		http.Error(w, "Payload manifest is corrupt", http.StatusGone)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(record.ProvenanceJSON)))
+	w.Header().Set("X-MicroC2-Payload-State", record.State)
+	_, _ = w.Write(record.ProvenanceJSON)
 }
 
 func (h *PayloadHandler) writePayloadEnrollmentRejection(
@@ -1080,6 +1221,18 @@ func (h *PayloadHandler) HandleDownloadPayload(w http.ResponseWriter, r *http.Re
 	w.Header().Set("Content-Disposition", disposition)
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.FormatInt(record.Size, 10))
+	w.Header().Set("X-MicroC2-Artifact-SHA256", record.SHA256)
+	if manifest, err := decodePayloadBuildManifest(
+		record.ProvenanceJSON,
+	); err == nil && payloadManifestMatchesRecord(manifest, record) == nil {
+		w.Header().Set(
+			"Link",
+			fmt.Sprintf(
+				"<%s>; rel=\"describedby\"; type=\"application/json\"",
+				payloadManifestURL(record.ID),
+			),
+		)
+	}
 
 	// Stream file to response
 	if _, err := io.Copy(w, file); err != nil {
@@ -1262,6 +1415,12 @@ func (h *PayloadHandler) GeneratePayloadWithContext(
 	if h.initErr != nil {
 		return PayloadResult{}, h.initErr
 	}
+	plan, err := validateAndResolvePayloadConfig(config)
+	if err != nil {
+		return PayloadResult{}, err
+	}
+	config = plan.config
+	sourceRevision, sourceState := gitSourceState(h.agentSourceDir)
 	log.Printf("[INFO] Generating payload with config: %+v", config)
 
 	// Get listener details
@@ -1294,10 +1453,6 @@ func (h *PayloadHandler) GeneratePayloadWithContext(
 	payloadID := uuid.NewString()
 	buildStartedAt := time.Now().UTC()
 	log.Printf("[INFO] Generated payload build ID %s for listener %s", payloadID, listener.ID)
-	maxSessions, err := resolvedPayloadMaxSessions(config.MaxSessions)
-	if err != nil {
-		return PayloadResult{}, err
-	}
 	bootstrap, err := enrollment.GenerateBootstrapCredential()
 	if err != nil {
 		return PayloadResult{}, fmt.Errorf("generate payload enrollment credential: %w", err)
@@ -1312,14 +1467,10 @@ func (h *PayloadHandler) GeneratePayloadWithContext(
 	}
 	log.Printf("[INFO] Using mutation seed %s (server-generated: %t)", mutationSeed, seedGenerated)
 
-	// Determine build type (debug or release)
-	buildType := "release"
-	if config.AgentType == "debugAgent" {
-		buildType = "debug"
-	}
+	buildType := plan.buildType
 	log.Printf("[INFO] Build type: %s", buildType)
 
-	payloadFileName := payloadFilename(config.Format)
+	payloadFileName := plan.profile.filename
 	log.Printf("[INFO] Payload filename: %s", payloadFileName)
 
 	plannedRelativePath := filepath.ToSlash(filepath.Join(
@@ -1381,10 +1532,18 @@ func (h *PayloadHandler) GeneratePayloadWithContext(
 		"output",
 		payloadFileName,
 	)
+	effectiveConfigRelativePath := filepath.Join(
+		"output",
+		effectiveConfigFilename,
+	)
+	effectiveConfigBuildPath := filepath.Join(
+		privateCargoBuildRoot,
+		payloadID,
+		effectiveConfigRelativePath,
+	)
 
-	// Create the build config through a root-anchored handle. The build
-	// contract still receives the ordinary output directory path, but server
-	// writes never follow a swapped component outside the payload root.
+	// The exact credential-free config exported by build.rs is published at
+	// this root-relative path only after the build completes.
 	configRelativePath := filepath.Join(
 		buildType,
 		payloadID,
@@ -1395,87 +1554,7 @@ func (h *PayloadHandler) GeneratePayloadWithContext(
 	allowInsecureIsolatedLab :=
 		protocol == "http" && h.allowInsecureIsolatedLab
 
-	agentConfig := map[string]interface{}{
-		"server_url":                  serverURL,
-		"sleep_interval":              config.Sleep,
-		"jitter":                      2, // Default jitter value
-		"payload_id":                  payloadID,
-		"agent_id":                    "",
-		"listener_id":                 listener.ID,
-		"protocol":                    protocol,
-		"allow_insecure_isolated_lab": allowInsecureIsolatedLab,
-	}
-
-	// Include SOCKS5 proxy settings if requested
-	agentConfig["socks5_enabled"] = config.Socks5Enabled
-	agentConfig["socks5_host"] = config.Socks5Host
-	agentConfig["socks5_port"] = config.Socks5Port
-	if config.Socks5Enabled {
-		agentConfig["protocol"] = "socks5"
-	}
-
-	// Add additional configuration options based on payload settings
-	if config.IndirectSyscall {
-		log.Printf("[INFO] Enabling indirect syscalls")
-		agentConfig["indirect_syscalls"] = true
-	}
-
-	if config.SleepTechnique != "" && config.SleepTechnique != "standard" {
-		log.Printf("[INFO] Using custom sleep technique: %s", config.SleepTechnique)
-		agentConfig["sleep_technique"] = config.SleepTechnique
-	}
-
-	if config.DllSideloading {
-		log.Printf("[INFO] Enabling DLL sideloading with DLL: %s, Export: %s",
-			config.SideloadDll, config.ExportName)
-		agentConfig["dll_sideloading"] = true
-		agentConfig["sideload_dll"] = config.SideloadDll
-		agentConfig["export_name"] = config.ExportName
-	}
-
-	// Add OPSEC configurations to agentConfig map
-	agentConfig["proc_scan_interval_secs"] = config.ProcScanIntervalSecs
-	agentConfig["base_score_threshold_reduced_to_full"] = config.BaseThresholdEnterFullOpsec     // Map from HTML name
-	agentConfig["base_score_threshold_bg_to_reduced"] = config.BaseThresholdEnterReducedActivity // Map from HTML name
-	agentConfig["min_duration_full_opsec_secs"] = config.MinDurationFullOpsecSecs
-	agentConfig["min_duration_reduced_activity_secs"] = config.MinDurationReducedActivitySecs
-	agentConfig["min_duration_background_opsec_secs"] = config.MinDurationBackgroundOpsecSecs
-	agentConfig["reduced_activity_sleep_secs"] = config.ReducedActivitySleepSecs
-	agentConfig["base_max_consecutive_c2_failures"] = config.BaseMaxConsecutiveC2Failures
-	agentConfig["c2_failure_threshold_increase_factor"] = config.C2FailureThresholdIncreaseFactor
-	agentConfig["c2_failure_threshold_decrease_factor"] = config.C2FailureThresholdDecreaseFactor
-	agentConfig["c2_threshold_adjust_interval_secs"] = config.C2ThresholdAdjustIntervalSecs
-	agentConfig["c2_dynamic_threshold_max_multiplier"] = config.C2DynamicThresholdMaxMultiplier
-
-	configJSON, err := json.MarshalIndent(agentConfig, "", "  ")
-	if err != nil {
-		log.Printf("[ERROR] Failed to marshal agent config: %v", err)
-		return PayloadResult{}, fmt.Errorf("failed to marshal agent config: %w", err)
-	}
-
-	if err := createPayloadFileBeneath(
-		h.payloadsDir,
-		configRelativePath,
-		configJSON,
-		0600,
-	); err != nil {
-		log.Printf("[ERROR] Failed to write agent config to %s: %v", configPath, err)
-		return PayloadResult{}, fmt.Errorf("failed to write agent config: %w", err)
-	}
-	log.Printf("[INFO] Created agent config file: %s", configPath)
-
-	// Determine build target
-	var buildTarget string
-	switch {
-	case config.Format == "windows_exe" || config.Format == "windows_dll" || config.Format == "windows_service":
-		buildTarget = "x86_64-pc-windows-gnu"
-	case config.Format == "linux_elf":
-		buildTarget = "x86_64-unknown-linux-gnu"
-	case config.Architecture == "arm64":
-		buildTarget = "aarch64-unknown-linux-gnu"
-	default:
-		buildTarget = "x86_64-unknown-linux-gnu" // Default to Linux x64
-	}
+	buildTarget := plan.profile.targetTriple
 	log.Printf("[INFO] Using build target: %s", buildTarget)
 
 	// Get the path to the build script
@@ -1499,25 +1578,6 @@ func (h *PayloadHandler) GeneratePayloadWithContext(
 		"--protocol", protocol,
 	}
 
-	// Add additional build arguments based on configuration
-	if config.IndirectSyscall {
-		cmdArgs = append(cmdArgs, "--indirect-syscalls")
-	}
-
-	if config.SleepTechnique != "" && config.SleepTechnique != "standard" {
-		cmdArgs = append(cmdArgs, "--sleep-technique", config.SleepTechnique)
-	}
-
-	if config.DllSideloading {
-		cmdArgs = append(cmdArgs, "--dll-sideload")
-		if config.SideloadDll != "" {
-			cmdArgs = append(cmdArgs, "--sideload-dll", config.SideloadDll)
-		}
-		if config.ExportName != "" {
-			cmdArgs = append(cmdArgs, "--export-name", config.ExportName)
-		}
-	}
-
 	log.Printf("[INFO] Command: /bin/bash %s", strings.Join(cmdArgs, " "))
 	cmd := exec.Command("/bin/bash", cmdArgs...)
 
@@ -1530,12 +1590,17 @@ func (h *PayloadHandler) GeneratePayloadWithContext(
 		fmt.Sprintf("TARGET=%s", buildTarget),
 		fmt.Sprintf("OUTPUT_DIR=%s", stagingOutputDir),
 		fmt.Sprintf("CARGO_TARGET_DIR=%s", cargoTargetDir),
+		fmt.Sprintf(
+			"EFFECTIVE_CONFIG_PATH=%s",
+			effectiveConfigBuildPath,
+		),
 		fmt.Sprintf("BUILD_TYPE=%s", buildType),
 		fmt.Sprintf("PROTOCOL=%s", protocol),
 		fmt.Sprintf("SERVER_URL=%s", serverURL),
 		fmt.Sprintf("LISTENER_HOST=%s", connectHost),
 		fmt.Sprintf("LISTENER_PORT=%d", listener.Port),
 		fmt.Sprintf("LISTENER_ID=%s", listener.ID),
+		fmt.Sprintf("PAYLOAD_ID=%s", payloadID),
 		fmt.Sprintf("SLEEP_INTERVAL=%d", config.Sleep),
 		fmt.Sprintf("SOCKS5_ENABLED=%t", config.Socks5Enabled),
 		fmt.Sprintf("SOCKS5_HOST=%s", config.Socks5Host),
@@ -1577,15 +1642,37 @@ func (h *PayloadHandler) GeneratePayloadWithContext(
 	}
 	_, err = h.runSerializedBuild(cmd)
 	var (
-		fileInfo     os.FileInfo
-		artifactHash string
+		fileInfo            os.FileInfo
+		artifactHash        string
+		effectiveConfigJSON json.RawMessage
 	)
+	if err == nil {
+		effectiveConfigJSON, err = readEffectiveBuildConfig(
+			cargoBuildDir,
+			effectiveConfigRelativePath,
+			payloadID,
+			listener.ID,
+			mutationSeed,
+			bootstrap.Public,
+		)
+	}
 	if err == nil {
 		fileInfo, artifactHash, err = h.publishGeneratedArtifact(
 			cargoBuildDir,
 			stagingArtifactRelativePath,
 			plannedRelativePath,
 		)
+	}
+	if err == nil {
+		err = createPayloadFileBeneath(
+			h.payloadsDir,
+			configRelativePath,
+			effectiveConfigJSON,
+			0600,
+		)
+		if err != nil {
+			err = fmt.Errorf("publish effective payload config: %w", err)
+		}
 	}
 	if cleanupErr := removePrivateCargoBuildDirectory(
 		cargoBuildRoot,
@@ -1609,6 +1696,7 @@ func (h *PayloadHandler) GeneratePayloadWithContext(
 		return PayloadResult{}, errors.New("payload build failed")
 	}
 	log.Printf("[INFO] Payload build command completed")
+	log.Printf("[INFO] Published effective agent config at: %s", configPath)
 
 	// The build contract has one deterministic artifact path. Publishing,
 	// permission restriction, and hashing all used the same anchored handle;
@@ -1616,29 +1704,55 @@ func (h *PayloadHandler) GeneratePayloadWithContext(
 	log.Printf("[INFO] Published payload at: %s", payloadPath)
 	completedAt := time.Now().UTC()
 
-	// Persist non-secret provenance. Enrollment uses a fresh, deliberately
-	// unrecorded high-entropy build input, so revision and mutation seed
-	// reproduce mutation choices but not the credential-bearing artifact.
-	provenance := map[string]interface{}{
-		"mutation_seed":                mutationSeed,
-		"seed_generated_by_server":     seedGenerated,
-		"git_revision":                 gitRevision(h.agentSourceDir),
-		"target":                       buildTarget,
-		"built_at":                     completedAt.Format(time.RFC3339Nano),
-		"config_sha256":                fmt.Sprintf("%x", sha256.Sum256(configJSON)),
-		"mutation_flags":               []string{"config-xor-key", "junk-code", "surface-strings"},
-		"enrollment_credential_source": "server-generated-ephemeral",
+	// Persist a complete non-secret manifest. Enrollment uses a fresh,
+	// deliberately unrecorded high-entropy build input, so revision and
+	// mutation seed reproduce mutation choices but not the
+	// credential-bearing artifact.
+	manifest := PayloadBuildManifest{
+		SchemaVersion: payloadBuildManifestSchemaV1,
+		PayloadID:     payloadID,
+		ListenerID:    listener.ID,
+		GitRevision:   sourceRevision,
+		SourceState:   sourceState,
+		TargetOS:      plan.profile.targetOS,
+		Architecture:  config.Architecture,
+		TargetTriple:  buildTarget,
+		Format:        config.Format,
+		BuildType:     buildType,
+		EffectiveConfig: append(
+			json.RawMessage(nil),
+			effectiveConfigJSON...,
+		),
+		ConfigSHA256: fmt.Sprintf(
+			"%x",
+			sha256.Sum256(effectiveConfigJSON),
+		),
+		Artifact: PayloadArtifactManifest{
+			Path:     plannedRelativePath,
+			Filename: payloadFileName,
+			Size:     fileInfo.Size(),
+			SHA256:   artifactHash,
+		},
+		CreatedAt:             completedAt.Format(time.RFC3339Nano),
+		MutationSeed:          mutationSeed,
+		SeedGeneratedByServer: seedGenerated,
+		MutationFlags: []string{
+			"config-xor-key",
+			"junk-code",
+			"surface-strings",
+		},
+		EnrollmentCredentialSource: "server-generated-ephemeral",
 	}
 	if err := writeProvenance(
 		h.payloadsDir,
 		plannedRelativePath,
-		provenance,
+		manifest,
 	); err != nil {
-		log.Printf("[WARNING] Failed to write build provenance: %v", err)
+		return PayloadResult{}, err
 	}
-	provenanceJSON, err := json.Marshal(provenance)
+	provenanceJSON, err := json.Marshal(manifest)
 	if err != nil {
-		return PayloadResult{}, fmt.Errorf("marshal payload provenance: %w", err)
+		return PayloadResult{}, fmt.Errorf("marshal payload build manifest: %w", err)
 	}
 	// Create the result
 	result = PayloadResult{
@@ -1650,6 +1764,8 @@ func (h *PayloadHandler) GeneratePayloadWithContext(
 		Path:         payloadPath,
 		Size:         fileInfo.Size(),
 		Created:      completedAt.Format(time.RFC3339Nano),
+		Manifest:     &manifest,
+		ManifestURL:  payloadManifestURL(payloadID),
 		relativePath: plannedRelativePath,
 		sha256:       artifactHash,
 		provenanceJSON: append(
@@ -1666,7 +1782,7 @@ func (h *PayloadHandler) GeneratePayloadWithContext(
 			PayloadBuildID:  payloadID,
 			ListenerID:      listener.ID,
 			BootstrapSHA256: bootstrap.SHA256,
-			MaxSessions:     maxSessions,
+			MaxSessions:     plan.maxSessions,
 		}
 		if err := h.completePayloadBuild(ctx, result, activation); err != nil {
 			return PayloadResult{}, fmt.Errorf("persist completed payload state: %w", err)
@@ -2672,7 +2788,7 @@ func hashOpenArtifact(file *os.File) (string, error) {
 func (h *PayloadHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/payload/generate", h.HandleGeneratePayload)
 	mux.HandleFunc("/api/payload/download/", h.HandleDownloadPayload)
-	mux.HandleFunc("/api/payload/", h.HandleRevokePayloadEnrollment)
+	mux.HandleFunc("/api/payload/", h.HandlePayloadResource)
 }
 
 // SetupRoutes registers payload routes on the default mux for legacy callers.
