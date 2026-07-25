@@ -124,6 +124,9 @@ are visible during development.
 | `/api/agents/{id}/command` | `internal/handlers/api` | Deprecated adapter from a raw command to a v1 shell task. |
 | `/api/agents/{id}/results` | `internal/handlers/api` | Deprecated bare-array result adapter with strict `limit`/`offset` pagination and a 16 MiB encoded-page ceiling; response headers expose count, total, and continuation offset. |
 | `/api/audit/events` | `internal/handlers/api` | Retrieve a bounded, newest-first page of Audit Event v1 records. |
+| `/api/health` | `internal/handlers/api` | Liveness probe; see [health-telemetry.md](health-telemetry.md). |
+| `/api/ready` | `internal/handlers/api` | Readiness probe with per-dependency checks. |
+| `/api/telemetry` | `internal/handlers/api` | Listener runtime status, sanitized error classes, agent counts, queue depth, and recent task/build failure indicators. |
 | `/api/file_drop/upload` | `internal/handlers/api` | Upload operator files into the server file store with a 32 MiB total request cap and same-directory atomic staging. |
 | `/api/file_drop/list` | `internal/handlers/api` | List operator file-drop contents. |
 | `/api/file_drop/download/{name}` | `internal/handlers/api` | Download a verified regular file with causal request/completion audit events. |
