@@ -300,6 +300,33 @@ func (s *DurableStore) List(agentID string) ([]Task, error) {
 	return tasks, nil
 }
 
+// QueueStats aggregates pending and recently failed tasks for this listener
+// scope with two constant-time COUNT aggregates over the durable tasks table.
+// It never scans task payloads, so it stays cheap enough to serve on every
+// telemetry request. failedSince bounds the recent-failure window; pending
+// counts are not windowed.
+func (s *DurableStore) QueueStats(failedSince time.Time) (QueueStats, error) {
+	row := s.db.SQL().QueryRow(
+		`SELECT
+			COALESCE(SUM(CASE WHEN status IN (?, ?) THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(
+				CASE WHEN status = ? AND server_completed_at >= ? THEN 1 ELSE 0 END
+			), 0)
+		 FROM tasks
+		 WHERE listener_id = ?`,
+		string(StatusQueued),
+		string(StatusDispatched),
+		string(StatusFailed),
+		formatDurableTime(failedSince),
+		s.listenerID,
+	)
+	var stats QueueStats
+	if err := row.Scan(&stats.Pending, &stats.RecentFailed); err != nil {
+		return QueueStats{}, fmt.Errorf("summarize durable task queue: %w", err)
+	}
+	return stats, nil
+}
+
 // ListTaskSummariesPage returns newest-first task metadata without selecting
 // stdout or stderr. Keeping the collection query separate from Get prevents a
 // bounded operator page from materializing the full retained result corpus.

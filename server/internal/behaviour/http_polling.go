@@ -62,6 +62,10 @@ type durableLegacyResultPager interface {
 	) ([]tasks.LegacyResult, int, bool, error)
 }
 
+type taskQueueStatsStore interface {
+	QueueStats(failedSince time.Time) (tasks.QueueStats, error)
+}
+
 type taskSummaryPager interface {
 	ListTaskSummariesPage(
 		agentID string,
@@ -912,6 +916,49 @@ func (p *HTTPPollingProtocol) GetAllAgents() map[string]interface{} {
 		result[id] = agent
 	}
 	return result
+}
+
+// RuntimeStats summarizes live agent presence and task backlog for operator
+// telemetry. It reads the same runtime agent registry and task store that
+// heartbeats and dispatch mutate; it is never a separate source of truth.
+type RuntimeStats struct {
+	// ActiveAgents counts agents that completed a heartbeat during this
+	// server process lifetime. Durable agent history loaded at startup does
+	// not count until the agent heartbeats again.
+	ActiveAgents int
+	// PendingTasks counts tasks waiting for an agent or dispatched but not
+	// yet completed.
+	PendingTasks int
+	// RecentFailedTasks counts tasks that failed at or after the
+	// caller-supplied window start.
+	RecentFailedTasks int
+}
+
+// RuntimeStats reports current listener runtime counters. failedSince bounds
+// the recent-failure window; agent presence and pending counts are current
+// point-in-time values. Stores without aggregate support report zero task
+// counters rather than an error.
+func (p *HTTPPollingProtocol) RuntimeStats(failedSince time.Time) (RuntimeStats, error) {
+	var stats RuntimeStats
+	p.agents.Lock()
+	for agentID := range p.agents.list {
+		if p.agents.activeThisBoot[agentID] {
+			stats.ActiveAgents++
+		}
+	}
+	p.agents.Unlock()
+
+	counter, ok := p.taskStore.(taskQueueStatsStore)
+	if !ok {
+		return stats, nil
+	}
+	queue, err := counter.QueueStats(failedSince)
+	if err != nil {
+		return RuntimeStats{}, err
+	}
+	stats.PendingTasks = queue.Pending
+	stats.RecentFailedTasks = queue.RecentFailed
+	return stats, nil
 }
 
 func (p *HTTPPollingProtocol) AgentLastSeen(agentID string) (time.Time, bool) {

@@ -298,6 +298,40 @@ func (s *Store) CompleteWithInfo(agentID string, result Result) (Task, Completio
 	return cloneTask(task), info, nil
 }
 
+// QueueStats summarizes outstanding and recently failed work in a store.
+// It is the machine-readable telemetry view over the same task lifecycle
+// state that dispatch and completion mutate; it never guesses from logs.
+type QueueStats struct {
+	// Pending counts tasks waiting for an agent (queued) or delivered to an
+	// agent but not yet completed (dispatched).
+	Pending int
+	// RecentFailed counts tasks that reached the failed terminal state at or
+	// after the caller-supplied window start.
+	RecentFailed int
+}
+
+// QueueStats aggregates pending and recently failed tasks across all agents
+// in the store. failedSince bounds the recent-failure window; pending counts
+// are not windowed.
+func (s *Store) QueueStats(failedSince time.Time) (QueueStats, error) {
+	failedSince = normalizeTime(failedSince)
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var stats QueueStats
+	for _, task := range s.byID {
+		switch task.Status {
+		case StatusQueued, StatusDispatched:
+			stats.Pending++
+		case StatusFailed:
+			if task.CompletedAt != nil && !task.CompletedAt.Before(failedSince) {
+				stats.RecentFailed++
+			}
+		}
+	}
+	return stats, nil
+}
+
 func (s *Store) Cancel(agentID, taskID string) (Task, error) {
 	if err := validateIDs(agentID, taskID); err != nil {
 		return Task{}, err

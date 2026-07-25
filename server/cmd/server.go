@@ -198,6 +198,10 @@ func main() {
 	// Set up listener management routes
 	listenerHandlers.RegisterRoutes(operatorMux)
 
+	// Set up health, readiness, and runtime telemetry routes
+	healthHandlers := api.NewHealthHandlers(serverManager.GetListenerManager(), stateDatabase)
+	healthHandlers.RegisterRoutes(operatorMux)
+
 	// Set up payload generator routes
 	payloadHandler.RegisterRoutes(operatorMux)
 
