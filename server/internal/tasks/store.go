@@ -1,5 +1,6 @@
 package tasks
 
+import "bytes"
 import (
 	"errors"
 	"fmt"
@@ -96,7 +97,7 @@ func (s *Store) create(agentID string, request CreateRequest, legacyOrigin bool)
 		ID:             uuid.NewString(),
 		AgentID:        agentID,
 		Type:           request.Type,
-		Arguments:      request.Arguments,
+		Arguments:      cloneTaskArguments(request.Arguments),
 		TimeoutSeconds: request.TimeoutSeconds,
 		Status:         StatusQueued,
 		CreatedAt:      now,
@@ -271,6 +272,9 @@ func (s *Store) CompleteWithInfo(agentID string, result Result) (Task, Completio
 			"%w: conflicting repeated terminal result",
 			ErrInvalidTransition,
 		)
+	}
+	if err := validateResultForTask(task, result); err != nil {
+		return Task{}, CompletionInfo{}, err
 	}
 	runningUpdate, ok := s.runningUpdates[task.ID]
 	if !ok {
@@ -537,6 +541,7 @@ func normalizeResult(result Result) Result {
 		exitCode := *result.ExitCode
 		result.ExitCode = &exitCode
 	}
+	result.Output.Data = cloneRawMessage(result.Output.Data)
 	return result
 }
 
@@ -560,7 +565,9 @@ func resultsEqual(left, right Result) bool {
 		left.StartedAt.Equal(right.StartedAt) &&
 		left.CompletedAt.Equal(right.CompletedAt) &&
 		exitCodesEqual(left.ExitCode, right.ExitCode) &&
-		left.Output == right.Output &&
+		left.Output.Stdout == right.Output.Stdout &&
+		left.Output.Stderr == right.Output.Stderr &&
+		bytes.Equal(left.Output.Data, right.Output.Data) &&
 		left.Error == right.Error
 }
 
@@ -582,6 +589,7 @@ func timePointer(value time.Time) *time.Time {
 
 func cloneTask(task *Task) Task {
 	clone := *task
+	clone.Arguments = cloneTaskArguments(task.Arguments)
 	clone.DispatchedAt = cloneTime(task.DispatchedAt)
 	clone.StartedAt = cloneTime(task.StartedAt)
 	clone.CompletedAt = cloneTime(task.CompletedAt)
@@ -596,6 +604,7 @@ func cloneResult(result *Result) *Result {
 	}
 	clone := *result
 	clone.ExitCode = cloneInt(result.ExitCode)
+	clone.Output.Data = cloneRawMessage(result.Output.Data)
 	return &clone
 }
 

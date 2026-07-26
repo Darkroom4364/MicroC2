@@ -19,6 +19,7 @@ import (
 	"microc2/server/internal/audit"
 	"microc2/server/internal/behaviour"
 	"microc2/server/internal/listeners"
+	"microc2/server/internal/modules"
 	"microc2/server/internal/tasks"
 	"microc2/server/pkg/communication"
 )
@@ -39,6 +40,10 @@ func (h *APIHandler) HandleRequest(w http.ResponseWriter, r *http.Request) {
 	// log.Printf("[DEBUG] HandleRequest called: %s %s", r.Method, r.URL.Path)
 	if r.URL.Path == "/api/audit/events" {
 		h.handleAuditEvents(w, r)
+		return
+	}
+	if r.URL.Path == "/api/modules" {
+		h.handleModuleCatalog(w, r)
 		return
 	}
 	if r.URL.Path == "/api/agents/list" {
@@ -94,6 +99,18 @@ func (h *APIHandler) HandleRequest(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusNotFound)
 	w.Write([]byte(`{"error":"unknown operator API route"}`))
+}
+
+func (h *APIHandler) handleModuleCatalog(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if r.URL.RawQuery != "" {
+		http.Error(w, "Module catalog does not accept query parameters", http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, modules.DefaultRegistry().Catalog())
 }
 
 func parseAgentPathID(path, prefix, suffix string) (string, bool) {

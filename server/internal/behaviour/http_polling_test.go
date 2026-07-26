@@ -212,6 +212,100 @@ func TestHTTPPollingProtocolTypedTaskLifecycle(t *testing.T) {
 	}
 }
 
+func TestHTTPPollingProtocolModuleTaskLifecycle(t *testing.T) {
+	proto := NewHTTPPollingProtocol(common.BaseProtocolConfig{UploadDir: t.TempDir(), Port: "0"})
+	handler := proto.GetHTTPHandler()
+	agentID := "agent-one"
+	if err := proto.HandleAgentHeartbeat([]byte(
+		`{"id":"agent-one","os":"linux","hostname":"workstation","ip":"127.0.0.1","module_ids":["agent.capability_inventory.v1"]}`,
+	)); err != nil {
+		t.Fatalf("record module-capable heartbeat: %v", err)
+	}
+
+	expiresIn := 300
+	queued, err := proto.CreateTask(agentID, tasks.CreateRequest{
+		SchemaVersion: tasks.SchemaVersion,
+		Type:          tasks.TypeModule,
+		Arguments: tasks.TaskArguments{
+			ModuleID: "agent.capability_inventory.v1",
+			Input:    json.RawMessage(`{}`),
+		},
+		TimeoutSeconds:   30,
+		ExpiresInSeconds: &expiresIn,
+	})
+	if err != nil {
+		t.Fatalf("queue module task: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/agent/"+agentID+"/tasks", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dispatch module task: %d: %s", rec.Code, rec.Body.String())
+	}
+	var dispatched tasks.Task
+	if err := json.Unmarshal(rec.Body.Bytes(), &dispatched); err != nil {
+		t.Fatalf("decode dispatched module task: %v", err)
+	}
+	if dispatched.ID != queued.ID || dispatched.Type != tasks.TypeModule ||
+		dispatched.Arguments.ModuleID != "agent.capability_inventory.v1" {
+		t.Fatalf("unexpected dispatched module task: %#v", dispatched)
+	}
+
+	startedAt := dispatched.DispatchedAt.Add(time.Second)
+	statusBody, err := json.Marshal(tasks.StatusUpdate{
+		SchemaVersion: tasks.SchemaVersion,
+		TaskID:        dispatched.ID,
+		AgentID:       agentID,
+		Status:        tasks.StatusRunning,
+		Timestamp:     startedAt,
+	})
+	if err != nil {
+		t.Fatalf("marshal module status update: %v", err)
+	}
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(
+		http.MethodPost,
+		"/api/agent/"+agentID+"/tasks/"+dispatched.ID+"/status",
+		bytes.NewReader(statusBody),
+	))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("mark module task running: %d: %s", rec.Code, rec.Body.String())
+	}
+
+	exitCode := 0
+	resultData := json.RawMessage(`{"operating_system":"linux","architecture":"x86_64","logical_cpu_count":8,"total_memory_bytes":17179869184}`)
+	resultBody, err := json.Marshal(tasks.Result{
+		SchemaVersion: tasks.SchemaVersion,
+		TaskID:        dispatched.ID,
+		AgentID:       agentID,
+		Outcome:       tasks.OutcomeCompleted,
+		StartedAt:     startedAt,
+		CompletedAt:   startedAt.Add(time.Second),
+		ExitCode:      &exitCode,
+		Output:        tasks.Output{Stdout: "", Stderr: "", Data: resultData},
+	})
+	if err != nil {
+		t.Fatalf("marshal module result: %v", err)
+	}
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(
+		http.MethodPost,
+		"/api/agent/"+agentID+"/results",
+		bytes.NewReader(resultBody),
+	))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("submit module result: %d: %s", rec.Code, rec.Body.String())
+	}
+	var completed tasks.Task
+	if err := json.Unmarshal(rec.Body.Bytes(), &completed); err != nil {
+		t.Fatalf("decode completed module task: %v", err)
+	}
+	if completed.Status != tasks.StatusCompleted || completed.Result == nil ||
+		string(completed.Result.Output.Data) != string(resultData) {
+		t.Fatalf("unexpected completed module task: %#v", completed)
+	}
+}
+
 func TestHTTPPollingProtocolTypedTaskRejectsInvalidUpdates(t *testing.T) {
 	proto := NewHTTPPollingProtocol(common.BaseProtocolConfig{UploadDir: t.TempDir(), Port: "0"})
 	handler := proto.GetHTTPHandler()

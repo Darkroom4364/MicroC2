@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://microc2.local/schemas/module-capability-inventory-output-v1.schema.json",
+  "title": "MicroC2 Capability Inventory Module Output v1",
+  "description": "Bounded local capability evidence. No host names, IP addresses, process lists, credentials, or arbitrary metadata are permitted.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "operating_system",
+    "architecture",
+    "logical_cpu_count",
+    "total_memory_bytes"
+  ],
+  "properties": {
+    "operating_system": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "\\S"
+    },
+    "architecture": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "\\S"
+    },
+    "logical_cpu_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "total_memory_bytes": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}

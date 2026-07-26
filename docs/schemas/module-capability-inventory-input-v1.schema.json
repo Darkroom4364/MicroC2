@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://microc2.local/schemas/module-capability-inventory-input-v1.schema.json",
+  "title": "MicroC2 Capability Inventory Module Input v1",
+  "description": "The capability inventory is intentionally parameterless and may only inspect the executing agent.",
+  "type": "object",
+  "additionalProperties": false,
+  "maxProperties": 0
+}

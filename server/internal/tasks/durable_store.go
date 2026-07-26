@@ -138,6 +138,10 @@ func (s *DurableStore) create(
 	if err := request.validate(); err != nil {
 		return Task{}, err
 	}
+	argumentsJSON, err := json.Marshal(request.Arguments)
+	if err != nil {
+		return Task{}, fmt.Errorf("encode task arguments: %w", err)
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -185,15 +189,16 @@ func (s *DurableStore) create(
 		ctx,
 		`INSERT INTO tasks (
 			listener_id, task_id, agent_id, schema_version, task_type, command,
-			timeout_seconds, status, created_at, queued_at, expires_at,
+			arguments_json, timeout_seconds, status, created_at, queued_at, expires_at,
 			legacy_origin, created_audit_event_seq
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		s.listenerID,
 		taskID,
 		agentID,
 		SchemaVersion,
 		string(request.Type),
 		request.Arguments.Command,
+		string(argumentsJSON),
 		request.TimeoutSeconds,
 		string(StatusQueued),
 		formatDurableTime(now),
@@ -713,6 +718,9 @@ func (s *DurableStore) CompleteWithInfo(
 		}
 		return record.task, info, nil
 	}
+	if err := validateResultForTask(&record.task, result); err != nil {
+		return Task{}, CompletionInfo{}, err
+	}
 	if record.acceptedRunningAt == nil {
 		return Task{}, CompletionInfo{}, fmt.Errorf(
 			"%w: task has no accepted running update",
@@ -1137,7 +1145,7 @@ const durableTaskSummarySelect = `SELECT
 	t.task_id,
 	t.agent_id,
 	t.task_type,
-	t.command,
+	t.arguments_json,
 	t.timeout_seconds,
 	t.status,
 	t.created_at,
@@ -1163,7 +1171,7 @@ const durableTaskSelect = `SELECT
 	t.task_id,
 	t.agent_id,
 	t.task_type,
-	t.command,
+	t.arguments_json,
 	t.timeout_seconds,
 	t.status,
 	t.created_at,
@@ -1184,7 +1192,8 @@ const durableTaskSelect = `SELECT
 	r.exit_code,
 	r.stdout,
 	r.stderr,
-	r.error
+	r.error,
+	r.data_json
  FROM tasks t
  LEFT JOIN task_results r
    ON r.listener_id = t.listener_id AND r.task_id = t.task_id`
@@ -1203,13 +1212,14 @@ func scanDurableTaskSummary(scanner durableRowScanner) (TaskSummary, error) {
 	var resultStartedAt, resultCompletedAt sql.NullString
 	var resultExitCode sql.NullInt64
 	var resultError sql.NullString
+	var argumentsJSON string
 
 	err := scanner.Scan(
 		&summary.SchemaVersion,
 		&summary.ID,
 		&summary.AgentID,
 		&taskType,
-		&summary.Arguments.Command,
+		&argumentsJSON,
 		&summary.TimeoutSeconds,
 		&status,
 		&createdAt,
@@ -1231,6 +1241,9 @@ func scanDurableTaskSummary(scanner durableRowScanner) (TaskSummary, error) {
 	}
 
 	summary.Type = Type(taskType)
+	if err := decodeStoredTaskArguments(argumentsJSON, &summary.Arguments); err != nil {
+		return TaskSummary{}, err
+	}
 	summary.Status = Status(status)
 	if summary.CreatedAt, err = parseDurableTime(createdAt); err != nil {
 		return TaskSummary{}, fmt.Errorf("parse task created_at: %w", err)
@@ -1300,6 +1313,8 @@ func scanDurableTask(scanner durableRowScanner) (durableTaskRecord, error) {
 	var resultStartedAt, resultCompletedAt sql.NullString
 	var resultExitCode sql.NullInt64
 	var resultStdout, resultStderr, resultError sql.NullString
+	var argumentsJSON string
+	var resultData sql.NullString
 
 	err := scanner.Scan(
 		&record.seq,
@@ -1307,7 +1322,7 @@ func scanDurableTask(scanner durableRowScanner) (durableTaskRecord, error) {
 		&record.task.ID,
 		&record.task.AgentID,
 		&taskType,
-		&record.task.Arguments.Command,
+		&argumentsJSON,
 		&record.task.TimeoutSeconds,
 		&status,
 		&createdAt,
@@ -1329,6 +1344,7 @@ func scanDurableTask(scanner durableRowScanner) (durableTaskRecord, error) {
 		&resultStdout,
 		&resultStderr,
 		&resultError,
+		&resultData,
 	)
 	if err != nil {
 		return durableTaskRecord{}, err
@@ -1337,6 +1353,9 @@ func scanDurableTask(scanner durableRowScanner) (durableTaskRecord, error) {
 	record.task.Type = Type(taskType)
 	record.task.Status = Status(status)
 	record.legacyOrigin = legacyOrigin != 0
+	if err := decodeStoredTaskArguments(argumentsJSON, &record.task.Arguments); err != nil {
+		return durableTaskRecord{}, err
+	}
 	if !createdAuditEventSeq.Valid || createdAuditEventSeq.Int64 <= 0 {
 		return durableTaskRecord{}, errors.New(
 			"durable task is missing its causal audit event",
@@ -1405,8 +1424,28 @@ func scanDurableTask(scanner durableRowScanner) (durableTaskRecord, error) {
 			},
 			Error: resultError.String,
 		}
+		if resultData.Valid {
+			if !json.Valid([]byte(resultData.String)) {
+				return durableTaskRecord{}, errors.New("durable task result data is invalid JSON")
+			}
+			record.task.Result.Output.Data = json.RawMessage(resultData.String)
+		}
 	}
 	return record, nil
+}
+
+func decodeStoredTaskArguments(raw string, destination *TaskArguments) error {
+	if !json.Valid([]byte(raw)) {
+		return errors.New("durable task arguments are invalid JSON")
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &object); err != nil || object == nil {
+		return errors.New("durable task arguments must be an object")
+	}
+	if err := decodeStrictBytes([]byte(raw), destination); err != nil {
+		return fmt.Errorf("decode durable task arguments: %w", err)
+	}
+	return nil
 }
 
 func (s *DurableStore) getTaskTx(
@@ -1653,12 +1692,16 @@ func (s *DurableStore) insertTaskResultTx(
 	if result.ExitCode != nil {
 		exitCode = *result.ExitCode
 	}
+	var outputData interface{}
+	if len(result.Output.Data) != 0 {
+		outputData = string(result.Output.Data)
+	}
 	if _, err := tx.ExecContext(
 		ctx,
 		`INSERT INTO task_results (
 			listener_id, task_id, schema_version, agent_id, outcome,
-			agent_started_at, agent_completed_at, exit_code, stdout, stderr, error
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			agent_started_at, agent_completed_at, exit_code, stdout, stderr, error, data_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		s.listenerID,
 		result.TaskID,
 		result.SchemaVersion,
@@ -1670,6 +1713,7 @@ func (s *DurableStore) insertTaskResultTx(
 		result.Output.Stdout,
 		result.Output.Stderr,
 		result.Error,
+		outputData,
 	); err != nil {
 		return fmt.Errorf("insert durable task result: %w", err)
 	}

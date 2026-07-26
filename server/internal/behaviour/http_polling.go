@@ -95,8 +95,9 @@ type Agent struct {
 	Hostname   string    `json:"hostname"`
 	IP         string    `json:"ip"`
 	IPList     []string  `json:"ip_list,omitempty"`
-	LastSeen   time.Time `json:"last_seen"`
 	Commands   []string  `json:"last_commands"`
+	ModuleIDs  []string  `json:"module_ids,omitempty"`
+	LastSeen   time.Time `json:"last_seen"`
 }
 
 // NewHTTPPollingProtocol creates a new HTTP polling protocol instance
@@ -1008,6 +1009,9 @@ func (p *HTTPPollingProtocol) QueueLegacyShellTaskContext(
 }
 
 func (p *HTTPPollingProtocol) CreateTask(agentID string, createRequest tasks.CreateRequest) (tasks.Task, error) {
+	if err := p.validateModuleTaskCompatibility(agentID, createRequest); err != nil {
+		return tasks.Task{}, err
+	}
 	return p.taskStore.Create(agentID, createRequest)
 }
 
@@ -1018,6 +1022,9 @@ func (p *HTTPPollingProtocol) CreateTaskContext(
 	agentID string,
 	createRequest tasks.CreateRequest,
 ) (tasks.Task, error) {
+	if err := p.validateModuleTaskCompatibility(agentID, createRequest); err != nil {
+		return tasks.Task{}, err
+	}
 	if store, ok := p.taskStore.(interface {
 		CreateContext(
 			context.Context,
@@ -1028,6 +1035,36 @@ func (p *HTTPPollingProtocol) CreateTaskContext(
 		return store.CreateContext(ctx, agentID, createRequest)
 	}
 	return p.taskStore.Create(agentID, createRequest)
+}
+
+func (p *HTTPPollingProtocol) validateModuleTaskCompatibility(
+	agentID string,
+	request tasks.CreateRequest,
+) error {
+	if request.Type != tasks.TypeModule {
+		return nil
+	}
+	if err := tasks.ValidateCreateRequest(request); err != nil {
+		return err
+	}
+	p.agents.Lock()
+	defer p.agents.Unlock()
+	agent := p.agents.list[agentID]
+	if agent == nil {
+		return &tasks.ValidationError{
+			Field:   "arguments.module_id",
+			Message: "selected agent has not advertised module support",
+		}
+	}
+	for _, moduleID := range agent.ModuleIDs {
+		if moduleID == request.Arguments.ModuleID {
+			return nil
+		}
+	}
+	return &tasks.ValidationError{
+		Field:   "arguments.module_id",
+		Message: "is not reported by selected agent",
+	}
 }
 
 func (p *HTTPPollingProtocol) ListTasks(agentID string) ([]tasks.Task, error) {

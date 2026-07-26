@@ -34,8 +34,8 @@ MicroC2 has three primary roles:
 
 The primary command path now uses a versioned typed contract:
 
-1. The operator selects an agent and creates a shell task with
-   `POST /api/agents/{agent_id}/tasks`.
+1. The operator selects an agent and creates a typed shell or registered module
+   task with `POST /api/agents/{agent_id}/tasks`.
 2. The server validates the request, assigns the task ID and v1 envelope, and
    queues it with an expiry and execution timeout.
 3. The agent polls `GET /api/agent/{agent_id}/tasks`; the server dispatches the
@@ -49,9 +49,10 @@ The primary command path now uses a versioned typed contract:
    Task v1 resource, including output, only when the operator opens
    `GET /api/agents/{agent_id}/tasks/{task_id}`.
 
-Shell is the first task type. File transfer, pivot control, and future modules
-should extend this envelope with explicit argument and result schemas rather
-than add new string grammars.
+Shell and the read-only `agent.capability_inventory.v1` module are the active
+task types. File transfer, pivot control, and future modules must extend this
+envelope with explicit argument and result schemas rather than add new string
+grammars or accept operator-provided code.
 
 ### Typed Task Contract v1
 
@@ -64,6 +65,9 @@ The normative contracts are:
 - [Task status update v1](schemas/task-status-update-v1.schema.json)
 - [Task result v1](schemas/task-result-v1.schema.json)
 - [Task result summary v1](schemas/task-result-summary-v1.schema.json)
+- [Module catalog v1](schemas/module-catalog-v1.schema.json)
+- [Capability inventory input v1](schemas/module-capability-inventory-input-v1.schema.json)
+- [Capability inventory output v1](schemas/module-capability-inventory-output-v1.schema.json)
 
 An operator creates a shell task with:
 
@@ -79,13 +83,21 @@ An operator creates a shell task with:
 }
 ```
 
+The module form is selected from `GET /api/modules`; it uses a registered
+`module_id` and closed `input`. The selected agent must have advertised that
+module ID in its authenticated heartbeat. The server validates module inputs and
+completed `output.data` against the registry, and the module's catalog safety
+metadata can require `safety_acknowledged: true` before queueing work.
+
 The server responds with `202 Accepted` and the complete Task v1 resource,
 including `schema_version`, `id`, `agent_id`, status, and server timestamps.
 The terminal Task Result v1 is nested under `result` when present and separates
-`stdout` from `stderr`. Operator list responses are newest-first Task Page v1
-resources with a maximum of 100 Task Summary v1 items. Summaries retain result
-metadata but omit the potentially large output streams; the individual task
-resource is the canonical output retrieval path.
+`stdout` from `stderr`; a completed module result additionally carries
+registry-validated structured evidence in `output.data`. Operator list
+responses are newest-first Task Page v1 resources with a maximum of 100 Task
+Summary v1 items. Summaries retain result metadata but omit potentially large
+output streams and module evidence; the individual task resource is the
+canonical result retrieval path.
 
 The lifecycle is `queued → dispatched → running → completed|failed`. A queued
 task may instead become `cancelled`; a queued or dispatched task becomes
@@ -161,18 +173,22 @@ The active implementation supports:
 - Direct or SOCKS5-proxied HTTP client creation.
 - Per-build bootstrap enrollment and a durable session bound to listener,
   payload, and runtime agent IDs.
-- Authenticated heartbeats with host, OS, local IP, and egress metadata.
+- Authenticated heartbeats with host, OS, local IP, egress metadata, and the
+  compile-time module IDs the payload can execute.
 - Bearer authentication on every task, status, result, and legacy lifecycle
   request, with two-phase rotation and explicit revoke/re-enroll actions.
-- Versioned shell task polling, running acknowledgement, and correlated result
-  submission.
+- Versioned shell and module task polling, running acknowledgement, and
+  correlated result submission.
+- A compile-time module registry; the shipped capability inventory validates
+  empty input and returns bounded OS, architecture, CPU, and memory evidence.
 - Lease-safe task redelivery and an in-memory delivery outbox that retries exact
   acknowledgements/results without re-executing completed work.
-- Server-defined task expiry and agent-enforced command timeout handling.
+- Server-defined task expiry and agent-enforced command or module timeout
+  handling.
 - Process-group (Unix) or job-object (Windows) timeouts and bounded
   stdout/stderr capture.
-- Explicit UTF-8 stdout/stderr in typed results; XOR output remains limited to
-  deprecated legacy result compatibility.
+- Explicit UTF-8 stdout/stderr in typed results; structured module evidence is
+  JSON, and XOR output remains limited to deprecated legacy result compatibility.
 - Adaptive OPSEC scoring and mode transitions.
 - In-memory encryption helper for OPSEC state.
 

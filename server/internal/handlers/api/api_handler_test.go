@@ -12,6 +12,7 @@ import (
 	"microc2/server/internal/behaviour"
 	"microc2/server/internal/common"
 	"microc2/server/internal/listeners"
+	"microc2/server/internal/modules"
 	"microc2/server/internal/persistence"
 	"microc2/server/internal/tasks"
 	"microc2/server/pkg/communication"
@@ -35,6 +36,68 @@ func TestOperatorAPIDoesNotServeAgentPollingRoutes(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("expected operator API to reject agent polling route with 404, got %d", rec.Code)
+	}
+}
+
+func TestOperatorAPIModuleCatalogIsClosedAndReadOnly(t *testing.T) {
+	handler := NewAPIHandler(nil)
+	rec := httptest.NewRecorder()
+	handler.HandleRequest(rec, httptest.NewRequest(http.MethodGet, "/api/modules", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected module catalog 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var catalog modules.Catalog
+	if err := json.Unmarshal(rec.Body.Bytes(), &catalog); err != nil {
+		t.Fatalf("decode module catalog: %v", err)
+	}
+	if catalog.SchemaVersion != modules.SchemaVersion || len(catalog.Modules) != 1 {
+		t.Fatalf("unexpected module catalog: %#v", catalog)
+	}
+	module := catalog.Modules[0]
+	if module.ID != "agent.capability_inventory.v1" ||
+		module.Safety.RiskLevel != "read_only" ||
+		module.Safety.TargetScope != "self" ||
+		module.Safety.RequiresOperatorAcknowledgement {
+		t.Fatalf("unexpected module safety metadata: %#v", module)
+	}
+}
+
+func TestOperatorAPIModuleTaskRequiresAdvertisedAgentCapability(t *testing.T) {
+	handler, proto := newTestAPIHandler(t, "agent-one")
+	request := map[string]interface{}{
+		"schema_version": 1,
+		"type":           "module",
+		"arguments": map[string]interface{}{
+			"module_id": "agent.capability_inventory.v1",
+			"input":     map[string]interface{}{},
+		},
+		"timeout_seconds":    30,
+		"expires_in_seconds": 120,
+	}
+
+	rec := httptest.NewRecorder()
+	handler.HandleRequest(rec, jsonRequest(t, http.MethodPost, "/api/agents/agent-one/tasks", request))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected unsupported module task to fail with 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	heartbeat := []byte(`{"id":"agent-one","os":"linux","hostname":"workstation","ip":"127.0.0.1","module_ids":["agent.capability_inventory.v1"]}`)
+	if err := proto.HandleAgentHeartbeat(heartbeat); err != nil {
+		t.Fatalf("refresh agent module capabilities: %v", err)
+	}
+
+	rec = httptest.NewRecorder()
+	handler.HandleRequest(rec, jsonRequest(t, http.MethodPost, "/api/agents/agent-one/tasks", request))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected module task 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var task tasks.Task
+	if err := json.Unmarshal(rec.Body.Bytes(), &task); err != nil {
+		t.Fatalf("decode created module task: %v", err)
+	}
+	if task.Type != tasks.TypeModule || task.Arguments.ModuleID != "agent.capability_inventory.v1" {
+		t.Fatalf("unexpected created module task: %#v", task)
 	}
 }
 
