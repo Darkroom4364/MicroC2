@@ -454,6 +454,95 @@ func TestManifestUsesExactCredentialFreeConfigExportedByBuild(t *testing.T) {
 	}
 }
 
+func TestReadEffectiveBuildConfigRejectsCredentialMaterial(t *testing.T) {
+	const (
+		payloadID    = "payload-test"
+		listenerID   = "listener-test"
+		mutationSeed = "0123456789abcdef"
+		relativePath = "effective-config.json"
+	)
+	// Base64url for a synthetic 32-byte all-zero credential.
+	credential := strings.Repeat("A", 43)
+	const credentialError = "effective build config contains enrollment credential material"
+
+	testCases := []struct {
+		name    string
+		config  map[string]interface{}
+		wantErr string
+	}{
+		{
+			name: "credential-free identity-matching control",
+			config: map[string]interface{}{
+				"payload_id":    payloadID,
+				"listener_id":   listenerID,
+				"mutation_seed": mutationSeed,
+				"protocol":      "https",
+			},
+		},
+		{
+			name: "enrollment credential field",
+			config: map[string]interface{}{
+				"payload_id":            payloadID,
+				"listener_id":           listenerID,
+				"mutation_seed":         mutationSeed,
+				"protocol":              "https",
+				"enrollment_credential": "not-the-test-credential",
+			},
+			wantErr: credentialError,
+		},
+		{
+			name: "credential bytes elsewhere",
+			config: map[string]interface{}{
+				"payload_id":    payloadID,
+				"listener_id":   listenerID,
+				"mutation_seed": mutationSeed,
+				"protocol":      "https",
+				"note":          credential,
+			},
+			wantErr: credentialError,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			buildRoot := t.TempDir()
+			configJSON, err := json.Marshal(testCase.config)
+			if err != nil {
+				t.Fatalf("marshal effective config: %v", err)
+			}
+			if err := os.WriteFile(
+				filepath.Join(buildRoot, relativePath),
+				configJSON,
+				0o600,
+			); err != nil {
+				t.Fatalf("write effective config: %v", err)
+			}
+
+			_, err = readEffectiveBuildConfig(
+				buildRoot,
+				relativePath,
+				payloadID,
+				listenerID,
+				mutationSeed,
+				credential,
+			)
+			if testCase.wantErr == "" {
+				if err != nil {
+					t.Fatalf("read credential-free effective config: %v", err)
+				}
+				return
+			}
+			if err == nil || err.Error() != testCase.wantErr {
+				t.Fatalf(
+					"read effective config error = %v, want %q",
+					err,
+					testCase.wantErr,
+				)
+			}
+		})
+	}
+}
+
 func validPayloadBuildConfig() PayloadConfig {
 	config := defaultPayloadRequestConfig()
 	config.ListenerID = "listener-one"

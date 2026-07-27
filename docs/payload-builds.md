@@ -40,6 +40,49 @@ OPSEC entry thresholds from 0 through 100 with the Reduced Activity threshold
 strictly below the Full OPSEC threshold. An omitted SOCKS5 host and port resolve
 to `127.0.0.1:9050`; an omitted sleep technique resolves to `standard`.
 
+## Configuration resolution and fallback boundary
+
+Payload requests are bounded to one JSON value and reject unknown fields. The
+decoder preloads the existing OPSEC defaults (scan interval `300`, entry
+thresholds `60`/`20`, durations `300`/`120`/`60`, reduced sleep `120`, and C2
+values `5`, `1.1`, `0.9`, `3600`, and `2`) before decoding. Consequently,
+omitted OPSEC settings receive those defaults, while explicit zero values
+overwrite them and remain subject to validation. The resolver separately maps
+an empty sleep technique to `standard`, an empty SOCKS5 host or zero port to
+`127.0.0.1:9050`, and `max_sessions: 0` to one.
+
+The request must identify a listener, select `agent` or `debugAgent`, select a
+supported architecture/format pair, and provide a positive sleep interval. It
+rejects unsupported profiles, indirect syscalls, custom sleep techniques, all
+DLL-sideload fields, nonzero reserved OPSEC exit thresholds, and invalid
+network or numeric ranges. The server, rather than the request, resolves the
+authoritative listener endpoint and transport, creates the payload identity and
+ephemeral enrollment credential, pins build jitter and transport-safety flags,
+and generates a mutation seed when one is not supplied.
+
+`build.rs` treats any nonempty member of `LISTENER_HOST`, `LISTENER_PORT`,
+`SERVER_URL`, `LISTENER_ID`, `PAYLOAD_ID`, or `ENROLLMENT_CREDENTIAL` as
+production input. That path requires the complete set, a canonical credential,
+and a build nonce; it does not fill a partial production configuration from
+fallback values. When none is present, the hardcoded development fallback has
+blank server URL, listener and payload identities, and enrollment credential,
+so it is unusable for a server connection or enrollment.
+
+Resolved request values are embedded at build time. At startup, the agent
+deobfuscates and validates that embedded configuration, then rejects any
+runtime argument: runtime C2 URL overrides are disabled and require rebuilding
+the payload for a different listener.
+
+For a server build, `build.rs` removes `enrollment_credential` before exporting
+the expected private per-build effective-config file. The server accepts that
+file only when `payload_id`, `listener_id`, and `mutation_seed` match the build
+and its `protocol` is independently `http` or `https`; it rejects both an
+`enrollment_credential` field and the current credential bytes anywhere in the
+JSON. The exact credential-free bytes are then published as `config.json` and
+recorded with their digest in provenance. The raw credential is absent from
+those files, API responses, and logs; enrollment state retains only its hash
+and provenance records `server-generated-ephemeral`.
+
 ## Deterministic Output
 
 Each accepted build publishes exactly one artifact beneath the configured
