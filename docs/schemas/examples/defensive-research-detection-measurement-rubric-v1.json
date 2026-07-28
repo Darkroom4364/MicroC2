@@ -1,0 +1,97 @@
+{
+  "rubric_id": "microc2-defensive-research-detection-measurement-rubric",
+  "rubric_version": "1.0.0",
+  "schema_version": 1,
+  "dimensions": [
+    {
+      "id": "provenance",
+      "definition": "Assess the tamper-evidence and reproducibility properties of redacted observation artifacts by comparing structural metadata across measurement runs. Provenance verification establishes whether observation metadata can be independently reconstructed and whether structural tampering would be detectable.",
+      "category_reference": {
+        "schema_version": 1,
+        "registry_id": "microc2-defensive-research-categories",
+        "registry_version": "1.0.0",
+        "category_id": "integrity-metadata"
+      },
+      "admissible_evidence_classes": [
+        "integrity-metadata"
+      ],
+      "invalid_handling": "reject-assessment",
+      "unknown_handling": "report-as-unknown",
+      "uncertainty_disclosure": "level-with-rationale",
+      "reporting_requirement": "Report provenance integrity level and supporting structural-metadata summary. When integrity verification is impossible due to missing metadata, report provenance as unknown with an explicit rationale.",
+      "comparability_limit": "Provenance comparisons are valid only between measurement runs that share the same observation-artifact schema version. Cross-schema provenance comparisons require explicit normalisation and a documented compatibility matrix."
+    },
+    {
+      "id": "collection-coverage",
+      "definition": "Summarise the defensive-surface coverage achieved by a set of synthetic control measurements. Collection-coverage provides a gap-analysis baseline indicating which defensive surfaces were observed and which remain unobserved without enumerating individual collection points.",
+      "category_reference": {
+        "schema_version": 1,
+        "registry_id": "microc2-defensive-research-categories",
+        "registry_version": "1.0.0",
+        "category_id": "coverage-summary"
+      },
+      "admissible_evidence_classes": [
+        "synthetic-control-summary"
+      ],
+      "invalid_handling": "downgrade-to-unknown",
+      "unknown_handling": "report-as-unknown",
+      "uncertainty_disclosure": "level-with-rationale",
+      "reporting_requirement": "Report coverage level, the set of covered defensive surfaces, and the set of known-unobserved surfaces. Express coverage as a fraction of the total surface inventory defined by the measurement protocol.",
+      "comparability_limit": "Collection-coverage comparisons require the same defensive-surface inventory to be meaningful. Differing surface inventories demand a normalised coverage metric with explicit inventory mapping."
+    },
+    {
+      "id": "validity",
+      "definition": "Aggregate redacted sensor observations to identify whether observed patterns are consistent with the expected defensive-signal model. Validity assessment determines whether the synthetic observation method produces measurements that can be distinguished from noise.",
+      "category_reference": {
+        "schema_version": 1,
+        "registry_id": "microc2-defensive-research-categories",
+        "registry_version": "1.0.0",
+        "category_id": "defensive-observation-summary"
+      },
+      "admissible_evidence_classes": [
+        "redacted-observation-summary"
+      ],
+      "invalid_handling": "reject-assessment",
+      "unknown_handling": "exclude-from-comparison",
+      "uncertainty_disclosure": "level",
+      "reporting_requirement": "Report a discrete validity level with supporting signal-to-noise characterisation. Include the redacted observation count and the fraction that passed the validity threshold.",
+      "comparability_limit": "Validity comparisons are valid only for measurements using identical synthetic-observation parameters. Changes to observation method, sensor configuration, or threshold criteria invalidate direct comparison."
+    },
+    {
+      "id": "uncertainty",
+      "definition": "Characterise the quantification limits and confidence bounds of aggregate measurements. Uncertainty assessment identifies systematic and random error sources that affect the reliability of aggregate observation summaries without exposing raw collection data.",
+      "category_reference": {
+        "schema_version": 1,
+        "registry_id": "microc2-defensive-research-categories",
+        "registry_version": "1.0.0",
+        "category_id": "defensive-observation-summary"
+      },
+      "admissible_evidence_classes": [
+        "aggregate-measurement-summary"
+      ],
+      "invalid_handling": "downgrade-to-unknown",
+      "unknown_handling": "report-as-unknown",
+      "uncertainty_disclosure": "level-with-rationale",
+      "reporting_requirement": "Report an uncertainty level with explicit rationale describing the dominant error sources. Include the estimated magnitude of systematic and random error components and their combined effect on aggregate measurements.",
+      "comparability_limit": "Uncertainty characterisations are valid for comparison only when the measurement protocol, sensor configuration, and aggregation method are held constant. Changes to any of these require a full re-characterisation."
+    },
+    {
+      "id": "missing-unknown-data",
+      "definition": "Identify and classify observational gaps where expected defensive evidence is absent, incomplete, or cannot be confirmed. Missing-unknown-data assessment distinguishes between known gaps (data expected but absent) and unknown gaps (data whose existence cannot be confirmed) to establish the completeness boundary of a measurement run.",
+      "category_reference": {
+        "schema_version": 1,
+        "registry_id": "microc2-defensive-research-categories",
+        "registry_version": "1.0.0",
+        "category_id": "coverage-summary"
+      },
+      "admissible_evidence_classes": [
+        "aggregate-measurement-summary"
+      ],
+      "invalid_handling": "downgrade-to-unknown",
+      "unknown_handling": "report-as-unknown",
+      "uncertainty_disclosure": "level-with-rationale",
+      "reporting_requirement": "Report the count and classification of missing or unknown data points, mapping each gap to the expected defensive surface. Distinguish between known gaps (data expected but absent) and unknown gaps (data whose existence cannot be confirmed).",
+      "comparability_limit": "Missing-unknown-data comparisons require identical surface inventories and observation expectations. Differing measurement-protocol coverage scopes invalidate direct gap comparisons; normalise to a common surface inventory first."
+    }
+  ]
+}
