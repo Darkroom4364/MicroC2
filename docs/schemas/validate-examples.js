@@ -26,6 +26,7 @@ const exampleSchemas = new Map([
     ['audit-page-v1.json', 'audit-page-v1.schema.json'],
     ['defensive-research-categories-v1.json', 'defensive-research-categories-v1.schema.json'],
     ['defensive-research-category-reference-v1.json', 'defensive-research-category-reference-v1.schema.json'],
+    ['defensive-research-detection-measurement-rubric-v1.json', 'defensive-research-detection-measurement-rubric-v1.schema.json'],
     ['task-create-request-v1.json', 'task-create-request-v1.schema.json'],
     ['task-dispatched-v1.json', 'task-v1.schema.json'],
     ['task-page-v1.json', 'task-page-v1.schema.json'],
@@ -548,11 +549,190 @@ for (const testCase of registryNegativeCases) {
     failed = true;
 }
 
+const rubricExample = readJSON(path.join(exampleDirectory, 'defensive-research-detection-measurement-rubric-v1.json'));
+
+const rubricPositiveCases = [
+    {name: 'rubric structure', error: validateRubric(rubricExample, registryExample)}
+];
+for (const testCase of rubricPositiveCases) {
+    if (testCase.error) {
+        console.error(`Defensive research contract failed positive case ${testCase.name}: ${testCase.error}`);
+        failed = true;
+    }
+}
+
+// Schema-negative cases: schema must reject malformed inputs.
+const rubricNegativeCases = [
+    {
+        name: 'rubric rejects 4 dimensions',
+        kind: 'rubric',
+        value: {
+            ...rubricExample,
+            dimensions: rubricExample.dimensions.slice(0, 4)
+        }
+    },
+    {
+        name: 'rubric rejects invalid handling suppress',
+        kind: 'rubric',
+        value: {
+            ...rubricExample,
+            dimensions: rubricExample.dimensions.map((d, i) =>
+                i === 0 ? { ...d, invalid_handling: 'suppress' } : d
+            )
+        }
+    },
+    {
+        name: 'rubric rejects uncertainty disclosure none',
+        kind: 'rubric',
+        value: {
+            ...rubricExample,
+            dimensions: rubricExample.dimensions.map((d, i) =>
+                i === 2 ? { ...d, uncertainty_disclosure: 'none' } : d
+            )
+        }
+    },
+    {
+        name: 'rubric rejects out-of-global-enum evidence class',
+        kind: 'rubric',
+        value: {
+            ...rubricExample,
+            dimensions: rubricExample.dimensions.map((d, i) =>
+                i === 1
+                    ? { ...d, admissible_evidence_classes: ['arbitrary-custom-tooling'] }
+                    : d
+            )
+        }
+    }
+];
+for (const testCase of rubricNegativeCases) {
+    const schemaId = schemaID('defensive-research-detection-measurement-rubric-v1.schema.json');
+    const validateFn = ajv.getSchema(schemaId);
+    if (!validateFn) {
+        console.error(`Defensive research contract schema not loaded: ${schemaId}`);
+        failed = true;
+        continue;
+    }
+    if (validateFn(testCase.value)) {
+        console.error(`Defensive research contract failed negative case ${testCase.name}: schema accepted invalid value`);
+        failed = true;
+    }
+}
+
+// Semantic-negative cases: fixtures are schema-valid before semantic
+// rejection unless explicitly marked expectSchemaValid: false.
+const rubricSemanticNegativeCases = [
+    {
+        name: 'rubric rejects duplicate dimension id',
+        value: {
+            ...rubricExample,
+            dimensions: [
+                rubricExample.dimensions[0],
+                rubricExample.dimensions[1],
+                rubricExample.dimensions[2],
+                rubricExample.dimensions[3],
+                {
+                    ...rubricExample.dimensions[0],
+                    definition: 'A completely different definition for the duplicate-id negative test case that describes an alternative provenance measurement methodology.',
+                    admissible_evidence_classes: ['redacted-observation-summary']
+                }
+            ]
+        }
+    },
+    {
+        name: 'rubric rejects missing dimension id',
+        expectSchemaValid: false,
+        value: {
+            ...rubricExample,
+            dimensions: [
+                rubricExample.dimensions[0],
+                rubricExample.dimensions[2],
+                rubricExample.dimensions[3],
+                rubricExample.dimensions[4]
+            ]
+        }
+    },
+    {
+        name: 'rubric rejects category-disallowed evidence class',
+        value: {
+            ...rubricExample,
+            dimensions: rubricExample.dimensions.map((d, i) =>
+                i === 0
+                    ? { ...d, admissible_evidence_classes: ['synthetic-control-summary'] }
+                    : d
+            )
+        }
+    },
+    {
+        name: 'rubric rejects unknown category id',
+        value: {
+            ...rubricExample,
+            dimensions: rubricExample.dimensions.map((d, i) =>
+                i === 3
+                    ? {
+                        ...d,
+                        category_reference: {
+                            ...d.category_reference,
+                            category_id: 'nonexistent-category'
+                        }
+                    }
+                    : d
+            )
+        }
+    },
+    {
+        name: 'rubric rejects missing-unknown-data with exclude-from-comparison',
+        value: {
+            ...rubricExample,
+            dimensions: rubricExample.dimensions.map((d) =>
+                d.id === 'missing-unknown-data'
+                    ? { ...d, unknown_handling: 'exclude-from-comparison' }
+                    : d
+            )
+        }
+    },
+    {
+        name: 'rubric rejects incompatible registry version',
+        expectSchemaValid: false,
+        value: {
+            ...rubricExample,
+            dimensions: rubricExample.dimensions.map((d) => ({
+                ...d,
+                category_reference: {
+                    ...d.category_reference,
+                    registry_version: '2.0.0'
+                }
+            }))
+        }
+    }
+];
+const rubricSchemaId = schemaID('defensive-research-detection-measurement-rubric-v1.schema.json');
+const rubricValidateFn = ajv.getSchema(rubricSchemaId);
+if (!rubricValidateFn) {
+    console.error(`Defensive research contract schema not loaded: ${rubricSchemaId}`);
+    failed = true;
+}
+if (rubricValidateFn) {
+    for (const testCase of rubricSemanticNegativeCases) {
+        if (testCase.expectSchemaValid !== false) {
+            if (!rubricValidateFn(testCase.value)) {
+                console.error(`Defensive research semantic-negative fixture ${testCase.name} must be schema-valid before semantic rejection but is not: ${ajv.errorsText(rubricValidateFn.errors)}`);
+                failed = true;
+                continue;
+            }
+        }
+        const err = validateRubric(testCase.value, registryExample);
+        if (!err) {
+            console.error(`Defensive research contract failed semantic-negative case: ${testCase.name}`);
+            failed = true;
+        }
+    }
+}
+
 if (failed) {
     process.exitCode = 1;
 } else {
     console.log(
-        `Validated ${exampleFiles.length} examples, ${lifecyclePositiveCases.length} lifecycle states, ${negativeCases.length} schema-negative cases, ${semanticNegativeCases.length + semanticStatusNegativeCases.length} semantic-negative cases, ${registryReferencePositiveCases.length} registry-positive cases, and ${registryNegativeCases.length} registry-negative cases against ${schemaFiles.length} Draft 2020-12 schemas.`
+        `Validated ${exampleFiles.length} examples, ${lifecyclePositiveCases.length} lifecycle states, ${negativeCases.length} schema-negative cases, ${semanticNegativeCases.length + semanticStatusNegativeCases.length} semantic-negative cases, ${registryReferencePositiveCases.length} registry-positive cases, ${registryNegativeCases.length} registry-negative cases, ${rubricNegativeCases.length} rubric schema-negative cases, ${rubricPositiveCases.length} rubric-positive cases, and ${rubricSemanticNegativeCases.length} rubric semantic-negative cases against ${schemaFiles.length} Draft 2020-12 schemas.`
     );
 }
 
@@ -654,5 +834,54 @@ function validateCategoryReference(ref, registry) {
     if (!catIds.has(ref.category_id)) {
         return `referenced category_id ${ref.category_id} is not present in the pinned registry`;
     }
+    return '';
+}
+
+function validateRubric(rubric, registry) {
+    const expectedIDs = new Set([
+        'provenance',
+        'collection-coverage',
+        'validity',
+        'uncertainty',
+        'missing-unknown-data'
+    ]);
+    const seenIDs = new Set();
+    const catMap = new Map(registry.categories.map(c => [c.id, c]));
+
+    for (const dim of rubric.dimensions) {
+        if (seenIDs.has(dim.id)) {
+            return `duplicate dimension id ${dim.id}`;
+        }
+        seenIDs.add(dim.id);
+
+        // Resolve category reference using the existing reusable helper.
+        const refErr = validateCategoryReference(dim.category_reference, registry);
+        if (refErr) {
+            return `dimension ${dim.id}: ${refErr}`;
+        }
+
+        // Each dimension's admissible_evidence_classes must be a subset
+        // of the referenced category's allowed_evidence_classes.
+        const cat = catMap.get(dim.category_reference.category_id);
+        const allowed = new Set(cat.allowed_evidence_classes);
+        for (const cls of dim.admissible_evidence_classes) {
+            if (!allowed.has(cls)) {
+                return `dimension ${dim.id}: evidence class ${cls} is not allowed by category ${cat.id}`;
+            }
+        }
+
+        // missing-unknown-data must use report-as-unknown.
+        if (dim.id === 'missing-unknown-data' && dim.unknown_handling !== 'report-as-unknown') {
+            return `dimension missing-unknown-data: unknown_handling must be report-as-unknown, got ${dim.unknown_handling}`;
+        }
+    }
+
+    // Exact five-ID set: detect missing IDs.
+    for (const id of expectedIDs) {
+        if (!seenIDs.has(id)) {
+            return `missing required dimension id ${id}`;
+        }
+    }
+
     return '';
 }
