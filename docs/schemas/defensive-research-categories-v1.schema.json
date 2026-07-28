@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://microc2.local/schemas/defensive-research-categories-v1.schema.json",
+  "title": "MicroC2 Defensive Research Categories Registry v1",
+  "description": "Immutable, closed-category registry for redacted defensive research evidence classification. Every published registry_version is immutable; semantic changes require a new exact registry version. Consumers pin by registry_id + registry_version and never use ranges or implicit upgrades.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "registry_id",
+    "registry_version",
+    "schema_version",
+    "categories"
+  ],
+  "properties": {
+    "registry_id": {
+      "const": "microc2-defensive-research-categories"
+    },
+    "registry_version": {
+      "const": "1.0.0"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "categories": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/category"
+      }
+    }
+  },
+  "$defs": {
+    "category": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label",
+        "purpose",
+        "allowed_evidence_classes",
+        "excluded_surfaces"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(?:-[a-z][a-z0-9]*)*$",
+          "minLength": 2,
+          "maxLength": 64,
+          "description": "Stable, immutable category identifier (kebab-case)."
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Short human-readable category label."
+        },
+        "purpose": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "Defensive-purpose description of what this category covers and why it is studied."
+        },
+        "allowed_evidence_classes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "redacted-observation-summary",
+              "aggregate-measurement-summary",
+              "integrity-metadata",
+              "synthetic-control-summary"
+            ]
+          },
+          "description": "Closed set of evidence classes permitted for this category."
+        },
+        "excluded_surfaces": {
+          "type": "array",
+          "minItems": 7,
+          "maxItems": 7,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "agent",
+              "payload",
+              "tasking",
+              "transport",
+              "evasion",
+              "credentials",
+              "live_control"
+            ]
+          },
+          "description": "Fixed seven-item set enumerating every category-excluded surface."
+        }
+      }
+    }
+  }
+}

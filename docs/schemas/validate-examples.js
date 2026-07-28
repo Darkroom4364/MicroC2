@@ -24,13 +24,15 @@ for (const file of schemaFiles) {
 
 const exampleSchemas = new Map([
     ['audit-page-v1.json', 'audit-page-v1.schema.json'],
+    ['defensive-research-categories-v1.json', 'defensive-research-categories-v1.schema.json'],
+    ['defensive-research-category-reference-v1.json', 'defensive-research-category-reference-v1.schema.json'],
     ['task-create-request-v1.json', 'task-create-request-v1.schema.json'],
     ['task-dispatched-v1.json', 'task-v1.schema.json'],
     ['task-page-v1.json', 'task-page-v1.schema.json'],
     ['task-result-failed-v1.json', 'task-result-v1.schema.json'],
     ['task-result-v1.json', 'task-result-v1.schema.json'],
     ['task-status-update-v1.json', 'task-status-update-v1.schema.json'],
-    ['task-v1.json', 'task-v1.schema.json']
+    ['task-v1.json', 'task-v1.schema.json'],
 ]);
 
 let failed = false;
@@ -465,11 +467,92 @@ for (const testCase of semanticStatusNegativeCases) {
     }
 }
 
+const registryExample = readJSON(path.join(exampleDirectory, 'defensive-research-categories-v1.json'));
+const referenceExample = readJSON(path.join(exampleDirectory, 'defensive-research-category-reference-v1.json'));
+
+const registryReferencePositiveCases = [
+    {name: 'registry structure', error: validateRegistry(registryExample)},
+    {name: 'reference structure', error: validateCategoryReference(referenceExample, registryExample)}
+];
+for (const testCase of registryReferencePositiveCases) {
+    if (testCase.error) {
+        console.error(`Defensive research contract failed positive case ${testCase.name}: ${testCase.error}`);
+        failed = true;
+    }
+}
+
+// Semantic negative: the duplicate-ID and unknown-category fixtures
+// satisfy their respective JSON Schemas; only the semantic helper
+// must reject them.  The mismatched-version reference is deliberately
+// schema-invalid (const mismatch) — the semantic helper must
+// independently reject it regardless.
+const registryNegativeCases = [
+    {
+        name: 'registry rejects duplicate category id',
+        kind: 'registry',
+        expectSchemaValid: true,
+        value: {
+            ...registryExample,
+            categories: [
+                ...registryExample.categories,
+                {
+                    ...registryExample.categories[0],
+                    label: 'Different Label',
+                    purpose: 'A completely different defensive research purpose for the duplicate-id negative test case.',
+                    allowed_evidence_classes: ['synthetic-control-summary']
+                }
+            ]
+        }
+    },
+    {
+        name: 'reference rejects unknown category id',
+        kind: 'reference',
+        expectSchemaValid: true,
+        value: {
+            ...referenceExample,
+            category_id: 'nonexistent-category'
+        }
+    },
+    {
+        name: 'reference rejects mismatched registry version',
+        kind: 'reference',
+        value: {
+            ...referenceExample,
+            registry_version: '2.0.0'
+        }
+    }
+];
+for (const testCase of registryNegativeCases) {
+    if (testCase.expectSchemaValid) {
+        const schemaId = testCase.kind === 'registry'
+            ? schemaID('defensive-research-categories-v1.schema.json')
+            : schemaID('defensive-research-category-reference-v1.schema.json');
+        const validateFn = ajv.getSchema(schemaId);
+        if (!validateFn) {
+            console.error(`Defensive research contract schema not loaded: ${schemaId}`);
+            failed = true;
+            continue;
+        }
+        if (!validateFn(testCase.value)) {
+            console.error(`Defensive research contract negative fixture ${testCase.name} must be schema-valid before semantic rejection but is not: ${ajv.errorsText(validateFn.errors)}`);
+            failed = true;
+            continue;
+        }
+    }
+    if (testCase.kind === 'registry') {
+        if (validateRegistry(testCase.value)) continue;
+    } else {
+        if (validateCategoryReference(testCase.value, registryExample)) continue;
+    }
+    console.error(`Defensive research contract failed negative case: ${testCase.name}`);
+    failed = true;
+}
+
 if (failed) {
     process.exitCode = 1;
 } else {
     console.log(
-        `Validated ${exampleFiles.length} examples, ${lifecyclePositiveCases.length} lifecycle states, ${negativeCases.length} schema-negative cases, and ${semanticNegativeCases.length + semanticStatusNegativeCases.length} semantic-negative cases against ${schemaFiles.length} Draft 2020-12 schemas.`
+        `Validated ${exampleFiles.length} examples, ${lifecyclePositiveCases.length} lifecycle states, ${negativeCases.length} schema-negative cases, ${semanticNegativeCases.length + semanticStatusNegativeCases.length} semantic-negative cases, ${registryReferencePositiveCases.length} registry-positive cases, and ${registryNegativeCases.length} registry-negative cases against ${schemaFiles.length} Draft 2020-12 schemas.`
     );
 }
 
@@ -548,6 +631,28 @@ function validateStatusTimestamp(update) {
     }
     if (timestamp === Date.parse('0001-01-01T00:00:00Z')) {
         return 'timestamp must not be the zero instant';
+    }
+    return '';
+}
+
+function validateRegistry(registry) {
+    const ids = new Set();
+    for (const cat of registry.categories) {
+        if (ids.has(cat.id)) {
+            return `duplicate category id ${cat.id}`;
+        }
+        ids.add(cat.id);
+    }
+    return '';
+}
+
+function validateCategoryReference(ref, registry) {
+    if (ref.registry_id !== registry.registry_id || ref.registry_version !== registry.registry_version) {
+        return `reference pins ${ref.registry_id}@${ref.registry_version} but registry is ${registry.registry_id}@${registry.registry_version}`;
+    }
+    const catIds = new Set(registry.categories.map(c => c.id));
+    if (!catIds.has(ref.category_id)) {
+        return `referenced category_id ${ref.category_id} is not present in the pinned registry`;
     }
     return '';
 }
