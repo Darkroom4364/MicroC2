@@ -98,6 +98,9 @@ jobs:
       - name: Test
         run: go test ./...
 
+      - name: Race (focused)
+        run: go test -race ./internal/enrollment ./internal/listeners ./internal/tasks ./internal/behaviour
+
       - name: Vet
         run: go vet ./...
 

@@ -50,7 +50,9 @@ It also enforces that pull requests into `main` come from `dev`.
 
 ## Context-Aware Suites
 
-- Server changes run `Go Server`: `go test ./...`, `go vet ./...`, and a server
+- Server changes run `Go Server`: `go test ./...`, a focused
+  `go test -race ./internal/enrollment ./internal/listeners ./internal/tasks ./internal/behaviour`,
+  `go vet ./...`, and a server
   build on Linux, plus `Go Server (Windows)` tests and a native Windows build.
 - Agent changes run `Rust Agent`: `cargo test --locked`,
   `cargo clippy --locked --all-targets`, and `cargo build --locked` on Linux,
@@ -80,6 +82,7 @@ Useful local equivalents before opening a pull request:
 ```sh
 cd server
 go test ./...
+go test -race ./internal/enrollment ./internal/listeners ./internal/tasks ./internal/behaviour
 go vet ./...
 go build -o /tmp/microc2-server ./cmd
 ```
