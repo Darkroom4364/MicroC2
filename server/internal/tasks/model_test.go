@@ -258,3 +258,87 @@ func TestIdentifierValidationUsesCanonicalASCIIAlphabet(t *testing.T) {
 		}
 	}
 }
+
+func TestV1ContractConformanceVectors(t *testing.T) {
+	corpusPath := filepath.Join("..", "..", "..", "docs", "schemas", "contract-vectors-v1.json")
+	data, err := os.ReadFile(corpusPath)
+	if err != nil {
+		t.Fatalf("read contract vectors corpus: %v", err)
+	}
+
+	type vectorEntry struct {
+		ID           string          `json:"id"`
+		SchemaTarget string          `json:"schema_target"`
+		Expected     string          `json:"expected"`
+		Value        json.RawMessage `json:"value"`
+	}
+	var raw struct {
+		SchemaVersion int           `json:"schema_version"`
+		Vectors       []vectorEntry `json:"vectors"`
+	}
+	if err := decodeStrictBytes(data, &raw); err != nil {
+		t.Fatalf("decode contract vectors corpus: %v", err)
+	}
+
+	if raw.SchemaVersion != 1 {
+		t.Fatalf("corpus schema_version must be 1, got %d", raw.SchemaVersion)
+	}
+	if len(raw.Vectors) == 0 {
+		t.Fatal("corpus vectors must be nonempty")
+	}
+
+	seen := make(map[string]bool)
+	for _, v := range raw.Vectors {
+		if v.ID == "" {
+			t.Fatal("vector id must be nonempty")
+		}
+		if seen[v.ID] {
+			t.Fatalf("duplicate vector id %q", v.ID)
+		}
+		seen[v.ID] = true
+
+		switch v.SchemaTarget {
+		case "task-result-v1.schema.json", "task-status-update-v1.schema.json":
+		default:
+			t.Fatalf("unknown schema_target %q in vector %q", v.SchemaTarget, v.ID)
+		}
+
+		switch v.Expected {
+		case "accept", "reject":
+		default:
+			t.Fatalf("invalid expected value %q in vector %q", v.Expected, v.ID)
+		}
+
+		if len(v.Value) == 0 || !json.Valid(v.Value) {
+			t.Fatalf("vector %q has missing or invalid JSON value", v.ID)
+		}
+	}
+
+	for _, v := range raw.Vectors {
+		t.Run(v.ID, func(t *testing.T) {
+			var accepted bool
+			switch v.SchemaTarget {
+			case "task-result-v1.schema.json":
+				var result Result
+				if err := json.Unmarshal(v.Value, &result); err != nil {
+					accepted = false
+				} else {
+					err := result.validate(result.AgentID)
+					accepted = err == nil
+				}
+			case "task-status-update-v1.schema.json":
+				var update StatusUpdate
+				if err := decodeStrictBytes(v.Value, &update); err != nil {
+					accepted = false
+				} else {
+					err := update.validate(update.AgentID, update.TaskID)
+					accepted = err == nil
+				}
+			}
+			wantAccept := v.Expected == "accept"
+			if accepted != wantAccept {
+				t.Fatalf("vector %q target %s: expected accepted=%v, got accepted=%v", v.ID, v.SchemaTarget, wantAccept, accepted)
+			}
+		})
+	}
+}
