@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://microc2.local/schemas/defensive-research-category-reference-v1.schema.json",
+  "title": "MicroC2 Defensive Research Category Reference v1",
+  "description": "Static reference pinning an exact registry version and a single category within it. Not a runtime manifest or contract—consumers use it to declare which category they reference.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "registry_id",
+    "registry_version",
+    "category_id"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "registry_id": {
+      "const": "microc2-defensive-research-categories"
+    },
+    "registry_version": {
+      "const": "1.0.0"
+    },
+    "category_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z][a-z0-9]*)*$",
+      "minLength": 2,
+      "maxLength": 64,
+      "description": "Syntactically valid category identifier; resolvable only against the pinned registry version."
+    }
+  }
+}

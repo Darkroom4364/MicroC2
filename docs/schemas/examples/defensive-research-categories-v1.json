@@ -1,0 +1,28 @@
+{
+  "registry_id": "microc2-defensive-research-categories",
+  "registry_version": "1.0.0",
+  "schema_version": 1,
+  "categories": [
+    {
+      "id": "integrity-metadata",
+      "label": "Integrity Metadata",
+      "purpose": "Characterise the tamper-evidence and reproducibility properties of redacted observation artifacts by comparing structural metadata across measurement runs.",
+      "allowed_evidence_classes": ["integrity-metadata", "redacted-observation-summary"],
+      "excluded_surfaces": ["agent", "payload", "tasking", "transport", "evasion", "credentials", "live_control"]
+    },
+    {
+      "id": "defensive-observation-summary",
+      "label": "Defensive Observation Summary",
+      "purpose": "Aggregate redacted sensor observations to identify baseline patterns useful for defensive classification research without exposing raw collection data.",
+      "allowed_evidence_classes": ["redacted-observation-summary", "aggregate-measurement-summary"],
+      "excluded_surfaces": ["agent", "payload", "tasking", "transport", "evasion", "credentials", "live_control"]
+    },
+    {
+      "id": "coverage-summary",
+      "label": "Coverage Summary",
+      "purpose": "Summarise the defensive-surface coverage achieved by a set of synthetic control measurements, providing a gap-analysis baseline without enumerating individual collection points.",
+      "allowed_evidence_classes": ["synthetic-control-summary", "aggregate-measurement-summary"],
+      "excluded_surfaces": ["agent", "payload", "tasking", "transport", "evasion", "credentials", "live_control"]
+    }
+  ]
+}
