@@ -1,0 +1,250 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://microc2.local/schemas/defensive-research-experiment-evidence-package-manifest-v1.schema.json",
+  "title": "MicroC2 Defensive Research Experiment-Evidence Package Manifest v1",
+  "description": "Immutable, static manifest for identifier-free redacted or synthetic defensive-research evidence. It pins the existing Audit Event v1, category registry, and detection-measurement rubric contracts without importing raw audit events or introducing runtime behavior.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "package_id",
+    "package_version",
+    "schema_version",
+    "rubric_reference",
+    "registry_reference",
+    "provenance",
+    "files"
+  ],
+  "properties": {
+    "package_id": {
+      "const": "microc2-defensive-research-experiment-evidence-package"
+    },
+    "package_version": {
+      "const": "1.0.0"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "rubric_reference": {
+      "$ref": "#/$defs/rubricReference"
+    },
+    "registry_reference": {
+      "$ref": "#/$defs/registryReference"
+    },
+    "provenance": {
+      "$ref": "#/$defs/provenance"
+    },
+    "files": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 6,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/file"
+      },
+      "allOf": [
+        {
+          "contains": {
+            "$ref": "#/$defs/manifestFile"
+          },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {
+            "$ref": "#/$defs/evidenceFile"
+          },
+          "minContains": 1,
+          "maxContains": 5
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "rubricReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rubric_id",
+        "rubric_version",
+        "schema_version"
+      ],
+      "properties": {
+        "rubric_id": {
+          "const": "microc2-defensive-research-detection-measurement-rubric"
+        },
+        "rubric_version": {
+          "const": "1.0.0"
+        },
+        "schema_version": {
+          "const": 1
+        }
+      }
+    },
+    "registryReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "registry_id",
+        "registry_version",
+        "schema_version"
+      ],
+      "properties": {
+        "registry_id": {
+          "const": "microc2-defensive-research-categories"
+        },
+        "registry_version": {
+          "const": "1.0.0"
+        },
+        "schema_version": {
+          "const": 1
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "audit_event_schema_id",
+        "audit_event_schema_version",
+        "derivative_profile_id",
+        "derivative_profile_version"
+      ],
+      "properties": {
+        "audit_event_schema_id": {
+          "const": "https://microc2.local/schemas/audit-event-v1.schema.json"
+        },
+        "audit_event_schema_version": {
+          "const": 1
+        },
+        "derivative_profile_id": {
+          "const": "microc2-audit-event-v1-identifier-free-summary"
+        },
+        "derivative_profile_version": {
+          "const": "1.0.0"
+        }
+      }
+    },
+    "file": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/manifestFile"
+        },
+        {
+          "$ref": "#/$defs/evidenceFile"
+        }
+      ]
+    },
+    "manifestFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "file_id",
+        "file_name",
+        "role"
+      ],
+      "properties": {
+        "file_id": {
+          "const": "manifest"
+        },
+        "file_name": {
+          "const": "manifest.json"
+        },
+        "role": {
+          "const": "manifest"
+        }
+      }
+    },
+    "evidenceFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "file_id",
+        "file_name",
+        "role",
+        "sha256"
+      ],
+      "properties": {
+        "file_id": {
+          "type": "string",
+          "pattern": "^evidence-[0-9]{3}$"
+        },
+        "file_name": {
+          "type": "string",
+          "pattern": "^evidence-[0-9]{3}\\.json$"
+        },
+        "role": {
+          "const": "audit-event-v1-evidence"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "evidenceEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "entry_id",
+        "schema_version",
+        "rubric_dimension_id",
+        "evidence_class",
+        "source_mode",
+        "derivative_summary"
+      ],
+      "properties": {
+        "entry_id": {
+          "type": "string",
+          "pattern": "^evidence-[0-9]{3}$"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "rubric_dimension_id": {
+          "enum": [
+            "provenance",
+            "collection-coverage",
+            "validity",
+            "uncertainty",
+            "missing-unknown-data"
+          ]
+        },
+        "evidence_class": {
+          "enum": [
+            "integrity-metadata",
+            "redacted-observation-summary",
+            "aggregate-measurement-summary",
+            "synthetic-control-summary"
+          ]
+        },
+        "source_mode": {
+          "enum": [
+            "redacted",
+            "synthetic"
+          ]
+        },
+        "derivative_summary": {
+          "$ref": "#/$defs/countOnlySummary"
+        }
+      }
+    },
+    "countOnlySummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "summary_kind",
+        "record_count"
+      ],
+      "properties": {
+        "summary_kind": {
+          "const": "count-only"
+        },
+        "record_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100000
+        }
+      }
+    }
+  }
+}

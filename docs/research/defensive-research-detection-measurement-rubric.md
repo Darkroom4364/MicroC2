@@ -150,7 +150,7 @@ This rubric MUST NOT produce a single composite score, pass/fail verdict, or agg
 
 ## Relationship to Issue #124
 
-Issue #124 (upcoming) defines a redacted experiment-evidence package manifest for measurement-trial packages. That manifest MAY pin this rubric by `rubric_id` + `rubric_version` to declare which interpretive framework governs the contained observations. This rubric does not create, validate, or reference any package, manifest, or evidence record. The dependency is one-way: #124 may point here; this rubric points only to the defensive research categories registry.
+The [Issue #124 experiment-evidence package manifest](./defensive-research-experiment-evidence-package-manifest.md) pins this rubric by `rubric_id` + `rubric_version` to declare which interpretive framework governs contained observations. Each bounded evidence entry names a rubric dimension; the package validator resolves its category and evidence class through this rubric and the pinned registry. The rubric does not validate or consume packages or evidence records. The dependency is one-way: #124 may point here; this rubric points only to the defensive research categories registry.
 
 ## Validation
 

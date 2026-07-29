@@ -1,6 +1,8 @@
 'use strict';
 
+const crypto = require('node:crypto');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const Ajv2020 = require('ajv/dist/2020');
 const addFormats = require('ajv-formats');
@@ -728,11 +730,476 @@ if (rubricValidateFn) {
     }
 }
 
+const evidencePackageSchemaFile = 'defensive-research-experiment-evidence-package-manifest-v1.schema.json';
+const evidencePackageSchemaId = schemaID(evidencePackageSchemaFile);
+const evidencePackageFixtureDirectory = path.join(
+    exampleDirectory,
+    'defensive-research-experiment-evidence-package-manifest-v1'
+);
+const evidencePackageManifest = readJSON(path.join(evidencePackageFixtureDirectory, 'manifest.json'));
+const evidenceEntryFixture = readJSON(path.join(evidencePackageFixtureDirectory, 'evidence-001.json'));
+const auditEventSchema = readJSON(path.join(schemaDirectory, 'audit-event-v1.schema.json'));
+const evidencePackageValidate = ajv.getSchema(evidencePackageSchemaId);
+const evidenceEntryValidate = ajv.getSchema(`${evidencePackageSchemaId}#/$defs/evidenceEntry`);
+const evidencePackageContext = {
+    manifestValidate: evidencePackageValidate,
+    entryValidate: evidenceEntryValidate,
+    rubric: rubricExample,
+    registry: registryExample,
+    auditEventSchema,
+    derivativeProfileID: 'microc2-audit-event-v1-identifier-free-summary',
+    derivativeProfileVersion: '1.0.0'
+};
+const evidencePackageMappingCases = [
+    {
+        name: 'provenance mapping',
+        rubricDimensionID: 'provenance',
+        evidenceClass: 'integrity-metadata'
+    },
+    {
+        name: 'collection coverage mapping',
+        rubricDimensionID: 'collection-coverage',
+        evidenceClass: 'synthetic-control-summary'
+    },
+    {
+        name: 'validity mapping',
+        rubricDimensionID: 'validity',
+        evidenceClass: 'redacted-observation-summary'
+    },
+    {
+        name: 'uncertainty mapping',
+        rubricDimensionID: 'uncertainty',
+        evidenceClass: 'aggregate-measurement-summary'
+    },
+    {
+        name: 'missing unknown data mapping',
+        rubricDimensionID: 'missing-unknown-data',
+        evidenceClass: 'aggregate-measurement-summary'
+    }
+];
+const evidencePackagePositiveCases = [];
+if (!evidencePackageValidate || !evidenceEntryValidate) {
+    console.error('Evidence package contract schema or entry subschema was not loaded.');
+    failed = true;
+} else {
+    evidencePackagePositiveCases.push({
+        name: 'package fixture',
+        error: validateEvidencePackageDirectory(evidencePackageFixtureDirectory, evidencePackageContext)
+    });
+    for (const testCase of evidencePackageMappingCases) {
+        const error = withTemporaryEvidencePackage(
+            evidencePackageFixtureDirectory,
+            (temporaryDirectory) => {
+                const entryPath = path.join(temporaryDirectory, 'evidence-001.json');
+                const entry = readJSON(entryPath);
+                entry.rubric_dimension_id = testCase.rubricDimensionID;
+                entry.evidence_class = testCase.evidenceClass;
+                writeJSON(entryPath, entry);
+                updateEvidencePackageDigest(temporaryDirectory, 'evidence-001');
+            },
+            (temporaryDirectory) => validateEvidencePackageDirectory(temporaryDirectory, evidencePackageContext)
+        );
+        evidencePackagePositiveCases.push({name: testCase.name, error});
+    }
+}
+for (const testCase of evidencePackagePositiveCases) {
+    if (testCase.error) {
+        console.error(`Evidence package contract failed positive case ${testCase.name}: ${testCase.error}`);
+        failed = true;
+    }
+}
+
+const evidencePackageSchemaNegativeCases = [
+    {
+        name: 'package rejects incompatible package version',
+        kind: 'manifest',
+        value: {
+            ...evidencePackageManifest,
+            package_version: '2.0.0'
+        }
+    },
+    {
+        name: 'package rejects incompatible rubric version',
+        kind: 'manifest',
+        value: {
+            ...evidencePackageManifest,
+            rubric_reference: {
+                ...evidencePackageManifest.rubric_reference,
+                rubric_version: '2.0.0'
+            }
+        }
+    },
+    {
+        name: 'package rejects incompatible registry version',
+        kind: 'manifest',
+        value: {
+            ...evidencePackageManifest,
+            registry_reference: {
+                ...evidencePackageManifest.registry_reference,
+                registry_version: '2.0.0'
+            }
+        }
+    },
+    {
+        name: 'package rejects incompatible Audit Event schema identity',
+        kind: 'manifest',
+        value: {
+            ...evidencePackageManifest,
+            provenance: {
+                ...evidencePackageManifest.provenance,
+                audit_event_schema_id: 'https://microc2.local/schemas/audit-event-v2.schema.json'
+            }
+        }
+    },
+    {
+        name: 'package rejects incompatible Audit Event schema version',
+        kind: 'manifest',
+        value: {
+            ...evidencePackageManifest,
+            provenance: {
+                ...evidencePackageManifest.provenance,
+                audit_event_schema_version: 2
+            }
+        }
+    },
+    {
+        name: 'package rejects incompatible derivative profile id',
+        kind: 'manifest',
+        value: {
+            ...evidencePackageManifest,
+            provenance: {
+                ...evidencePackageManifest.provenance,
+                derivative_profile_id: 'arbitrary-profile'
+            }
+        }
+    },
+    {
+        name: 'package rejects incompatible derivative profile version',
+        kind: 'manifest',
+        value: {
+            ...evidencePackageManifest,
+            provenance: {
+                ...evidencePackageManifest.provenance,
+                derivative_profile_version: '2.0.0'
+            }
+        }
+    },
+    {
+        name: 'package rejects an unapproved file role',
+        kind: 'manifest',
+        value: {
+            ...evidencePackageManifest,
+            files: evidencePackageManifest.files.map((file) =>
+                file.role === 'audit-event-v1-evidence'
+                    ? {...file, role: 'artifact'}
+                    : file
+            )
+        }
+    },
+    {
+        name: 'package rejects an uppercase digest',
+        kind: 'manifest',
+        value: {
+            ...evidencePackageManifest,
+            files: evidencePackageManifest.files.map((file) =>
+                file.role === 'audit-event-v1-evidence'
+                    ? {...file, sha256: file.sha256.toUpperCase()}
+                    : file
+            )
+        }
+    },
+    {
+        name: 'package rejects a path-shaped file name',
+        kind: 'manifest',
+        value: {
+            ...evidencePackageManifest,
+            files: evidencePackageManifest.files.map((file) =>
+                file.role === 'audit-event-v1-evidence'
+                    ? {...file, file_name: '/evidence-001.json'}
+                    : file
+            )
+        }
+    },
+    {
+        name: 'package rejects arbitrary metadata',
+        kind: 'manifest',
+        value: {
+            ...evidencePackageManifest,
+            metadata: 'not-permitted'
+        }
+    },
+    {
+        name: 'package rejects an arbitrary URL',
+        kind: 'manifest',
+        value: {
+            ...evidencePackageManifest,
+            url: 'not-permitted'
+        }
+    },
+    ...[
+        'actor',
+        'action',
+        'route',
+        'target',
+        'outcome',
+        'identifier',
+        'body',
+        'raw_log',
+        'artifact',
+        'endpoint',
+        'command',
+        'output',
+        'credential',
+        'full_path',
+        'database',
+        'payload',
+        'listener',
+        'task',
+        'result',
+        'network',
+        'export'
+    ].map((property) => ({
+        name: `evidence entry rejects ${property}`,
+        kind: 'entry',
+        value: {
+            ...evidenceEntryFixture,
+            [property]: 'not-permitted'
+        }
+    })),
+    {
+        name: 'evidence entry rejects an unapproved source mode',
+        kind: 'entry',
+        value: {
+            ...evidenceEntryFixture,
+            source_mode: 'live'
+        }
+    },
+    {
+        name: 'evidence entry rejects a non-count summary',
+        kind: 'entry',
+        value: {
+            ...evidenceEntryFixture,
+            derivative_summary: {
+                ...evidenceEntryFixture.derivative_summary,
+                summary_kind: 'details'
+            }
+        }
+    }
+];
+if (evidencePackageValidate && evidenceEntryValidate) {
+    for (const testCase of evidencePackageSchemaNegativeCases) {
+        const validate = testCase.kind === 'manifest'
+            ? evidencePackageValidate
+            : evidenceEntryValidate;
+        if (validate(testCase.value)) {
+            console.error(`Evidence package contract failed schema-negative case: ${testCase.name}`);
+            failed = true;
+        }
+    }
+}
+
+const evidencePackageSemanticNegativeCases = [
+    {
+        name: 'package rejects category-valid but rubric-invalid evidence class',
+        expectedReason: 'rubric evidence-class mapping',
+        mutate: (temporaryDirectory) => {
+            const entryPath = path.join(temporaryDirectory, 'evidence-001.json');
+            const entry = readJSON(entryPath);
+            entry.evidence_class = 'aggregate-measurement-summary';
+            writeJSON(entryPath, entry);
+            updateEvidencePackageDigest(temporaryDirectory, 'evidence-001');
+        }
+    },
+    {
+        name: 'package rejects duplicate rubric dimension',
+        expectedReason: 'duplicate rubric dimension',
+        mutate: (temporaryDirectory) => {
+            const entry = readJSON(path.join(temporaryDirectory, 'evidence-001.json'));
+            const duplicateEntry = {
+                ...entry,
+                entry_id: 'evidence-002'
+            };
+            const duplicatePath = path.join(temporaryDirectory, 'evidence-002.json');
+            writeJSON(duplicatePath, duplicateEntry);
+            const manifestPath = path.join(temporaryDirectory, 'manifest.json');
+            const manifest = readJSON(manifestPath);
+            manifest.files.push({
+                file_id: 'evidence-002',
+                file_name: 'evidence-002.json',
+                role: 'audit-event-v1-evidence',
+                sha256: sha256File(duplicatePath)
+            });
+            writeJSON(manifestPath, manifest);
+        }
+    },
+    {
+        name: 'package rejects descriptor entry id mismatch',
+        expectedReason: 'descriptor-entry mapping',
+        mutate: (temporaryDirectory) => {
+            const entryPath = path.join(temporaryDirectory, 'evidence-001.json');
+            const entry = readJSON(entryPath);
+            entry.entry_id = 'evidence-002';
+            writeJSON(entryPath, entry);
+            updateEvidencePackageDigest(temporaryDirectory, 'evidence-001');
+        }
+    },
+    {
+        name: 'package rejects a missing declared file',
+        expectedReason: 'missing file',
+        preconditionScope: 'manifest-only',
+        mutate: (temporaryDirectory) => {
+            fs.rmSync(path.join(temporaryDirectory, 'evidence-001.json'));
+        }
+    },
+    {
+        name: 'package rejects a digest mismatch',
+        expectedReason: 'digest mismatch',
+        mutate: (temporaryDirectory) => {
+            const entryPath = path.join(temporaryDirectory, 'evidence-001.json');
+            const entry = readJSON(entryPath);
+            entry.derivative_summary.record_count = 2;
+            writeJSON(entryPath, entry);
+        }
+    },
+    {
+        name: 'package rejects an undeclared file',
+        expectedReason: 'undeclared directory entry',
+        mutate: (temporaryDirectory) => {
+            fs.writeFileSync(path.join(temporaryDirectory, 'undeclared.json'), '{}\n');
+        }
+    },
+    {
+        name: 'package rejects a directory',
+        expectedReason: 'non-regular directory entry',
+        preconditionScope: 'manifest-only',
+        mutate: (temporaryDirectory) => {
+            const entryPath = path.join(temporaryDirectory, 'evidence-001.json');
+            fs.rmSync(entryPath);
+            fs.mkdirSync(entryPath);
+        }
+    },
+    {
+        name: 'package rejects a sidecar symlink',
+        expectedReason: 'symbolic link',
+        preconditionScope: 'manifest-only',
+        mutate: (temporaryDirectory) => {
+            const entryPath = path.join(temporaryDirectory, 'evidence-001.json');
+            fs.rmSync(entryPath);
+            return createEvidencePackageSymlink(
+                path.join(temporaryDirectory, 'manifest.json'),
+                entryPath
+            );
+        }
+    },
+    {
+        name: 'package rejects a malformed manifest',
+        expectedReason: 'manifest is not valid JSON',
+        expectSchemaValid: false,
+        mutate: (temporaryDirectory) => {
+            fs.writeFileSync(path.join(temporaryDirectory, 'manifest.json'), '{"package_id":');
+        }
+    },
+    {
+        name: 'package rejects a manifest symlink',
+        expectedReason: 'symbolic link',
+        expectSchemaValid: false,
+        mutate: (temporaryDirectory) => {
+            const manifestPath = path.join(temporaryDirectory, 'manifest.json');
+            fs.rmSync(manifestPath);
+            return createEvidencePackageSymlink(
+                path.join(temporaryDirectory, 'evidence-001.json'),
+                manifestPath
+            );
+        }
+    },
+    {
+        name: 'package rejects duplicate manifest members before schema validation',
+        expectedReason: 'duplicate JSON member name',
+        mutate: (temporaryDirectory) => {
+            const manifestPath = path.join(temporaryDirectory, 'manifest.json');
+            writeJSONWithDiscardedDuplicate(
+                manifestPath,
+                readJSON(manifestPath),
+                'package_version',
+                'discarded-unsafe-looking-text'
+            );
+        }
+    },
+    {
+        name: 'package rejects duplicate sidecar members before digest validation',
+        expectedReason: 'duplicate JSON member name',
+        mutate: (temporaryDirectory) => {
+            const entryPath = path.join(temporaryDirectory, 'evidence-001.json');
+            writeJSONWithDiscardedDuplicate(
+                entryPath,
+                readJSON(entryPath),
+                'source_mode',
+                'discarded-command-output-like-text'
+            );
+            updateEvidencePackageDigest(temporaryDirectory, 'evidence-001');
+        }
+    },
+    {
+        name: 'package rejects decoded duplicate nested sidecar members before digest validation',
+        expectedReason: 'duplicate JSON member name',
+        mutate: (temporaryDirectory) => {
+            const entryPath = path.join(temporaryDirectory, 'evidence-001.json');
+            writeJSONWithDiscardedNestedDuplicate(
+                entryPath,
+                readJSON(entryPath),
+                'derivative_summary',
+                'record_count',
+                'discarded-unsafe-looking-text',
+                '"record_\\u0063ount"'
+            );
+            updateEvidencePackageDigest(temporaryDirectory, 'evidence-001');
+        }
+    }
+];
+if (evidencePackageValidate && evidenceEntryValidate) {
+    for (const testCase of evidencePackageSemanticNegativeCases) {
+        let shouldValidate = true;
+        const error = withTemporaryEvidencePackage(
+            evidencePackageFixtureDirectory,
+            (temporaryDirectory) => {
+                shouldValidate = testCase.mutate(temporaryDirectory) !== false;
+            },
+            (temporaryDirectory) => {
+                if (!shouldValidate) return '';
+                if (testCase.expectSchemaValid !== false) {
+                    const preconditionError = validateEvidencePackageOrdinarySchemaPrecondition(
+                        temporaryDirectory,
+                        evidencePackageContext,
+                        testCase.preconditionScope || 'full'
+                    );
+                    if (preconditionError) {
+                        return `test precondition failed: ${preconditionError}`;
+                    }
+                }
+                return validateEvidencePackageDirectory(temporaryDirectory, evidencePackageContext);
+            }
+        );
+        if (!shouldValidate) {
+            console.log(`Evidence package contract skipped creation-level symlink case: ${testCase.name}`);
+            continue;
+        }
+        if (error.startsWith('test precondition failed:')) {
+            console.error(`Evidence package contract invalid semantic-negative precondition ${testCase.name}: ${error}`);
+            failed = true;
+            continue;
+        }
+        if (!error || !error.includes(testCase.expectedReason)) {
+            console.error(`Evidence package contract failed semantic-negative case: ${testCase.name}`);
+            failed = true;
+        }
+    }
+}
+
 if (failed) {
     process.exitCode = 1;
 } else {
     console.log(
-        `Validated ${exampleFiles.length} examples, ${lifecyclePositiveCases.length} lifecycle states, ${negativeCases.length} schema-negative cases, ${semanticNegativeCases.length + semanticStatusNegativeCases.length} semantic-negative cases, ${registryReferencePositiveCases.length} registry-positive cases, ${registryNegativeCases.length} registry-negative cases, ${rubricNegativeCases.length} rubric schema-negative cases, ${rubricPositiveCases.length} rubric-positive cases, and ${rubricSemanticNegativeCases.length} rubric semantic-negative cases against ${schemaFiles.length} Draft 2020-12 schemas.`
+        `Validated ${exampleFiles.length} examples, ${lifecyclePositiveCases.length} lifecycle states, ${negativeCases.length} schema-negative cases, ${semanticNegativeCases.length + semanticStatusNegativeCases.length} semantic-negative cases, ${registryReferencePositiveCases.length} registry-positive cases, ${registryNegativeCases.length} registry-negative cases, ${rubricNegativeCases.length} rubric schema-negative cases, ${rubricPositiveCases.length} rubric-positive cases, ${rubricSemanticNegativeCases.length} rubric semantic-negative cases, ${evidencePackagePositiveCases.length} evidence-package positive cases, ${evidencePackageSchemaNegativeCases.length} evidence-package schema-negative cases, and ${evidencePackageSemanticNegativeCases.length} evidence-package semantic-negative cases against ${schemaFiles.length} Draft 2020-12 schemas.`
     );
 }
 
@@ -884,4 +1351,596 @@ function validateRubric(rubric, registry) {
     }
 
     return '';
+}
+
+function validateEvidencePackageDirectory(directory, context) {
+    const inventory = inspectEvidencePackageDirectory(directory);
+    if (inventory.error) return inventory.error;
+
+    const manifestResult = readEvidencePackageJSON(inventory.entryPaths.get('manifest.json'), 'manifest');
+    if (manifestResult.error) return manifestResult.error;
+
+    return validateEvidencePackage(manifestResult.value, inventory, context);
+}
+
+function inspectEvidencePackageDirectory(directory) {
+    let root;
+    try {
+        root = fs.lstatSync(directory);
+    } catch {
+        return {error: 'package root cannot be inspected'};
+    }
+    if (root.isSymbolicLink()) {
+        return {error: 'package root must not be a symbolic link'};
+    }
+    if (!root.isDirectory()) {
+        return {error: 'package root is not a directory'};
+    }
+
+    let names;
+    try {
+        names = fs.readdirSync(directory);
+    } catch {
+        return {error: 'package directory cannot be read'};
+    }
+
+    const entryPaths = new Map();
+    for (const name of names) {
+        const entryPath = path.join(directory, name);
+        let entry;
+        try {
+            entry = fs.lstatSync(entryPath);
+        } catch {
+            return {error: 'package directory entry cannot be inspected'};
+        }
+        if (entry.isSymbolicLink()) {
+            return {error: 'package contains a symbolic link'};
+        }
+        if (!entry.isFile()) {
+            return {error: 'package contains a non-regular directory entry'};
+        }
+        entryPaths.set(name, entryPath);
+    }
+    if (!entryPaths.has('manifest.json')) {
+        return {error: 'package is missing manifest.json'};
+    }
+
+    return {entryPaths};
+}
+
+function readEvidencePackageJSON(file, documentKind) {
+    let source;
+    try {
+        source = fs.readFileSync(file, 'utf8');
+    } catch {
+        return {error: `${documentKind} cannot be read`};
+    }
+
+    const scanError = scanEvidencePackageJSONForDuplicateKeys(source);
+    if (scanError === 'duplicate') {
+        return {error: `${documentKind} contains duplicate JSON member name`};
+    }
+    if (scanError) {
+        return {error: `${documentKind} is not valid JSON`};
+    }
+
+    try {
+        return {value: JSON.parse(source)};
+    } catch {
+        return {error: `${documentKind} is not valid JSON`};
+    }
+}
+
+function scanEvidencePackageJSONForDuplicateKeys(source) {
+    const state = {source, index: 0};
+    try {
+        skipEvidencePackageJSONWhitespace(state);
+        scanEvidencePackageJSONValue(state);
+        skipEvidencePackageJSONWhitespace(state);
+        if (state.index !== source.length) {
+            throw {kind: 'invalid'};
+        }
+        return '';
+    } catch (error) {
+        return error && error.kind === 'duplicate' ? 'duplicate' : 'invalid';
+    }
+}
+
+function scanEvidencePackageJSONValue(state) {
+    skipEvidencePackageJSONWhitespace(state);
+    const character = state.source[state.index];
+    if (character === '{') {
+        scanEvidencePackageJSONObject(state);
+        return;
+    }
+    if (character === '[') {
+        scanEvidencePackageJSONArray(state);
+        return;
+    }
+    if (character === '"') {
+        scanEvidencePackageJSONString(state);
+        return;
+    }
+    if (character === '-' || isEvidencePackageJSONDigit(character)) {
+        scanEvidencePackageJSONNumber(state);
+        return;
+    }
+    if (state.source.startsWith('true', state.index)) {
+        state.index += 4;
+        return;
+    }
+    if (state.source.startsWith('false', state.index)) {
+        state.index += 5;
+        return;
+    }
+    if (state.source.startsWith('null', state.index)) {
+        state.index += 4;
+        return;
+    }
+    throw {kind: 'invalid'};
+}
+
+function scanEvidencePackageJSONObject(state) {
+    state.index += 1;
+    skipEvidencePackageJSONWhitespace(state);
+    if (state.source[state.index] === '}') {
+        state.index += 1;
+        return;
+    }
+
+    const keys = new Set();
+    while (true) {
+        if (state.source[state.index] !== '"') {
+            throw {kind: 'invalid'};
+        }
+        const key = scanEvidencePackageJSONString(state);
+        if (keys.has(key)) {
+            throw {kind: 'duplicate'};
+        }
+        keys.add(key);
+
+        skipEvidencePackageJSONWhitespace(state);
+        if (state.source[state.index] !== ':') {
+            throw {kind: 'invalid'};
+        }
+        state.index += 1;
+        scanEvidencePackageJSONValue(state);
+        skipEvidencePackageJSONWhitespace(state);
+
+        if (state.source[state.index] === '}') {
+            state.index += 1;
+            return;
+        }
+        if (state.source[state.index] !== ',') {
+            throw {kind: 'invalid'};
+        }
+        state.index += 1;
+        skipEvidencePackageJSONWhitespace(state);
+    }
+}
+
+function scanEvidencePackageJSONArray(state) {
+    state.index += 1;
+    skipEvidencePackageJSONWhitespace(state);
+    if (state.source[state.index] === ']') {
+        state.index += 1;
+        return;
+    }
+
+    while (true) {
+        scanEvidencePackageJSONValue(state);
+        skipEvidencePackageJSONWhitespace(state);
+        if (state.source[state.index] === ']') {
+            state.index += 1;
+            return;
+        }
+        if (state.source[state.index] !== ',') {
+            throw {kind: 'invalid'};
+        }
+        state.index += 1;
+        skipEvidencePackageJSONWhitespace(state);
+    }
+}
+
+function scanEvidencePackageJSONString(state) {
+    if (state.source[state.index] !== '"') {
+        throw {kind: 'invalid'};
+    }
+    state.index += 1;
+    let decoded = '';
+    while (state.index < state.source.length) {
+        const character = state.source[state.index];
+        state.index += 1;
+        if (character === '"') {
+            return decoded;
+        }
+        if (character === '\\') {
+            const escape = state.source[state.index];
+            state.index += 1;
+            if (escape === '"' || escape === '\\' || escape === '/') {
+                decoded += escape;
+                continue;
+            }
+            if (escape === 'b') {
+                decoded += '\b';
+                continue;
+            }
+            if (escape === 'f') {
+                decoded += '\f';
+                continue;
+            }
+            if (escape === 'n') {
+                decoded += '\n';
+                continue;
+            }
+            if (escape === 'r') {
+                decoded += '\r';
+                continue;
+            }
+            if (escape === 't') {
+                decoded += '\t';
+                continue;
+            }
+            if (escape === 'u') {
+                decoded += String.fromCharCode(scanEvidencePackageJSONHexCodeUnit(state));
+                continue;
+            }
+            throw {kind: 'invalid'};
+        }
+        if (character.charCodeAt(0) <= 0x1f) {
+            throw {kind: 'invalid'};
+        }
+        decoded += character;
+    }
+    throw {kind: 'invalid'};
+}
+
+function scanEvidencePackageJSONHexCodeUnit(state) {
+    if (state.index + 4 > state.source.length) {
+        throw {kind: 'invalid'};
+    }
+    let value = 0;
+    for (let offset = 0; offset < 4; offset += 1) {
+        const digit = evidencePackageJSONHexValue(state.source[state.index + offset]);
+        if (digit < 0) {
+            throw {kind: 'invalid'};
+        }
+        value = (value * 16) + digit;
+    }
+    state.index += 4;
+    return value;
+}
+
+function scanEvidencePackageJSONNumber(state) {
+    if (state.source[state.index] === '-') {
+        state.index += 1;
+    }
+    if (state.source[state.index] === '0') {
+        state.index += 1;
+        if (isEvidencePackageJSONDigit(state.source[state.index])) {
+            throw {kind: 'invalid'};
+        }
+    } else {
+        if (!isEvidencePackageJSONNonzeroDigit(state.source[state.index])) {
+            throw {kind: 'invalid'};
+        }
+        state.index += 1;
+        while (isEvidencePackageJSONDigit(state.source[state.index])) {
+            state.index += 1;
+        }
+    }
+    if (state.source[state.index] === '.') {
+        state.index += 1;
+        if (!isEvidencePackageJSONDigit(state.source[state.index])) {
+            throw {kind: 'invalid'};
+        }
+        while (isEvidencePackageJSONDigit(state.source[state.index])) {
+            state.index += 1;
+        }
+    }
+    if (state.source[state.index] === 'e' || state.source[state.index] === 'E') {
+        state.index += 1;
+        if (state.source[state.index] === '+' || state.source[state.index] === '-') {
+            state.index += 1;
+        }
+        if (!isEvidencePackageJSONDigit(state.source[state.index])) {
+            throw {kind: 'invalid'};
+        }
+        while (isEvidencePackageJSONDigit(state.source[state.index])) {
+            state.index += 1;
+        }
+    }
+}
+
+function skipEvidencePackageJSONWhitespace(state) {
+    while (
+        state.source[state.index] === ' ' ||
+        state.source[state.index] === '\n' ||
+        state.source[state.index] === '\r' ||
+        state.source[state.index] === '\t'
+    ) {
+        state.index += 1;
+    }
+}
+
+function isEvidencePackageJSONDigit(character) {
+    return character >= '0' && character <= '9';
+}
+
+function isEvidencePackageJSONNonzeroDigit(character) {
+    return character >= '1' && character <= '9';
+}
+
+function evidencePackageJSONHexValue(character) {
+    if (character >= '0' && character <= '9') return character.charCodeAt(0) - 48;
+    if (character >= 'a' && character <= 'f') return character.charCodeAt(0) - 87;
+    if (character >= 'A' && character <= 'F') return character.charCodeAt(0) - 55;
+    return -1;
+}
+
+function validateEvidencePackage(manifest, inventory, context) {
+    if (!context.manifestValidate(manifest)) {
+        return 'manifest does not satisfy its schema';
+    }
+
+    const pinError = validateEvidencePackagePins(manifest, context);
+    if (pinError) return pinError;
+
+    const descriptorsByName = new Map();
+    const descriptorsByID = new Map();
+    let manifestCount = 0;
+    for (const descriptor of manifest.files) {
+        if (descriptorsByName.has(descriptor.file_name)) {
+            return 'package inventory has duplicate descriptor names';
+        }
+        if (descriptorsByID.has(descriptor.file_id)) {
+            return 'package inventory has duplicate descriptor ids';
+        }
+        descriptorsByName.set(descriptor.file_name, descriptor);
+        descriptorsByID.set(descriptor.file_id, descriptor);
+        if (descriptor.role === 'manifest') {
+            manifestCount += 1;
+        } else if (descriptor.file_name !== `${descriptor.file_id}.json`) {
+            return 'package inventory has invalid evidence descriptor naming';
+        }
+    }
+    if (manifestCount !== 1) {
+        return 'package inventory has invalid manifest descriptor count';
+    }
+
+    for (const name of inventory.entryPaths.keys()) {
+        if (!descriptorsByName.has(name)) {
+            return 'package contains an undeclared directory entry';
+        }
+    }
+    for (const name of descriptorsByName.keys()) {
+        if (!inventory.entryPaths.has(name)) {
+            return 'package declares a missing file';
+        }
+    }
+
+    const parsedEntries = [];
+    for (const descriptor of manifest.files) {
+        if (descriptor.role === 'manifest') continue;
+        const entryResult = readEvidencePackageJSON(
+            inventory.entryPaths.get(descriptor.file_name),
+            'evidence entry'
+        );
+        if (entryResult.error) return entryResult.error;
+        parsedEntries.push({
+            descriptor,
+            entry: entryResult.value,
+            entryPath: inventory.entryPaths.get(descriptor.file_name)
+        });
+    }
+
+    const dimensionsByID = new Map(context.rubric.dimensions.map(dimension => [dimension.id, dimension]));
+    const categoriesByID = new Map(context.registry.categories.map(category => [category.id, category]));
+    const seenDimensions = new Set();
+    for (const {descriptor, entry, entryPath} of parsedEntries) {
+        if (!context.entryValidate(entry)) {
+            return 'evidence entry does not satisfy its schema';
+        }
+        if (entry.entry_id !== descriptor.file_id) {
+            return 'package has a descriptor-entry mapping mismatch';
+        }
+
+        let digest;
+        try {
+            digest = sha256File(entryPath);
+        } catch {
+            return 'evidence entry cannot be read';
+        }
+        if (digest !== descriptor.sha256) {
+            return 'evidence entry has a digest mismatch';
+        }
+        if (seenDimensions.has(entry.rubric_dimension_id)) {
+            return 'package has a duplicate rubric dimension';
+        }
+        seenDimensions.add(entry.rubric_dimension_id);
+
+        const dimension = dimensionsByID.get(entry.rubric_dimension_id);
+        if (!dimension) {
+            return 'pinned rubric dimension is invalid';
+        }
+        if (
+            dimension.category_reference.registry_id !== manifest.registry_reference.registry_id ||
+            dimension.category_reference.registry_version !== manifest.registry_reference.registry_version ||
+            dimension.category_reference.schema_version !== manifest.registry_reference.schema_version
+        ) {
+            return 'pinned rubric category reference does not match the manifest registry pin';
+        }
+        if (validateCategoryReference(dimension.category_reference, context.registry)) {
+            return 'pinned rubric category reference is invalid';
+        }
+
+        const category = categoriesByID.get(dimension.category_reference.category_id);
+        if (!category.allowed_evidence_classes.includes(entry.evidence_class)) {
+            return 'registry evidence-class mapping is invalid';
+        }
+        if (!dimension.admissible_evidence_classes.includes(entry.evidence_class)) {
+            return 'rubric evidence-class mapping is invalid';
+        }
+    }
+
+    return '';
+}
+
+function validateEvidencePackageOrdinarySchemaPrecondition(directory, context, scope) {
+    const manifestResult = readEvidencePackageJSONOrdinarily(path.join(directory, 'manifest.json'));
+    if (manifestResult.error) return manifestResult.error;
+    if (!context.manifestValidate(manifestResult.value)) {
+        return 'ordinary manifest parse is not schema-valid';
+    }
+
+    // Missing or non-regular declared entries are inventory cases; their valid
+    // manifest is the only applicable schema precondition.
+    if (scope === 'manifest-only') return '';
+
+    for (const descriptor of manifestResult.value.files) {
+        if (descriptor.role === 'manifest') continue;
+        const entryResult = readEvidencePackageJSONOrdinarily(
+            path.join(directory, descriptor.file_name)
+        );
+        if (entryResult.error) return entryResult.error;
+        if (!context.entryValidate(entryResult.value)) {
+            return 'ordinary evidence entry parse is not schema-valid';
+        }
+    }
+    return '';
+}
+
+function readEvidencePackageJSONOrdinarily(file) {
+    let source;
+    try {
+        source = fs.readFileSync(file, 'utf8');
+    } catch {
+        return {error: 'ordinary JSON precondition cannot read package input'};
+    }
+    try {
+        return {value: JSON.parse(source)};
+    } catch {
+        return {error: 'ordinary JSON precondition cannot parse package input'};
+    }
+}
+
+function validateEvidencePackagePins(manifest, context) {
+    if (
+        manifest.rubric_reference.rubric_id !== context.rubric.rubric_id ||
+        manifest.rubric_reference.rubric_version !== context.rubric.rubric_version ||
+        manifest.rubric_reference.schema_version !== context.rubric.schema_version
+    ) {
+        return 'manifest rubric reference does not match the pinned rubric';
+    }
+    if (
+        manifest.registry_reference.registry_id !== context.registry.registry_id ||
+        manifest.registry_reference.registry_version !== context.registry.registry_version ||
+        manifest.registry_reference.schema_version !== context.registry.schema_version
+    ) {
+        return 'manifest registry reference does not match the pinned registry';
+    }
+
+    const auditEventSchemaVersion = context.auditEventSchema.properties.schema_version.const;
+    if (
+        manifest.provenance.audit_event_schema_id !== context.auditEventSchema.$id ||
+        manifest.provenance.audit_event_schema_version !== auditEventSchemaVersion
+    ) {
+        return 'manifest provenance does not match the pinned Audit Event schema';
+    }
+    if (
+        manifest.provenance.derivative_profile_id !== context.derivativeProfileID ||
+        manifest.provenance.derivative_profile_version !== context.derivativeProfileVersion
+    ) {
+        return 'manifest provenance does not match the fixed derivative profile';
+    }
+
+    return '';
+}
+
+function withTemporaryEvidencePackage(fixtureDirectory, mutate, validate) {
+    const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'microc2-evidence-package-'));
+    const temporaryDirectory = path.join(temporaryRoot, 'package');
+    try {
+        fs.cpSync(fixtureDirectory, temporaryDirectory, {recursive: true, dereference: true});
+        mutate(temporaryDirectory);
+        return validate(temporaryDirectory);
+    } finally {
+        fs.rmSync(temporaryRoot, {recursive: true, force: true});
+    }
+}
+
+function createEvidencePackageSymlink(target, linkPath) {
+    try {
+        fs.symlinkSync(target, linkPath);
+        return true;
+    } catch (error) {
+        // Windows may deny unprivileged symlink setup; Linux CI still covers
+        // the validator path, and this reports a setup-only skipped case.
+        if (
+            process.platform === 'win32' &&
+            (error && (error.code === 'EPERM' || error.code === 'EACCES'))
+        ) {
+            return false;
+        }
+        throw error;
+    }
+}
+
+function updateEvidencePackageDigest(directory, entryID) {
+    const manifestPath = path.join(directory, 'manifest.json');
+    const manifest = readJSON(manifestPath);
+    const descriptor = manifest.files.find(file => file.file_id === entryID);
+    if (!descriptor) {
+        throw new Error(`missing descriptor for ${entryID}`);
+    }
+    descriptor.sha256 = sha256File(path.join(directory, descriptor.file_name));
+    writeJSON(manifestPath, manifest);
+}
+
+function sha256File(file) {
+    return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+}
+
+function writeJSON(file, value) {
+    fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function writeJSONWithDiscardedDuplicate(file, value, property, discardedValue) {
+    const members = [];
+    for (const [key, memberValue] of Object.entries(value)) {
+        if (key === property) {
+            members.push(`${JSON.stringify(key)}: ${JSON.stringify(discardedValue)}`);
+        }
+        members.push(`${JSON.stringify(key)}: ${JSON.stringify(memberValue)}`);
+    }
+    fs.writeFileSync(file, `{\n  ${members.join(',\n  ')}\n}\n`);
+}
+
+function writeJSONWithDiscardedNestedDuplicate(
+    file,
+    value,
+    parentProperty,
+    property,
+    discardedValue,
+    encodedProperty
+) {
+    const members = [];
+    for (const [key, memberValue] of Object.entries(value)) {
+        if (key !== parentProperty) {
+            members.push(`${JSON.stringify(key)}: ${JSON.stringify(memberValue)}`);
+            continue;
+        }
+
+        const nestedMembers = [];
+        for (const [nestedKey, nestedValue] of Object.entries(memberValue)) {
+            if (nestedKey === property) {
+                nestedMembers.push(`${JSON.stringify(nestedKey)}: ${JSON.stringify(discardedValue)}`);
+                nestedMembers.push(`${encodedProperty}: ${JSON.stringify(nestedValue)}`);
+                continue;
+            }
+            nestedMembers.push(`${JSON.stringify(nestedKey)}: ${JSON.stringify(nestedValue)}`);
+        }
+        members.push(`${JSON.stringify(key)}: {\n    ${nestedMembers.join(',\n    ')}\n  }`);
+    }
+    fs.writeFileSync(file, `{\n  ${members.join(',\n  ')}\n}\n`);
 }

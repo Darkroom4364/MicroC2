@@ -1,0 +1,34 @@
+{
+  "package_id": "microc2-defensive-research-experiment-evidence-package",
+  "package_version": "1.0.0",
+  "schema_version": 1,
+  "rubric_reference": {
+    "rubric_id": "microc2-defensive-research-detection-measurement-rubric",
+    "rubric_version": "1.0.0",
+    "schema_version": 1
+  },
+  "registry_reference": {
+    "registry_id": "microc2-defensive-research-categories",
+    "registry_version": "1.0.0",
+    "schema_version": 1
+  },
+  "provenance": {
+    "audit_event_schema_id": "https://microc2.local/schemas/audit-event-v1.schema.json",
+    "audit_event_schema_version": 1,
+    "derivative_profile_id": "microc2-audit-event-v1-identifier-free-summary",
+    "derivative_profile_version": "1.0.0"
+  },
+  "files": [
+    {
+      "file_id": "manifest",
+      "file_name": "manifest.json",
+      "role": "manifest"
+    },
+    {
+      "file_id": "evidence-001",
+      "file_name": "evidence-001.json",
+      "role": "audit-event-v1-evidence",
+      "sha256": "9c2ccef6a1280a1846393c8a734b90bfb718d5bfa273f9958e9a8c3a01dc6767"
+    }
+  ]
+}
