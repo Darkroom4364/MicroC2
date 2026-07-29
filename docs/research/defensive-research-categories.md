@@ -40,7 +40,7 @@ These surfaces are **never** in scope for any defensive research category. The `
 ### Relationship to Future Work
 
 - **Issue #123 (detection-measurement rubric)** may reference categories from this registry to scope what is measured and how.
-- **Issue #124 (redacted experiment-evidence package manifest)** may record a pinned category reference in its package metadata.
+- **[Issue #124 experiment-evidence package manifest](./defensive-research-experiment-evidence-package-manifest.md)** pins this registry version and resolves each bounded rubric-dimension entry against it.
 - Neither issue requires changes to the registry itself; they consume it as a pinned, immutable reference.
 
 ### What This Registry Is Not
