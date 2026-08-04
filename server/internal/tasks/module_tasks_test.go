@@ -10,14 +10,11 @@ func TestModuleTaskLifecycleValidatesClosedResultData(t *testing.T) {
 	now := time.Date(2026, time.July, 26, 12, 0, 0, 0, time.UTC)
 	store := NewStoreWithClock(func() time.Time { return now })
 	expiresIn := 300
-	task, err := store.Create("agent-one", CreateRequest{
-		SchemaVersion: SchemaVersion,
-		Type:          TypeModule,
-		Arguments: TaskArguments{
-			ModuleID: "agent.capability_inventory.v1",
-			Input:    json.RawMessage(`{}`),
-		},
-		TimeoutSeconds:   DefaultTimeoutSeconds,
+	task, err := store.CreateModule("agent-one", ModuleCreateRequest{
+		SchemaVersion:    SchemaVersion,
+		ModuleID:         "agent.capability_inventory.v1",
+		Input:            json.RawMessage(`{}`),
+		TimeoutSeconds:   moduleTaskMaxTimeoutSeconds,
 		ExpiresInSeconds: &expiresIn,
 	})
 	if err != nil {
@@ -27,7 +24,10 @@ func TestModuleTaskLifecycleValidatesClosedResultData(t *testing.T) {
 		t.Fatalf("module task arguments did not round-trip: %#v", task.Arguments)
 	}
 
-	dispatched, found, err := store.DispatchNext("agent-one")
+	dispatched, found, err := store.DispatchNextEligible(
+		"agent-one",
+		map[string]struct{}{"agent.capability_inventory.v1": {}},
+	)
 	if err != nil || !found {
 		t.Fatalf("dispatch module task: found=%v err=%v", found, err)
 	}
@@ -82,29 +82,26 @@ func TestModuleTaskLifecycleValidatesClosedResultData(t *testing.T) {
 
 func TestModuleTaskRejectsUnknownModuleAndUnexpectedInput(t *testing.T) {
 	expiresIn := 300
-	base := CreateRequest{
+	base := ModuleCreateRequest{
 		SchemaVersion:    SchemaVersion,
-		Type:             TypeModule,
-		TimeoutSeconds:   DefaultTimeoutSeconds,
+		ModuleID:         "agent.capability_inventory.v1",
+		Input:            json.RawMessage(`{}`),
+		TimeoutSeconds:   moduleTaskMaxTimeoutSeconds,
 		ExpiresInSeconds: &expiresIn,
-		Arguments: TaskArguments{
-			ModuleID: "agent.capability_inventory.v1",
-			Input:    json.RawMessage(`{}`),
-		},
 	}
-	if err := ValidateCreateRequest(base); err != nil {
+	if _, err := NewStore().CreateModule("agent-one", base); err != nil {
 		t.Fatalf("validate known module request: %v", err)
 	}
 
 	unknown := base
-	unknown.Arguments.ModuleID = "agent.unknown.v1"
-	if err := ValidateCreateRequest(unknown); err == nil {
+	unknown.ModuleID = "agent.unknown.v1"
+	if _, err := NewStore().CreateModule("agent-one", unknown); err == nil {
 		t.Fatal("accepted unknown module")
 	}
 
 	unexpectedInput := base
-	unexpectedInput.Arguments.Input = json.RawMessage(`{"unexpected":true}`)
-	if err := ValidateCreateRequest(unexpectedInput); err == nil {
+	unexpectedInput.Input = json.RawMessage(`{"unexpected":true}`)
+	if _, err := NewStore().CreateModule("agent-one", unexpectedInput); err == nil {
 		t.Fatal("accepted unexpected module input")
 	}
 }

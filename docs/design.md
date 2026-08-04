@@ -34,10 +34,10 @@ MicroC2 has three primary roles:
 
 The primary command path now uses a versioned typed contract:
 
-1. The operator selects an agent and creates a typed shell or registered module
-   task with `POST /api/agents/{agent_id}/tasks`.
-2. The server validates the request, assigns the task ID and v1 envelope, and
-   queues it with an expiry and execution timeout.
+1. The operator creates a typed shell task at `POST /api/agents/{agent_id}/tasks`
+   or the governed inventory task at `POST /api/agents/{agent_id}/module-tasks`.
+2. The server validates the closed route-specific request, assigns the task ID
+   and v1 envelope, and queues it with an expiry and execution timeout.
 3. The agent polls `GET /api/agent/{agent_id}/tasks`; the server dispatches the
    next task or returns `204 No Content`.
 4. The agent acknowledges execution through
@@ -59,6 +59,7 @@ grammars or accept operator-provided code.
 The normative contracts are:
 
 - [Create Task Request v1](schemas/task-create-request-v1.schema.json)
+- [Module Task Create Request v1](schemas/module-task-create-request-v1.schema.json)
 - [Task v1](schemas/task-v1.schema.json)
 - [Task summary v1](schemas/task-summary-v1.schema.json)
 - [Task page v1](schemas/task-page-v1.schema.json)
@@ -83,11 +84,14 @@ An operator creates a shell task with:
 }
 ```
 
-The module form is selected from `GET /api/modules`; it uses a registered
-`module_id` and closed `input`. The selected agent must have advertised that
-module ID in its authenticated heartbeat. The server validates module inputs and
-completed `output.data` against the registry, and the module's catalog safety
-metadata can require `safety_acknowledged: true` before queueing work.
+The sole governed module is selected from `GET /api/modules` but created only
+at `/module-tasks` with `module_id: "agent.capability_inventory.v1"`, exact
+empty `input`, a 1–5 second timeout, and a bounded expiry. The selected agent
+must have a current authenticated heartbeat advertisement. The server derives
+the read-only/self, evidence-required, no-approval policy from its registry and
+stores it outside Task v1 and the agent wire; request acknowledgements and
+policy fields are rejected. Successful module `output.data` must satisfy the
+closed registry schema and be no larger than 1024 bytes.
 
 The server responds with `202 Accepted` and the complete Task v1 resource,
 including `schema_version`, `id`, `agent_id`, status, and server timestamps.
@@ -109,8 +113,8 @@ agent's execution timestamps without making clock synchronization a transition
 precondition.
 
 `POST /api/agents/command` and `POST /api/agents/{agent_id}/command` remain
-temporary compatibility adapters. They translate legacy raw commands into v1
-shell tasks and are deprecated: new UI and API clients must use `/tasks`.
+deprecated arbitrary-shell compatibility adapters. New shell callers use
+`/tasks`; governed inventory callers use `/module-tasks`.
 
 ## Server Design
 

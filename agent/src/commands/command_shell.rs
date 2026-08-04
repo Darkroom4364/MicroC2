@@ -1980,6 +1980,7 @@ mod tests {
             module_id: Some(crate::modules::CAPABILITY_INVENTORY_ID.to_string()),
             input: Some(serde_json::json!({})),
         };
+        task.timeout_seconds = 5;
         task.validate_for_agent("agent-one")
             .expect("valid module task");
 

@@ -4,9 +4,11 @@
 package modules
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"unicode/utf8"
 )
@@ -190,9 +192,36 @@ func decodeObject(raw json.RawMessage) (map[string]json.RawMessage, error) {
 	if len(raw) == 0 || !json.Valid(raw) {
 		return nil, errors.New("must be valid JSON")
 	}
-	var object map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
 		return nil, errors.New("must be an object")
+	}
+	object := make(map[string]json.RawMessage)
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return nil, errors.New("must be an object")
+		}
+		name, ok := token.(string)
+		if !ok {
+			return nil, errors.New("must be an object")
+		}
+		if _, exists := object[name]; exists {
+			return nil, fmt.Errorf("must not contain duplicate top-level property %q", name)
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, errors.New("must be valid JSON")
+		}
+		object[name] = value
+	}
+	token, err = decoder.Token()
+	if err != nil || token != json.Delim('}') {
+		return nil, errors.New("must be an object")
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return nil, errors.New("must contain exactly one JSON object")
 	}
 	return object, nil
 }

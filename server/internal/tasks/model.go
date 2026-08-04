@@ -22,6 +22,12 @@ const (
 	DefaultExpiresIn      = 300
 	MaxExpiresIn          = 604800
 
+	moduleTaskMaxInputBytes          = 1024
+	moduleTaskMaxOutputBytes         = 1024
+	moduleTaskMaxTimeoutSeconds      = 5
+	capabilityInventoryModuleID      = "agent.capability_inventory.v1"
+	capabilityInventoryModuleVersion = 1
+
 	// The task API is intentionally bounded because agent-facing listeners must
 	// treat both task output and compromised agents as untrusted input.
 	MaxCommandCharacters      = 8 << 10
@@ -264,15 +270,37 @@ func Summarize(task Task) TaskSummary {
 	return summary
 }
 
-// CreateRequest is the operator-facing subset of Task. Identity, state, and
-// timestamps are assigned by the server.
+// CreateRequest is the closed shell-task operator request. Identity, state,
+// and timestamps are assigned by the server.
 type CreateRequest struct {
-	SchemaVersion      int           `json:"schema_version,omitempty"`
-	Type               Type          `json:"type"`
-	Arguments          TaskArguments `json:"arguments"`
-	TimeoutSeconds     int           `json:"timeout_seconds"`
-	ExpiresInSeconds   *int          `json:"expires_in_seconds,omitempty"`
-	SafetyAcknowledged bool          `json:"safety_acknowledged,omitempty"`
+	SchemaVersion    int           `json:"schema_version"`
+	Type             Type          `json:"type"`
+	Arguments        TaskArguments `json:"arguments"`
+	TimeoutSeconds   int           `json:"timeout_seconds"`
+	ExpiresInSeconds *int          `json:"expires_in_seconds"`
+}
+
+// ModuleCreateRequest is the separate closed operator request for the sole
+// governed module. Its policy is derived by the server and is never accepted
+// from the request.
+type ModuleCreateRequest struct {
+	SchemaVersion    int             `json:"schema_version"`
+	ModuleID         string          `json:"module_id"`
+	Input            json.RawMessage `json:"input"`
+	TimeoutSeconds   int             `json:"timeout_seconds"`
+	ExpiresInSeconds *int            `json:"expires_in_seconds"`
+}
+
+type moduleTaskPolicy struct {
+	moduleID          string
+	moduleVersion     int
+	inputMaxBytes     int
+	outputMaxBytes    int
+	maxTimeoutSeconds int
+	riskLevel         string
+	targetScope       string
+	evidenceRequired  bool
+	approvalRequired  bool
 }
 
 type StatusUpdate struct {
@@ -305,8 +333,8 @@ func ValidateIdentifier(field, value string) error {
 	return nil
 }
 
-// ValidateCreateRequest validates an operator request before it reaches a
-// store. Stores call it again so direct users cannot bypass module policy.
+// ValidateCreateRequest validates the shell-only operator request before it
+// reaches a store. Module task creation has a separate authority.
 func ValidateCreateRequest(r CreateRequest) error {
 	return r.validate()
 }
@@ -315,42 +343,20 @@ func (r CreateRequest) validate() error {
 	if r.SchemaVersion != SchemaVersion {
 		return &ValidationError{Field: "schema_version", Message: "must be 1"}
 	}
-	switch r.Type {
-	case TypeShell:
-		if r.Arguments.ModuleID != "" || len(r.Arguments.Input) != 0 {
-			return &ValidationError{Field: "arguments", Message: "must contain only command for shell tasks"}
+	if r.Type != TypeShell {
+		return &ValidationError{Field: "type", Message: `must be "shell"`}
+	}
+	if r.Arguments.ModuleID != "" || len(r.Arguments.Input) != 0 {
+		return &ValidationError{Field: "arguments", Message: "must contain only command for shell tasks"}
+	}
+	if strings.TrimSpace(r.Arguments.Command) == "" {
+		return &ValidationError{Field: "arguments.command", Message: "is required"}
+	}
+	if utf8.RuneCountInString(r.Arguments.Command) > MaxCommandCharacters {
+		return &ValidationError{
+			Field:   "arguments.command",
+			Message: fmt.Sprintf("must be at most %d characters", MaxCommandCharacters),
 		}
-		if r.SafetyAcknowledged {
-			return &ValidationError{Field: "safety_acknowledged", Message: "is only valid for module tasks"}
-		}
-		if strings.TrimSpace(r.Arguments.Command) == "" {
-			return &ValidationError{Field: "arguments.command", Message: "is required"}
-		}
-		if utf8.RuneCountInString(r.Arguments.Command) > MaxCommandCharacters {
-			return &ValidationError{
-				Field:   "arguments.command",
-				Message: fmt.Sprintf("must be at most %d characters", MaxCommandCharacters),
-			}
-		}
-	case TypeModule:
-		if r.Arguments.Command != "" {
-			return &ValidationError{Field: "arguments.command", Message: "is not valid for module tasks"}
-		}
-		if err := ValidateIdentifier("arguments.module_id", r.Arguments.ModuleID); err != nil {
-			return err
-		}
-		if err := modules.DefaultRegistry().ValidateInput(r.Arguments.ModuleID, r.Arguments.Input); err != nil {
-			return &ValidationError{Field: "arguments.input", Message: err.Error()}
-		}
-		requiresAcknowledgement, err := modules.DefaultRegistry().RequiresAcknowledgement(r.Arguments.ModuleID)
-		if err != nil {
-			return &ValidationError{Field: "arguments.module_id", Message: err.Error()}
-		}
-		if requiresAcknowledgement && !r.SafetyAcknowledged {
-			return &ValidationError{Field: "safety_acknowledged", Message: "must be true for this module"}
-		}
-	default:
-		return &ValidationError{Field: "type", Message: `must be "shell" or "module"`}
 	}
 	if r.TimeoutSeconds < 1 || r.TimeoutSeconds > MaxTimeoutSeconds {
 		return &ValidationError{Field: "timeout_seconds", Message: "must be between 1 and 3600"}
@@ -360,6 +366,91 @@ func (r CreateRequest) validate() error {
 	}
 	if *r.ExpiresInSeconds < 1 || *r.ExpiresInSeconds > MaxExpiresIn {
 		return &ValidationError{Field: "expires_in_seconds", Message: "must be between 1 and 604800"}
+	}
+	return nil
+}
+
+func deriveModuleTaskPolicy(request ModuleCreateRequest) (CreateRequest, moduleTaskPolicy, error) {
+	if request.SchemaVersion != SchemaVersion {
+		return CreateRequest{}, moduleTaskPolicy{}, &ValidationError{Field: "schema_version", Message: "must be 1"}
+	}
+	if request.ModuleID != capabilityInventoryModuleID {
+		return CreateRequest{}, moduleTaskPolicy{}, &ValidationError{Field: "module_id", Message: "is unsupported"}
+	}
+	if len(request.Input) > moduleTaskMaxInputBytes {
+		return CreateRequest{}, moduleTaskPolicy{}, &ValidationError{
+			Field:   "input",
+			Message: fmt.Sprintf("must be at most %d bytes", moduleTaskMaxInputBytes),
+		}
+	}
+	if err := modules.DefaultRegistry().ValidateInput(request.ModuleID, request.Input); err != nil {
+		return CreateRequest{}, moduleTaskPolicy{}, &ValidationError{Field: "input", Message: err.Error()}
+	}
+	if request.TimeoutSeconds < 1 || request.TimeoutSeconds > moduleTaskMaxTimeoutSeconds {
+		return CreateRequest{}, moduleTaskPolicy{}, &ValidationError{
+			Field:   "timeout_seconds",
+			Message: fmt.Sprintf("must be between 1 and %d", moduleTaskMaxTimeoutSeconds),
+		}
+	}
+	if request.ExpiresInSeconds == nil {
+		return CreateRequest{}, moduleTaskPolicy{}, &ValidationError{Field: "expires_in_seconds", Message: "is required"}
+	}
+	if *request.ExpiresInSeconds < 1 || *request.ExpiresInSeconds > MaxExpiresIn {
+		return CreateRequest{}, moduleTaskPolicy{}, &ValidationError{
+			Field:   "expires_in_seconds",
+			Message: "must be between 1 and 604800",
+		}
+	}
+	descriptor, ok := modules.DefaultRegistry().Descriptor(request.ModuleID)
+	if !ok ||
+		descriptor.Version != capabilityInventoryModuleVersion ||
+		descriptor.Safety.RiskLevel != "read_only" ||
+		descriptor.Safety.TargetScope != "self" ||
+		!descriptor.Safety.EvidenceRequired ||
+		descriptor.Safety.RequiresOperatorAcknowledgement {
+		return CreateRequest{}, moduleTaskPolicy{}, &ValidationError{
+			Field:   "module_id",
+			Message: "does not have an admissible server policy",
+		}
+	}
+	policy := moduleTaskPolicy{
+		moduleID:          request.ModuleID,
+		moduleVersion:     descriptor.Version,
+		inputMaxBytes:     moduleTaskMaxInputBytes,
+		outputMaxBytes:    moduleTaskMaxOutputBytes,
+		maxTimeoutSeconds: moduleTaskMaxTimeoutSeconds,
+		riskLevel:         descriptor.Safety.RiskLevel,
+		targetScope:       descriptor.Safety.TargetScope,
+		evidenceRequired:  descriptor.Safety.EvidenceRequired,
+		approvalRequired:  descriptor.Safety.RequiresOperatorAcknowledgement,
+	}
+	return CreateRequest{
+		SchemaVersion:    SchemaVersion,
+		Type:             TypeModule,
+		Arguments:        TaskArguments{ModuleID: request.ModuleID, Input: cloneRawMessage(request.Input)},
+		TimeoutSeconds:   request.TimeoutSeconds,
+		ExpiresInSeconds: request.ExpiresInSeconds,
+	}, policy, nil
+}
+
+func (p moduleTaskPolicy) validateTask(task *Task) error {
+	if task == nil ||
+		task.Type != TypeModule ||
+		task.Arguments.Command != "" ||
+		task.Arguments.ModuleID != p.moduleID ||
+		len(task.Arguments.Input) > p.inputMaxBytes ||
+		task.TimeoutSeconds < 1 ||
+		task.TimeoutSeconds > p.maxTimeoutSeconds ||
+		p.moduleID != capabilityInventoryModuleID ||
+		p.moduleVersion != capabilityInventoryModuleVersion ||
+		p.inputMaxBytes != moduleTaskMaxInputBytes ||
+		p.outputMaxBytes != moduleTaskMaxOutputBytes ||
+		p.maxTimeoutSeconds != moduleTaskMaxTimeoutSeconds ||
+		p.riskLevel != "read_only" ||
+		p.targetScope != "self" ||
+		!p.evidenceRequired ||
+		p.approvalRequired {
+		return errors.New("module task policy is invalid")
 	}
 	return nil
 }
@@ -467,13 +558,19 @@ func (r Result) validate(agentID string) error {
 	return nil
 }
 
-func validateResultForTask(task *Task, result Result) error {
+func validateResultForTask(task *Task, result Result, policy *moduleTaskPolicy) error {
 	switch task.Type {
 	case TypeShell:
 		if len(result.Output.Data) != 0 {
 			return &ValidationError{Field: "output.data", Message: "is not valid for shell tasks"}
 		}
 	case TypeModule:
+		if policy == nil {
+			return &ValidationError{Field: "output.data", Message: "module task has no persisted policy"}
+		}
+		if err := policy.validateTask(task); err != nil {
+			return &ValidationError{Field: "output.data", Message: err.Error()}
+		}
 		if result.Outcome == OutcomeFailed {
 			if len(result.Output.Data) != 0 {
 				return &ValidationError{Field: "output.data", Message: "must be omitted for failed module tasks"}
@@ -483,7 +580,13 @@ func validateResultForTask(task *Task, result Result) error {
 		if len(result.Output.Data) == 0 {
 			return &ValidationError{Field: "output.data", Message: "is required for completed module tasks"}
 		}
-		if err := modules.DefaultRegistry().ValidateOutput(task.Arguments.ModuleID, result.Output.Data); err != nil {
+		if len(result.Output.Data) > policy.outputMaxBytes {
+			return &ValidationError{
+				Field:   "output.data",
+				Message: fmt.Sprintf("must be at most %d bytes", policy.outputMaxBytes),
+			}
+		}
+		if err := modules.DefaultRegistry().ValidateOutput(policy.moduleID, result.Output.Data); err != nil {
 			return &ValidationError{Field: "output.data", Message: err.Error()}
 		}
 	default:

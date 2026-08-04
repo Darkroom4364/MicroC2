@@ -55,6 +55,14 @@ func (h *APIHandler) HandleRequest(w http.ResponseWriter, r *http.Request) {
 		h.handleQueueAgentCommandFromBody(w, r)
 		return
 	}
+	if matched, valid, agentID := parseOperatorModuleTaskRoute(r.URL.Path); matched {
+		if !valid {
+			http.Error(w, "Invalid module task request path", http.StatusBadRequest)
+			return
+		}
+		h.handleModuleTasks(w, r, agentID)
+		return
+	}
 
 	if matched, valid, agentID, taskID, cancel := parseOperatorTaskRoute(r.URL.Path); matched {
 		if !valid {
@@ -148,9 +156,20 @@ func parseOperatorTaskRoute(path string) (matched, valid bool, agentID, taskID s
 		return true, false, "", "", false
 	}
 }
+func parseOperatorModuleTaskRoute(path string) (matched, valid bool, agentID string) {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) != 4 || parts[0] != "api" || parts[1] != "agents" || parts[3] != "module-tasks" {
+		return false, false, ""
+	}
+	if err := tasks.ValidateIdentifier("agent_id", parts[2]); err != nil {
+		return true, false, ""
+	}
+	return true, true, parts[2]
+}
 
 type taskProtocol interface {
 	CreateTask(agentID string, request tasks.CreateRequest) (tasks.Task, error)
+	CreateModuleTask(agentID string, request tasks.ModuleCreateRequest) (tasks.Task, error)
 	ListTasks(agentID string) ([]tasks.Task, error)
 	CancelTask(agentID, taskID string) (tasks.Task, error)
 	GetTask(agentID, taskID string) (tasks.Task, error)
@@ -160,10 +179,14 @@ type taskProtocol interface {
 }
 
 type taskCreateContextProtocol interface {
-	CreateTaskContext(
+	CreateTaskContext(context.Context, string, tasks.CreateRequest) (tasks.Task, error)
+}
+
+type moduleTaskCreateContextProtocol interface {
+	CreateModuleTaskContext(
 		context.Context,
 		string,
-		tasks.CreateRequest,
+		tasks.ModuleCreateRequest,
 	) (tasks.Task, error)
 }
 
@@ -261,6 +284,41 @@ func (h *APIHandler) handleTasks(w http.ResponseWriter, r *http.Request, agentID
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+func (h *APIHandler) handleModuleTasks(
+	w http.ResponseWriter,
+	r *http.Request,
+	agentID string,
+) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := rejectTaskQuery(r.URL.RawQuery); err != nil {
+		writeTaskQueryError(w, err)
+		return
+	}
+	protocol, err := h.resolveActiveAgentTaskProtocol(agentID)
+	if err != nil {
+		writeAgentResolutionError(w, err)
+		return
+	}
+	var request tasks.ModuleCreateRequest
+	if err := decodeStrictJSON(w, r, &request, tasks.MaxTaskCreateBodyBytes); err != nil {
+		writeJSONDecodeError(w, "Invalid module task request", err)
+		return
+	}
+	var task tasks.Task
+	if actorAware, ok := protocol.(moduleTaskCreateContextProtocol); ok {
+		task, err = actorAware.CreateModuleTaskContext(r.Context(), agentID, request)
+	} else {
+		task, err = protocol.CreateModuleTask(agentID, request)
+	}
+	if err != nil {
+		writeTaskError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, task)
 }
 
 func (h *APIHandler) handleTaskDetail(
@@ -468,6 +526,20 @@ func (p *durableHistoryTaskProtocol) CreateTaskContext(
 ) (tasks.Task, error) {
 	return p.store.CreateContext(ctx, agentID, request)
 }
+func (p *durableHistoryTaskProtocol) CreateModuleTask(
+	agentID string,
+	request tasks.ModuleCreateRequest,
+) (tasks.Task, error) {
+	return p.store.CreateModule(agentID, request)
+}
+
+func (p *durableHistoryTaskProtocol) CreateModuleTaskContext(
+	ctx context.Context,
+	agentID string,
+	request tasks.ModuleCreateRequest,
+) (tasks.Task, error) {
+	return p.store.CreateModuleContext(ctx, agentID, request)
+}
 
 func (p *durableHistoryTaskProtocol) ListTasks(agentID string) ([]tasks.Task, error) {
 	return p.store.List(agentID)
@@ -587,6 +659,7 @@ func (h *APIHandler) agentTaskProtocolRefs(
 		if err != nil {
 			return nil, fmt.Errorf("enumerate durable agent listener scopes: %w", err)
 		}
+		var historicalListenerIDs []string
 		for rows.Next() {
 			var listenerID string
 			if err := rows.Scan(&listenerID); err != nil {
@@ -597,9 +670,18 @@ func (h *APIHandler) agentTaskProtocolRefs(
 				refs[index].knownAgent = true
 				continue
 			}
+			historicalListenerIDs = append(historicalListenerIDs, listenerID)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("iterate durable agent listener scopes: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf("close durable agent listener scopes: %w", err)
+		}
+		for _, listenerID := range historicalListenerIDs {
 			store, err := tasks.NewDurableStore(database, listenerID, time.Now)
 			if err != nil {
-				_ = rows.Close()
 				return nil, fmt.Errorf(
 					"open durable agent listener scope %q: %w",
 					listenerID,
@@ -616,13 +698,6 @@ func (h *APIHandler) agentTaskProtocolRefs(
 				},
 				knownAgent: true,
 			})
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			return nil, fmt.Errorf("iterate durable agent listener scopes: %w", err)
-		}
-		if err := rows.Close(); err != nil {
-			return nil, fmt.Errorf("close durable agent listener scopes: %w", err)
 		}
 	}
 	sort.Slice(refs, func(i, j int) bool {

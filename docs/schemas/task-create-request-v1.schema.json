@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://microc2.local/schemas/task-create-request-v1.schema.json",
-  "title": "MicroC2 Task Create Request v1",
-  "description": "Canonical operator request for creating a versioned shell or compile-time registered module task.",
+  "title": "MicroC2 Shell Task Create Request v1",
+  "description": "Closed operator request for a Task v1 shell task. Governed modules use module-task-create-request-v1.schema.json at /api/agents/{id}/module-tasks.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -13,107 +13,28 @@
     "expires_in_seconds"
   ],
   "properties": {
-    "schema_version": {
-      "const": 1
-    },
-    "type": {
-      "enum": [
-        "shell",
-        "module"
-      ]
-    },
-    "arguments": {
-      "type": "object"
-    },
-    "timeout_seconds": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 3600
-    },
+    "schema_version": {"const": 1},
+    "type": {"const": "shell"},
+    "arguments": {"$ref": "#/$defs/shell_arguments"},
+    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600},
     "expires_in_seconds": {
       "type": "integer",
       "minimum": 1,
       "maximum": 604800,
       "description": "Seconds from server acceptance until the latest authorized start time."
-    },
-    "safety_acknowledged": {
-      "type": "boolean",
-      "description": "Must be true when the selected module catalog entry requires operator acknowledgement."
     }
   },
-  "allOf": [
-    {
-      "if": {
-        "properties": {
-          "type": {
-            "const": "shell"
-          }
-        },
-        "required": [
-          "type"
-        ]
-      },
-      "then": {
-        "properties": {
-          "arguments": {
-            "$ref": "#/$defs/shell_arguments"
-          },
-          "safety_acknowledged": false
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "type": {
-            "const": "module"
-          }
-        },
-        "required": [
-          "type"
-        ]
-      },
-      "then": {
-        "properties": {
-          "arguments": {
-            "$ref": "#/$defs/module_arguments"
-          }
-        }
-      }
-    }
-  ],
   "$defs": {
     "shell_arguments": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "command"
-      ],
+      "required": ["command"],
       "properties": {
         "command": {
           "type": "string",
           "minLength": 1,
           "maxLength": 8192,
-          "pattern": "\\S"
-        }
-      }
-    },
-    "module_arguments": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "module_id",
-        "input"
-      ],
-      "properties": {
-        "module_id": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 128,
-          "pattern": "^[A-Za-z0-9_.:-]+$"
-        },
-        "input": {
-          "type": "object"
+          "pattern": ".*\\S.*"
         }
       }
     }

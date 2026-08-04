@@ -36,6 +36,7 @@ func TestOpenBootstrapsAndReopensFileDatabase(t *testing.T) {
 		"listener_events",
 		"agents",
 		"tasks",
+		"module_task_policies",
 		"task_results",
 		"legacy_results",
 		"payload_builds",
@@ -69,12 +70,12 @@ func TestOpenBootstrapsAndReopensFileDatabase(t *testing.T) {
 	if err := database.SQL().QueryRow(
 		`SELECT name, checksum_sha256
 		 FROM schema_migrations
-		 WHERE version = 5`,
+		 WHERE version = 6`,
 	).Scan(&migrationName, &checksum); err != nil {
 		t.Fatalf("read latest migration ledger entry: %v", err)
 	}
-	if migrationCount != 5 ||
-		migrationName != "0005_module_tasks.sql" ||
+	if migrationCount != 6 ||
+		migrationName != "0006_module_task_policies.sql" ||
 		len(checksum) != 64 {
 		t.Fatalf(
 			"unexpected migration ledger: count=%d name=%q checksum=%q",
