@@ -11,6 +11,9 @@ pub const MAX_MODULE_INPUT_BYTES: usize = 64 << 10;
 pub const MAX_MODULE_OUTPUT_BYTES: usize = 64 << 10;
 pub const MAX_TASK_OUTPUT_CHARS: usize = 1_048_576;
 pub const MAX_TASK_ERROR_CHARS: usize = 8_192;
+const GOVERNED_MODULE_MAX_INPUT_BYTES: usize = 1024;
+const GOVERNED_MODULE_MAX_OUTPUT_BYTES: usize = 1024;
+const GOVERNED_MODULE_MAX_TIMEOUT_SECONDS: u64 = 5;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -143,30 +146,37 @@ impl Task {
                 let module_id = self.arguments.module_id.as_deref().ok_or_else(|| {
                     TaskValidationError::new("module task arguments.module_id is required")
                 })?;
-                validate_identifier("module task arguments.module_id", module_id)?;
+                if module_id != crate::modules::CAPABILITY_INVENTORY_ID {
+                    return Err(TaskValidationError::new("unsupported module task"));
+                }
                 let input = self.arguments.input.as_ref().ok_or_else(|| {
                     TaskValidationError::new("module task arguments.input is required")
                 })?;
-                if !input.is_object() {
+                if !input.as_object().is_some_and(|object| object.is_empty()) {
                     return Err(TaskValidationError::new(
-                        "module task arguments.input must be an object",
+                        "module task arguments.input must be an empty object",
                     ));
                 }
                 let input_bytes = serde_json::to_vec(input).map_err(|_| {
                     TaskValidationError::new("module task arguments.input must be JSON")
                 })?;
-                if input_bytes.len() > MAX_MODULE_INPUT_BYTES {
+                if input_bytes.len() > GOVERNED_MODULE_MAX_INPUT_BYTES {
                     return Err(TaskValidationError::new(format!(
                         "module task arguments.input must be at most {} bytes",
-                        MAX_MODULE_INPUT_BYTES
+                        GOVERNED_MODULE_MAX_INPUT_BYTES
                     )));
                 }
             }
         }
-        if !(1..=MAX_TASK_TIMEOUT_SECONDS).contains(&self.timeout_seconds) {
+        let max_timeout_seconds = if matches!(self.task_type, TaskType::Module) {
+            GOVERNED_MODULE_MAX_TIMEOUT_SECONDS
+        } else {
+            MAX_TASK_TIMEOUT_SECONDS
+        };
+        if !(1..=max_timeout_seconds).contains(&self.timeout_seconds) {
             return Err(TaskValidationError::new(format!(
                 "timeout_seconds must be between 1 and {}",
-                MAX_TASK_TIMEOUT_SECONDS
+                max_timeout_seconds
             )));
         }
 
@@ -254,10 +264,10 @@ impl TaskResult {
             }
             let data_bytes = serde_json::to_vec(data)
                 .map_err(|_| TaskValidationError::new("output.data must be JSON"))?;
-            if data_bytes.len() > MAX_MODULE_OUTPUT_BYTES {
+            if data_bytes.len() > GOVERNED_MODULE_MAX_OUTPUT_BYTES {
                 return Err(TaskValidationError::new(format!(
                     "output.data must be at most {} bytes",
-                    MAX_MODULE_OUTPUT_BYTES
+                    GOVERNED_MODULE_MAX_OUTPUT_BYTES
                 )));
             }
         }
@@ -551,6 +561,7 @@ mod tests {
             module_id: Some("agent.capability_inventory.v1".to_string()),
             input: Some(json!({})),
         };
+        task.timeout_seconds = GOVERNED_MODULE_MAX_TIMEOUT_SECONDS;
         task.validate_for_agent("agent-one")
             .expect("valid module task envelope");
 
@@ -558,7 +569,15 @@ mod tests {
         assert!(task.validate_for_agent("agent-one").is_err());
 
         task.arguments.command.clear();
-        task.arguments.input = Some(json!("not an object"));
+        task.arguments.module_id = Some("unknown.module.v1".to_string());
+        assert!(task.validate_for_agent("agent-one").is_err());
+
+        task.arguments.module_id = Some(crate::modules::CAPABILITY_INVENTORY_ID.to_string());
+        task.arguments.input = Some(json!({"unexpected": true}));
+        assert!(task.validate_for_agent("agent-one").is_err());
+
+        task.arguments.input = Some(json!({}));
+        task.timeout_seconds = GOVERNED_MODULE_MAX_TIMEOUT_SECONDS + 1;
         assert!(task.validate_for_agent("agent-one").is_err());
     }
 
@@ -632,6 +651,9 @@ mod tests {
             error: None,
         };
         result.validate().expect("valid result");
+        let mut oversized_data = result.clone();
+        oversized_data.output.data = Some(json!({"evidence": "x".repeat(1024)}));
+        assert!(oversized_data.validate().is_err());
         let encoded_result = serde_json::to_string(&result).expect("serialize result");
         assert!(encoded_result.contains("\"outcome\":\"completed\""));
         assert_eq!(

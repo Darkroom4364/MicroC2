@@ -65,21 +65,41 @@ func TestOperatorAPIModuleCatalogIsClosedAndReadOnly(t *testing.T) {
 
 func TestOperatorAPIModuleTaskRequiresAdvertisedAgentCapability(t *testing.T) {
 	handler, proto := newTestAPIHandler(t, "agent-one")
-	request := map[string]interface{}{
-		"schema_version": 1,
-		"type":           "module",
-		"arguments": map[string]interface{}{
-			"module_id": "agent.capability_inventory.v1",
-			"input":     map[string]interface{}{},
-		},
-		"timeout_seconds":    30,
+	moduleRequest := map[string]interface{}{
+		"schema_version":     1,
+		"module_id":          "agent.capability_inventory.v1",
+		"input":              map[string]interface{}{},
+		"timeout_seconds":    5,
+		"expires_in_seconds": 120,
+	}
+	moduleShapedTaskRequest := map[string]interface{}{
+		"schema_version":     1,
+		"type":               "module",
+		"arguments":          map[string]interface{}{"module_id": "agent.capability_inventory.v1", "input": map[string]interface{}{}},
+		"timeout_seconds":    5,
 		"expires_in_seconds": 120,
 	}
 
 	rec := httptest.NewRecorder()
-	handler.HandleRequest(rec, jsonRequest(t, http.MethodPost, "/api/agents/agent-one/tasks", request))
+	handler.HandleRequest(rec, jsonRequest(
+		t,
+		http.MethodPost,
+		"/api/agents/agent-one/tasks",
+		moduleShapedTaskRequest,
+	))
 	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected unsupported module task to fail with 400, got %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("expected module-shaped shell task to fail with 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	handler.HandleRequest(rec, jsonRequest(
+		t,
+		http.MethodPost,
+		"/api/agents/agent-one/module-tasks",
+		moduleRequest,
+	))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected inactive module task to fail with 400, got %d: %s", rec.Code, rec.Body.String())
 	}
 
 	heartbeat := []byte(`{"id":"agent-one","os":"linux","hostname":"workstation","ip":"127.0.0.1","module_ids":["agent.capability_inventory.v1"]}`)
@@ -88,7 +108,12 @@ func TestOperatorAPIModuleTaskRequiresAdvertisedAgentCapability(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	handler.HandleRequest(rec, jsonRequest(t, http.MethodPost, "/api/agents/agent-one/tasks", request))
+	handler.HandleRequest(rec, jsonRequest(
+		t,
+		http.MethodPost,
+		"/api/agents/agent-one/module-tasks",
+		moduleRequest,
+	))
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("expected module task 202, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -98,6 +123,93 @@ func TestOperatorAPIModuleTaskRequiresAdvertisedAgentCapability(t *testing.T) {
 	}
 	if task.Type != tasks.TypeModule || task.Arguments.ModuleID != "agent.capability_inventory.v1" {
 		t.Fatalf("unexpected created module task: %#v", task)
+	}
+}
+
+func TestOperatorAPIModuleTaskLoopbackSmoke(t *testing.T) {
+	handler, proto := newTestAPIHandler(t, "agent-one")
+	if err := proto.HandleAgentHeartbeat([]byte(
+		`{"id":"agent-one","os":"linux","hostname":"workstation","ip":"127.0.0.1","module_ids":["agent.capability_inventory.v1"]}`,
+	)); err != nil {
+		t.Fatalf("record module heartbeat: %v", err)
+	}
+	body, err := json.Marshal(map[string]interface{}{
+		"schema_version":     1,
+		"module_id":          "agent.capability_inventory.v1",
+		"input":              map[string]interface{}{},
+		"timeout_seconds":    5,
+		"expires_in_seconds": 120,
+	})
+	if err != nil {
+		t.Fatalf("marshal loopback module request: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(handler.HandleRequest))
+	defer server.Close()
+	response, err := http.Post(
+		server.URL+"/api/agents/agent-one/module-tasks",
+		"application/json",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		t.Fatalf("post loopback module request: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("loopback module task status %d", response.StatusCode)
+	}
+}
+
+func TestOperatorAPIModuleTaskRouteIsClosed(t *testing.T) {
+	handler, proto := newTestAPIHandler(t, "agent-one")
+	if err := proto.HandleAgentHeartbeat([]byte(
+		`{"id":"agent-one","os":"linux","hostname":"workstation","ip":"127.0.0.1","module_ids":["agent.capability_inventory.v1"]}`,
+	)); err != nil {
+		t.Fatalf("record module heartbeat: %v", err)
+	}
+	cases := []map[string]interface{}{
+		{
+			"schema_version": 1, "module_id": "agent.capability_inventory.v1",
+			"input": map[string]interface{}{}, "timeout_seconds": 6, "expires_in_seconds": 120,
+		},
+		{
+			"schema_version": 1, "module_id": "agent.capability_inventory.v1",
+			"input": map[string]interface{}{"unexpected": true}, "timeout_seconds": 5, "expires_in_seconds": 120,
+		},
+		{
+			"schema_version": 1, "module_id": "agent.unknown.v1",
+			"input": map[string]interface{}{}, "timeout_seconds": 5, "expires_in_seconds": 120,
+		},
+		{
+			"schema_version": 1, "module_id": "agent.capability_inventory.v1",
+			"input": map[string]interface{}{}, "timeout_seconds": 5, "expires_in_seconds": 120,
+			"command": "whoami",
+		},
+		{
+			"schema_version": 1, "module_id": "agent.capability_inventory.v1",
+			"input": map[string]interface{}{}, "timeout_seconds": 5, "expires_in_seconds": 120,
+			"safety_acknowledged": true,
+		},
+		{
+			"schema_version": 1, "module_id": "agent.capability_inventory.v1",
+			"input": map[string]interface{}{}, "timeout_seconds": 5, "expires_in_seconds": 120,
+			"policy": map[string]interface{}{},
+		},
+	}
+	for index, request := range cases {
+		recorder := httptest.NewRecorder()
+		handler.HandleRequest(recorder, jsonRequest(
+			t,
+			http.MethodPost,
+			"/api/agents/agent-one/module-tasks",
+			request,
+		))
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("closed module case %d got %d: %s", index, recorder.Code, recorder.Body.String())
+		}
+	}
+	history, err := proto.ListTasks("agent-one")
+	if err != nil || len(history) != 0 {
+		t.Fatalf("closed module requests created tasks: %#v err=%v", history, err)
 	}
 }
 
@@ -1905,6 +2017,12 @@ func (p *staticTaskProtocol) GetHTTPHandler() http.Handler {
 }
 
 func (p *staticTaskProtocol) CreateTask(string, tasks.CreateRequest) (tasks.Task, error) {
+	return tasks.Task{}, errors.New("not implemented")
+}
+func (p *staticTaskProtocol) CreateModuleTask(
+	string,
+	tasks.ModuleCreateRequest,
+) (tasks.Task, error) {
 	return tasks.Task{}, errors.New("not implemented")
 }
 

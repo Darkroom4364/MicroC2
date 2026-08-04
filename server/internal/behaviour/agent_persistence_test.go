@@ -11,6 +11,7 @@ import (
 
 	"microc2/server/internal/common"
 	"microc2/server/internal/persistence"
+	"microc2/server/internal/tasks"
 )
 
 func TestPersistedAgentHistoryRequiresFreshHeartbeatAfterRestart(t *testing.T) {
@@ -87,6 +88,79 @@ func TestPersistedAgentHistoryRequiresFreshHeartbeatAfterRestart(t *testing.T) {
 			lastSeen,
 			known,
 		)
+	}
+}
+
+func TestPersistedModuleEligibilityRequiresFreshHeartbeat(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "microc2.db")
+	database, err := persistence.Open(path)
+	if err != nil {
+		t.Fatalf("open persistence database: %v", err)
+	}
+	protocol, err := NewHTTPPollingProtocolWithPersistence(
+		common.BaseProtocolConfig{UploadDir: t.TempDir(), Port: "0"},
+		database,
+		"listener-one",
+	)
+	if err != nil {
+		t.Fatalf("create durable protocol: %v", err)
+	}
+	heartbeat := []byte(
+		`{"id":"agent-one","os":"linux","hostname":"host-one","ip":"127.0.0.1",` +
+			`"module_ids":["agent.capability_inventory.v1"]}`,
+	)
+	if err := protocol.HandleAgentHeartbeat(heartbeat); err != nil {
+		t.Fatalf("record module heartbeat: %v", err)
+	}
+	expiresIn := 120
+	queued, err := protocol.CreateModuleTask("agent-one", tasks.ModuleCreateRequest{
+		SchemaVersion:    tasks.SchemaVersion,
+		ModuleID:         "agent.capability_inventory.v1",
+		Input:            json.RawMessage(`{}`),
+		TimeoutSeconds:   5,
+		ExpiresInSeconds: &expiresIn,
+	})
+	if err != nil {
+		t.Fatalf("queue module task: %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("close first database: %v", err)
+	}
+
+	database, err = persistence.Open(path)
+	if err != nil {
+		t.Fatalf("reopen persistence database: %v", err)
+	}
+	defer database.Close()
+	restarted, err := NewHTTPPollingProtocolWithPersistence(
+		common.BaseProtocolConfig{UploadDir: t.TempDir(), Port: "0"},
+		database,
+		"listener-one",
+	)
+	if err != nil {
+		t.Fatalf("reload durable protocol: %v", err)
+	}
+	if _, err := restarted.CreateModuleTask("agent-one", tasks.ModuleCreateRequest{
+		SchemaVersion:    tasks.SchemaVersion,
+		ModuleID:         "agent.capability_inventory.v1",
+		Input:            json.RawMessage(`{}`),
+		TimeoutSeconds:   5,
+		ExpiresInSeconds: &expiresIn,
+	}); err == nil {
+		t.Fatal("created module from persisted heartbeat eligibility")
+	}
+	recorder := httptest.NewRecorder()
+	restarted.GetHTTPHandler().ServeHTTP(
+		recorder,
+		httptest.NewRequest(http.MethodGet, "/api/agent/agent-one/tasks", nil),
+	)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("persisted module dispatched before fresh heartbeat: %d: %s", recorder.Code, recorder.Body.String())
+	}
+	history, err := restarted.ListTasks("agent-one")
+	if err != nil || len(history) != 1 || history[0].ID != queued.ID ||
+		history[0].Status != tasks.StatusCancelled {
+		t.Fatalf("persisted module quarantine history=%#v err=%v", history, err)
 	}
 }
 

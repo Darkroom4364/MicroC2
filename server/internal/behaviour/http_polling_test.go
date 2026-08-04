@@ -212,6 +212,52 @@ func TestHTTPPollingProtocolTypedTaskLifecycle(t *testing.T) {
 	}
 }
 
+type dispatchLockAssertingStore struct {
+	taskStateStore
+	protocol *HTTPPollingProtocol
+}
+
+func (s *dispatchLockAssertingStore) DispatchNextEligible(
+	agentID string,
+	eligible map[string]struct{},
+) (tasks.Task, bool, error) {
+	if s.protocol.agents.TryLock() {
+		s.protocol.agents.Unlock()
+		return tasks.Task{}, false, fmt.Errorf(
+			"manager eligibility lock was released before lease selection",
+		)
+	}
+	return s.taskStateStore.DispatchNextEligible(agentID, eligible)
+}
+
+func TestHTTPPollingProtocolHoldsEligibilityLockThroughDispatch(t *testing.T) {
+	proto := NewHTTPPollingProtocol(common.BaseProtocolConfig{UploadDir: t.TempDir(), Port: "0"})
+	if err := proto.HandleAgentHeartbeat([]byte(
+		`{"id":"agent-one","os":"linux","hostname":"workstation","ip":"127.0.0.1","module_ids":["agent.capability_inventory.v1"]}`,
+	)); err != nil {
+		t.Fatalf("record module heartbeat: %v", err)
+	}
+	expiresIn := 120
+	queued, err := proto.CreateModuleTask("agent-one", tasks.ModuleCreateRequest{
+		SchemaVersion:    tasks.SchemaVersion,
+		ModuleID:         "agent.capability_inventory.v1",
+		Input:            json.RawMessage(`{}`),
+		TimeoutSeconds:   5,
+		ExpiresInSeconds: &expiresIn,
+	})
+	if err != nil {
+		t.Fatalf("queue module task: %v", err)
+	}
+	proto.taskStore = &dispatchLockAssertingStore{
+		taskStateStore: proto.taskStore,
+		protocol:       proto,
+	}
+	dispatched, ok, err := proto.dispatchNextTask("agent-one")
+	if err != nil || !ok || dispatched.ID != queued.ID {
+		t.Fatalf("dispatch with retained eligibility lock: task=%#v ok=%t err=%v", dispatched, ok, err)
+	}
+}
+
 func TestHTTPPollingProtocolModuleTaskLifecycle(t *testing.T) {
 	proto := NewHTTPPollingProtocol(common.BaseProtocolConfig{UploadDir: t.TempDir(), Port: "0"})
 	handler := proto.GetHTTPHandler()
@@ -223,14 +269,11 @@ func TestHTTPPollingProtocolModuleTaskLifecycle(t *testing.T) {
 	}
 
 	expiresIn := 300
-	queued, err := proto.CreateTask(agentID, tasks.CreateRequest{
-		SchemaVersion: tasks.SchemaVersion,
-		Type:          tasks.TypeModule,
-		Arguments: tasks.TaskArguments{
-			ModuleID: "agent.capability_inventory.v1",
-			Input:    json.RawMessage(`{}`),
-		},
-		TimeoutSeconds:   30,
+	queued, err := proto.CreateModuleTask(agentID, tasks.ModuleCreateRequest{
+		SchemaVersion:    tasks.SchemaVersion,
+		ModuleID:         "agent.capability_inventory.v1",
+		Input:            json.RawMessage(`{}`),
+		TimeoutSeconds:   5,
 		ExpiresInSeconds: &expiresIn,
 	})
 	if err != nil {
@@ -241,6 +284,20 @@ func TestHTTPPollingProtocolModuleTaskLifecycle(t *testing.T) {
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/agent/"+agentID+"/tasks", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("dispatch module task: %d: %s", rec.Code, rec.Body.String())
+	}
+	for _, field := range []string{
+		`"policy"`,
+		`"module_version"`,
+		`"input_max_bytes"`,
+		`"output_max_bytes"`,
+		`"risk_level"`,
+		`"target_scope"`,
+		`"evidence_required"`,
+		`"approval_required"`,
+	} {
+		if bytes.Contains(rec.Body.Bytes(), []byte(field)) {
+			t.Fatalf("agent-facing module task exposed server-only field %s", field)
+		}
 	}
 	var dispatched tasks.Task
 	if err := json.Unmarshal(rec.Body.Bytes(), &dispatched); err != nil {

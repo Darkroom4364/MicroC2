@@ -44,10 +44,12 @@ type HTTPPollingProtocol struct {
 
 type taskStateStore interface {
 	Create(agentID string, request tasks.CreateRequest) (tasks.Task, error)
+	CreateModule(agentID string, request tasks.ModuleCreateRequest) (tasks.Task, error)
 	CreateLegacyShell(agentID, command string) (tasks.Task, error)
 	List(agentID string) ([]tasks.Task, error)
 	Get(agentID, taskID string) (tasks.Task, error)
 	DispatchNext(agentID string) (tasks.Task, bool, error)
+	DispatchNextEligible(agentID string, eligible map[string]struct{}) (tasks.Task, bool, error)
 	DispatchNextLegacy(agentID string) (tasks.Task, bool, error)
 	MarkRunning(agentID, taskID string, update tasks.StatusUpdate) (tasks.Task, error)
 	CompleteWithInfo(agentID string, result tasks.Result) (tasks.Task, tasks.CompletionInfo, error)
@@ -493,7 +495,7 @@ func (p *HTTPPollingProtocol) handleAgentTasks(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	task, ok, err := p.taskStore.DispatchNext(agentID)
+	task, ok, err := p.dispatchNextTask(agentID)
 	if err != nil {
 		writeTaskError(w, err)
 		return
@@ -1008,63 +1010,112 @@ func (p *HTTPPollingProtocol) QueueLegacyShellTaskContext(
 	return p.taskStore.CreateLegacyShell(agentID, command)
 }
 
-func (p *HTTPPollingProtocol) CreateTask(agentID string, createRequest tasks.CreateRequest) (tasks.Task, error) {
-	if err := p.validateModuleTaskCompatibility(agentID, createRequest); err != nil {
-		return tasks.Task{}, err
+func (p *HTTPPollingProtocol) CreateTask(
+	agentID string,
+	createRequest tasks.CreateRequest,
+) (tasks.Task, error) {
+	if createRequest.Type != tasks.TypeShell {
+		return tasks.Task{}, &tasks.ValidationError{Field: "type", Message: `must be "shell"`}
 	}
 	return p.taskStore.Create(agentID, createRequest)
 }
 
 // CreateTaskContext preserves the authenticated operator actor for durable
-// task queue audit records.
+// shell queue audit records.
 func (p *HTTPPollingProtocol) CreateTaskContext(
 	ctx context.Context,
 	agentID string,
 	createRequest tasks.CreateRequest,
 ) (tasks.Task, error) {
-	if err := p.validateModuleTaskCompatibility(agentID, createRequest); err != nil {
-		return tasks.Task{}, err
+	if createRequest.Type != tasks.TypeShell {
+		return tasks.Task{}, &tasks.ValidationError{Field: "type", Message: `must be "shell"`}
 	}
 	if store, ok := p.taskStore.(interface {
-		CreateContext(
-			context.Context,
-			string,
-			tasks.CreateRequest,
-		) (tasks.Task, error)
+		CreateContext(context.Context, string, tasks.CreateRequest) (tasks.Task, error)
 	}); ok {
 		return store.CreateContext(ctx, agentID, createRequest)
 	}
 	return p.taskStore.Create(agentID, createRequest)
 }
 
-func (p *HTTPPollingProtocol) validateModuleTaskCompatibility(
+func (p *HTTPPollingProtocol) CreateModuleTask(
 	agentID string,
-	request tasks.CreateRequest,
+	request tasks.ModuleCreateRequest,
+) (tasks.Task, error) {
+	if err := p.validateCurrentModuleEligibility(agentID, request.ModuleID); err != nil {
+		return tasks.Task{}, err
+	}
+	return p.taskStore.CreateModule(agentID, request)
+}
+
+// CreateModuleTaskContext preserves the authenticated operator actor for the
+// policy and queue audit chain.
+func (p *HTTPPollingProtocol) CreateModuleTaskContext(
+	ctx context.Context,
+	agentID string,
+	request tasks.ModuleCreateRequest,
+) (tasks.Task, error) {
+	if err := p.validateCurrentModuleEligibility(agentID, request.ModuleID); err != nil {
+		return tasks.Task{}, err
+	}
+	if store, ok := p.taskStore.(interface {
+		CreateModuleContext(
+			context.Context,
+			string,
+			tasks.ModuleCreateRequest,
+		) (tasks.Task, error)
+	}); ok {
+		return store.CreateModuleContext(ctx, agentID, request)
+	}
+	return p.taskStore.CreateModule(agentID, request)
+}
+
+func (p *HTTPPollingProtocol) validateCurrentModuleEligibility(
+	agentID, moduleID string,
 ) error {
-	if request.Type != tasks.TypeModule {
+	if _, ok := p.moduleEligibilitySnapshot(agentID)[moduleID]; ok {
 		return nil
 	}
-	if err := tasks.ValidateCreateRequest(request); err != nil {
-		return err
+	return &tasks.ValidationError{
+		Field:   "module_id",
+		Message: "is not reported by a current agent heartbeat",
 	}
+}
+
+func (p *HTTPPollingProtocol) moduleEligibilitySnapshot(
+	agentID string,
+) map[string]struct{} {
 	p.agents.Lock()
 	defer p.agents.Unlock()
+	return p.moduleEligibilitySnapshotLocked(agentID)
+}
+
+// moduleEligibilitySnapshotLocked copies the manager-owned eligibility state.
+// The caller must hold p.agents.Lock. Dispatch retains that lock through the
+// store transition so a heartbeat cannot withdraw eligibility mid-lease.
+func (p *HTTPPollingProtocol) moduleEligibilitySnapshotLocked(
+	agentID string,
+) map[string]struct{} {
+	eligible := make(map[string]struct{})
 	agent := p.agents.list[agentID]
-	if agent == nil {
-		return &tasks.ValidationError{
-			Field:   "arguments.module_id",
-			Message: "selected agent has not advertised module support",
-		}
+	if agent == nil || !p.agents.activeThisBoot[agentID] {
+		return eligible
 	}
 	for _, moduleID := range agent.ModuleIDs {
-		if moduleID == request.Arguments.ModuleID {
-			return nil
-		}
+		eligible[moduleID] = struct{}{}
 	}
-	return &tasks.ValidationError{
-		Field:   "arguments.module_id",
-		Message: "is not reported by selected agent",
-	}
+	return eligible
+}
+
+func (p *HTTPPollingProtocol) dispatchNextTask(
+	agentID string,
+) (tasks.Task, bool, error) {
+	p.agents.Lock()
+	defer p.agents.Unlock()
+	return p.taskStore.DispatchNextEligible(
+		agentID,
+		p.moduleEligibilitySnapshotLocked(agentID),
+	)
 }
 
 func (p *HTTPPollingProtocol) ListTasks(agentID string) ([]tasks.Task, error) {

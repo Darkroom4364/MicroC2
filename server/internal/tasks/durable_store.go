@@ -81,29 +81,54 @@ func newDurableStoreWithOptions(
 	if err != nil {
 		return nil, fmt.Errorf("initialize durable task audit store: %w", err)
 	}
-	return &DurableStore{
+	store := &DurableStore{
 		db:               db,
 		audit:            auditStore,
 		listenerID:       listenerID,
 		now:              now,
 		dispatchLease:    dispatchLease,
 		maxTasksPerAgent: maxTasksPerAgent,
-	}, nil
+	}
+	if err := store.quarantineUnboundModuleTasks(); err != nil {
+		return nil, err
+	}
+	return store, nil
 }
 
 func (s *DurableStore) Create(agentID string, request CreateRequest) (Task, error) {
 	return s.CreateContext(context.Background(), agentID, request)
 }
 
-// CreateContext creates a task with the trusted operator actor attached by the
-// operator authentication boundary. Create remains for compatibility and
-// records an explicit unspecified operator actor.
+// CreateContext creates a shell task with the trusted operator actor attached
+// by the authentication boundary.
 func (s *DurableStore) CreateContext(
 	ctx context.Context,
 	agentID string,
 	request CreateRequest,
 ) (Task, error) {
-	return s.create(ctx, agentID, request, false)
+	return s.create(ctx, agentID, request, false, nil)
+}
+
+func (s *DurableStore) CreateModule(
+	agentID string,
+	request ModuleCreateRequest,
+) (Task, error) {
+	return s.CreateModuleContext(context.Background(), agentID, request)
+}
+
+// CreateModuleContext is the sole durable module-creation authority. It derives
+// and persists the server policy in the same transaction as its task and audit
+// chain.
+func (s *DurableStore) CreateModuleContext(
+	ctx context.Context,
+	agentID string,
+	request ModuleCreateRequest,
+) (Task, error) {
+	taskRequest, policy, err := deriveModuleTaskPolicy(request)
+	if err != nil {
+		return Task{}, err
+	}
+	return s.create(ctx, agentID, taskRequest, false, &policy)
 }
 
 func (s *DurableStore) CreateLegacyShell(agentID, command string) (Task, error) {
@@ -123,7 +148,7 @@ func (s *DurableStore) CreateLegacyShellContext(
 		Arguments:        ShellArguments{Command: command},
 		TimeoutSeconds:   DefaultTimeoutSeconds,
 		ExpiresInSeconds: &expiresIn,
-	}, true)
+	}, true, nil)
 }
 
 func (s *DurableStore) create(
@@ -131,11 +156,20 @@ func (s *DurableStore) create(
 	agentID string,
 	request CreateRequest,
 	legacyOrigin bool,
+	policy *moduleTaskPolicy,
 ) (Task, error) {
 	if err := ValidateIdentifier("agent_id", agentID); err != nil {
 		return Task{}, err
 	}
-	if err := request.validate(); err != nil {
+	if policy == nil {
+		if err := request.validate(); err != nil {
+			return Task{}, err
+		}
+	} else if err := policy.validateTask(&Task{
+		Type:           request.Type,
+		Arguments:      request.Arguments,
+		TimeoutSeconds: request.TimeoutSeconds,
+	}); err != nil {
 		return Task{}, err
 	}
 	argumentsJSON, err := json.Marshal(request.Arguments)
@@ -169,15 +203,33 @@ func (s *DurableStore) create(
 	}
 	expiresAt := now.Add(time.Duration(expiresIn) * time.Second)
 	taskID := uuid.NewString()
+	var causationSequence *int64
+	if policy != nil {
+		policyEvent, err := s.audit.AppendTx(ctx, tx, audit.Input{
+			Actor:      audit.ActorOr(ctx, audit.DefaultOperatorActor()),
+			Action:     "module_task.policy_applied",
+			Route:      "/api/agents/{agent_id}/module-tasks",
+			Target:     audit.Target{Kind: "task", ID: taskID},
+			Outcome:    audit.OutcomeSucceeded,
+			ListenerID: s.listenerID,
+			AgentID:    agentID,
+			TaskID:     taskID,
+		})
+		if err != nil {
+			return Task{}, fmt.Errorf("record durable module policy audit event: %w", err)
+		}
+		causationSequence = &policyEvent.Sequence
+	}
 	queuedEvent, err := s.audit.AppendTx(ctx, tx, audit.Input{
-		Actor:      audit.ActorOr(ctx, audit.DefaultOperatorActor()),
-		Action:     "task.queued",
-		Route:      taskQueueAuditRoute(legacyOrigin),
-		Target:     audit.Target{Kind: "task", ID: taskID},
-		Outcome:    audit.OutcomeSucceeded,
-		ListenerID: s.listenerID,
-		AgentID:    agentID,
-		TaskID:     taskID,
+		Actor:             audit.ActorOr(ctx, audit.DefaultOperatorActor()),
+		Action:            "task.queued",
+		Route:             taskQueueAuditRoute(legacyOrigin, policy != nil),
+		Target:            audit.Target{Kind: "task", ID: taskID},
+		Outcome:           audit.OutcomeSucceeded,
+		CausationSequence: causationSequence,
+		ListenerID:        s.listenerID,
+		AgentID:           agentID,
+		TaskID:            taskID,
 	})
 	if err != nil {
 		return Task{}, fmt.Errorf("record durable task queue audit event: %w", err)
@@ -209,6 +261,11 @@ func (s *DurableStore) create(
 	); err != nil {
 		return Task{}, fmt.Errorf("insert durable task: %w", err)
 	}
+	if policy != nil {
+		if err := s.insertModulePolicyTx(ctx, tx, taskID, *policy); err != nil {
+			return Task{}, err
+		}
+	}
 
 	record, err := s.getTaskTx(ctx, tx, agentID, taskID)
 	if err != nil {
@@ -220,9 +277,12 @@ func (s *DurableStore) create(
 	return record.task, nil
 }
 
-func taskQueueAuditRoute(legacyOrigin bool) string {
+func taskQueueAuditRoute(legacyOrigin, module bool) string {
 	if legacyOrigin {
 		return "/api/agents/{agent_id}/command"
+	}
+	if module {
+		return "/api/agents/{agent_id}/module-tasks"
 	}
 	return "/api/agents/{agent_id}/tasks"
 }
@@ -268,6 +328,177 @@ func (s *DurableStore) appendTaskAuditTx(
 	})
 	if err != nil {
 		return fmt.Errorf("record %s audit event: %w", action, err)
+	}
+	return nil
+}
+func (s *DurableStore) insertModulePolicyTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	taskID string,
+	policy moduleTaskPolicy,
+) error {
+	if _, err := tx.ExecContext(
+		ctx,
+		`INSERT INTO module_task_policies (
+			listener_id, task_id, module_id, module_version, input_max_bytes,
+			output_max_bytes, max_timeout_seconds, risk_level, target_scope,
+			evidence_required, approval_required
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		s.listenerID,
+		taskID,
+		policy.moduleID,
+		policy.moduleVersion,
+		policy.inputMaxBytes,
+		policy.outputMaxBytes,
+		policy.maxTimeoutSeconds,
+		policy.riskLevel,
+		policy.targetScope,
+		boolToSQLite(policy.evidenceRequired),
+		boolToSQLite(policy.approvalRequired),
+	); err != nil {
+		return fmt.Errorf("insert durable module task policy: %w", err)
+	}
+	return nil
+}
+
+func (s *DurableStore) getModulePolicyTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	taskID string,
+) (*moduleTaskPolicy, error) {
+	var policy moduleTaskPolicy
+	var evidenceRequired, approvalRequired int
+	err := tx.QueryRowContext(
+		ctx,
+		`SELECT
+			module_id, module_version, input_max_bytes, output_max_bytes,
+			max_timeout_seconds, risk_level, target_scope, evidence_required,
+			approval_required
+		 FROM module_task_policies
+		 WHERE listener_id = ? AND task_id = ?`,
+		s.listenerID,
+		taskID,
+	).Scan(
+		&policy.moduleID,
+		&policy.moduleVersion,
+		&policy.inputMaxBytes,
+		&policy.outputMaxBytes,
+		&policy.maxTimeoutSeconds,
+		&policy.riskLevel,
+		&policy.targetScope,
+		&evidenceRequired,
+		&approvalRequired,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load durable module task policy: %w", err)
+	}
+	if evidenceRequired != 0 && evidenceRequired != 1 ||
+		approvalRequired != 0 && approvalRequired != 1 {
+		return nil, errors.New("durable module task policy has invalid flags")
+	}
+	policy.evidenceRequired = evidenceRequired != 0
+	policy.approvalRequired = approvalRequired != 0
+	return &policy, nil
+}
+
+func (s *DurableStore) quarantineUnboundModuleTasks() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ctx := context.Background()
+	tx, err := s.db.SQL().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin module policy recovery: %w", err)
+	}
+	defer rollbackDurableTx(tx)
+
+	rows, err := tx.QueryContext(
+		ctx,
+		`SELECT t.agent_id, t.task_id
+		 FROM tasks t
+		 LEFT JOIN module_task_policies p
+		   ON p.listener_id = t.listener_id AND p.task_id = t.task_id
+		 WHERE t.listener_id = ? AND t.task_type = ?
+		   AND t.status IN (?, ?, ?) AND p.task_id IS NULL
+		 ORDER BY t.seq ASC`,
+		s.listenerID,
+		string(TypeModule),
+		string(StatusQueued),
+		string(StatusDispatched),
+		string(StatusRunning),
+	)
+	if err != nil {
+		return fmt.Errorf("find unbound historic module tasks: %w", err)
+	}
+	type taskRef struct{ agentID, taskID string }
+	var unbound []taskRef
+	for rows.Next() {
+		var ref taskRef
+		if err := rows.Scan(&ref.agentID, &ref.taskID); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan unbound historic module task: %w", err)
+		}
+		unbound = append(unbound, ref)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate unbound historic module tasks: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close unbound historic module task query: %w", err)
+	}
+	now := normalizeTime(s.now())
+	for _, ref := range unbound {
+		record, err := s.getTaskTx(ctx, tx, ref.agentID, ref.taskID)
+		if err != nil {
+			return err
+		}
+		result, err := tx.ExecContext(
+			ctx,
+			`UPDATE tasks
+			 SET status = ?, server_completed_at = ?, last_delivery_at = NULL
+			 WHERE listener_id = ? AND agent_id = ? AND task_id = ?
+			   AND status IN (?, ?, ?)`,
+			string(StatusCancelled),
+			formatDurableTime(now),
+			s.listenerID,
+			ref.agentID,
+			ref.taskID,
+			string(StatusQueued),
+			string(StatusDispatched),
+			string(StatusRunning),
+		)
+		if err != nil {
+			return fmt.Errorf("cancel unbound historic module task: %w", err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("count unbound historic module cancellation: %w", err)
+		}
+		if affected == 0 {
+			continue
+		}
+		causationSequence := record.createdAuditEventSeq
+		if _, err := s.audit.AppendTx(ctx, tx, audit.Input{
+			Actor:             audit.Actor{Kind: audit.ActorSystem, ID: "module_task_recovery"},
+			Action:            "task.cancelled",
+			Route:             "internal:module_task_policy_recovery",
+			Target:            audit.Target{Kind: "task", ID: record.task.ID},
+			Outcome:           audit.OutcomeSucceeded,
+			ReasonCode:        "module_policy_missing",
+			CausationSequence: &causationSequence,
+			ListenerID:        s.listenerID,
+			AgentID:           record.task.AgentID,
+			TaskID:            record.task.ID,
+		}); err != nil {
+			return fmt.Errorf("audit unbound historic module cancellation: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit module policy recovery: %w", err)
 	}
 	return nil
 }
@@ -447,16 +678,26 @@ func (s *DurableStore) Get(agentID, taskID string) (Task, error) {
 }
 
 func (s *DurableStore) DispatchNext(agentID string) (Task, bool, error) {
-	return s.dispatchNext(agentID, false)
+	return s.dispatchNext(agentID, false, nil)
+}
+
+// DispatchNextEligible rechecks the caller's immutable, current-heartbeat
+// eligibility snapshot while selecting durable module work.
+func (s *DurableStore) DispatchNextEligible(
+	agentID string,
+	eligible map[string]struct{},
+) (Task, bool, error) {
+	return s.dispatchNext(agentID, false, eligible)
 }
 
 func (s *DurableStore) DispatchNextLegacy(agentID string) (Task, bool, error) {
-	return s.dispatchNext(agentID, true)
+	return s.dispatchNext(agentID, true, nil)
 }
 
 func (s *DurableStore) dispatchNext(
 	agentID string,
 	legacyOnly bool,
+	eligible map[string]struct{},
 ) (Task, bool, error) {
 	if err := ValidateIdentifier("agent_id", agentID); err != nil {
 		return Task{}, false, err
@@ -477,17 +718,30 @@ func (s *DurableStore) dispatchNext(
 		return Task{}, false, err
 	}
 
-	record, found, err := s.nextDispatchedTx(
-		ctx,
-		tx,
-		agentID,
-		legacyOnly,
-		now.Add(-s.dispatchLease),
-	)
-	if err != nil {
-		return Task{}, false, err
-	}
-	if found {
+	for {
+		record, found, err := s.nextDispatchedTx(
+			ctx,
+			tx,
+			agentID,
+			legacyOnly,
+			now.Add(-s.dispatchLease),
+		)
+		if err != nil {
+			return Task{}, false, err
+		}
+		if !found {
+			break
+		}
+		allowed, reason, err := s.moduleDispatchAllowedTx(ctx, tx, record, eligible)
+		if err != nil {
+			return Task{}, false, err
+		}
+		if !allowed {
+			if err := s.cancelModuleDispatchTx(ctx, tx, record, now, reason); err != nil {
+				return Task{}, false, err
+			}
+			continue
+		}
 		result, err := tx.ExecContext(
 			ctx,
 			`UPDATE tasks
@@ -525,54 +779,133 @@ func (s *DurableStore) dispatchNext(
 		return record.task, true, nil
 	}
 
-	record, found, err = s.nextQueuedTx(ctx, tx, agentID, legacyOnly)
-	if err != nil {
-		return Task{}, false, err
-	}
-	if !found {
-		if err := tx.Commit(); err != nil {
-			return Task{}, false, fmt.Errorf("commit empty durable task dispatch: %w", err)
+	for {
+		record, found, err := s.nextQueuedTx(ctx, tx, agentID, legacyOnly)
+		if err != nil {
+			return Task{}, false, err
 		}
-		return Task{}, false, nil
-	}
+		if !found {
+			if err := tx.Commit(); err != nil {
+				return Task{}, false, fmt.Errorf("commit empty durable task dispatch: %w", err)
+			}
+			return Task{}, false, nil
+		}
+		allowed, reason, err := s.moduleDispatchAllowedTx(ctx, tx, record, eligible)
+		if err != nil {
+			return Task{}, false, err
+		}
+		if !allowed {
+			if err := s.cancelModuleDispatchTx(ctx, tx, record, now, reason); err != nil {
+				return Task{}, false, err
+			}
+			continue
+		}
 
+		result, err := tx.ExecContext(
+			ctx,
+			`UPDATE tasks
+			 SET status = ?, dispatched_at = ?, last_delivery_at = ?
+			 WHERE listener_id = ? AND agent_id = ? AND task_id = ? AND status = ?`,
+			string(StatusDispatched),
+			formatDurableTime(now),
+			formatDurableTime(now),
+			s.listenerID,
+			agentID,
+			record.task.ID,
+			string(StatusQueued),
+		)
+		if err != nil {
+			return Task{}, false, fmt.Errorf("dispatch durable task: %w", err)
+		}
+		if err := requireOneDurableRow(result, "dispatch durable task"); err != nil {
+			return Task{}, false, err
+		}
+		record, err = s.getTaskTx(ctx, tx, agentID, record.task.ID)
+		if err != nil {
+			return Task{}, false, err
+		}
+		if err := s.appendTaskAuditTx(
+			ctx,
+			tx,
+			audit.Actor{Kind: audit.ActorAgent, ID: agentID},
+			"task.dispatched",
+			taskAgentAuditRoute("task.dispatched", record.legacyOrigin),
+			record,
+		); err != nil {
+			return Task{}, false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return Task{}, false, fmt.Errorf("commit durable task dispatch: %w", err)
+		}
+		return record.task, true, nil
+	}
+}
+
+func (s *DurableStore) moduleDispatchAllowedTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	record durableTaskRecord,
+	eligible map[string]struct{},
+) (bool, string, error) {
+	if record.task.Type != TypeModule {
+		return true, "", nil
+	}
+	policy, err := s.getModulePolicyTx(ctx, tx, record.task.ID)
+	if err != nil {
+		return false, "", err
+	}
+	if policy == nil || policy.validateTask(&record.task) != nil {
+		return false, "module_policy_missing", nil
+	}
+	if _, ok := eligible[policy.moduleID]; !ok {
+		return false, "module_capability_unavailable", nil
+	}
+	return true, "", nil
+}
+
+func (s *DurableStore) cancelModuleDispatchTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	record durableTaskRecord,
+	now time.Time,
+	reason string,
+) error {
 	result, err := tx.ExecContext(
 		ctx,
 		`UPDATE tasks
-		 SET status = ?, dispatched_at = ?, last_delivery_at = ?
-		 WHERE listener_id = ? AND agent_id = ? AND task_id = ? AND status = ?`,
-		string(StatusDispatched),
-		formatDurableTime(now),
+		 SET status = ?, server_completed_at = ?, last_delivery_at = NULL
+		 WHERE listener_id = ? AND agent_id = ? AND task_id = ?
+		   AND status IN (?, ?)`,
+		string(StatusCancelled),
 		formatDurableTime(now),
 		s.listenerID,
-		agentID,
+		record.task.AgentID,
 		record.task.ID,
 		string(StatusQueued),
+		string(StatusDispatched),
 	)
 	if err != nil {
-		return Task{}, false, fmt.Errorf("dispatch durable task: %w", err)
+		return fmt.Errorf("cancel ineligible module task: %w", err)
 	}
-	if err := requireOneDurableRow(result, "dispatch durable task"); err != nil {
-		return Task{}, false, err
+	if err := requireOneDurableRow(result, "cancel ineligible module task"); err != nil {
+		return err
 	}
-	record, err = s.getTaskTx(ctx, tx, agentID, record.task.ID)
-	if err != nil {
-		return Task{}, false, err
+	causationSequence := record.createdAuditEventSeq
+	if _, err := s.audit.AppendTx(ctx, tx, audit.Input{
+		Actor:             audit.Actor{Kind: audit.ActorSystem, ID: "module_task_dispatch"},
+		Action:            "task.cancelled",
+		Route:             "internal:module_task_dispatch",
+		Target:            audit.Target{Kind: "task", ID: record.task.ID},
+		Outcome:           audit.OutcomeSucceeded,
+		ReasonCode:        reason,
+		CausationSequence: &causationSequence,
+		ListenerID:        s.listenerID,
+		AgentID:           record.task.AgentID,
+		TaskID:            record.task.ID,
+	}); err != nil {
+		return fmt.Errorf("audit ineligible module task cancellation: %w", err)
 	}
-	if err := s.appendTaskAuditTx(
-		ctx,
-		tx,
-		audit.Actor{Kind: audit.ActorAgent, ID: agentID},
-		"task.dispatched",
-		taskAgentAuditRoute("task.dispatched", record.legacyOrigin),
-		record,
-	); err != nil {
-		return Task{}, false, err
-	}
-	if err := tx.Commit(); err != nil {
-		return Task{}, false, fmt.Errorf("commit durable task dispatch: %w", err)
-	}
-	return record.task, true, nil
+	return nil
 }
 
 func (s *DurableStore) MarkRunning(
@@ -703,6 +1036,13 @@ func (s *DurableStore) CompleteWithInfo(
 		return Task{}, CompletionInfo{}, err
 	}
 	info := CompletionInfo{LegacyOrigin: record.legacyOrigin}
+	var policy *moduleTaskPolicy
+	if record.task.Type == TypeModule {
+		policy, err = s.getModulePolicyTx(ctx, tx, record.task.ID)
+		if err != nil {
+			return Task{}, CompletionInfo{}, err
+		}
+	}
 	if record.task.Status == StatusCompleted || record.task.Status == StatusFailed {
 		if record.task.Result == nil || !resultsEqual(*record.task.Result, result) {
 			return Task{}, CompletionInfo{}, fmt.Errorf(
@@ -718,7 +1058,7 @@ func (s *DurableStore) CompleteWithInfo(
 		}
 		return record.task, info, nil
 	}
-	if err := validateResultForTask(&record.task, result); err != nil {
+	if err := validateResultForTask(&record.task, result, policy); err != nil {
 		return Task{}, CompletionInfo{}, err
 	}
 	if record.acceptedRunningAt == nil {
@@ -779,6 +1119,18 @@ func (s *DurableStore) CompleteWithInfo(
 			agentID,
 			record.task.ID,
 			projectDurableLegacyResult(record.task),
+		); err != nil {
+			return Task{}, CompletionInfo{}, err
+		}
+	}
+	if record.task.Type == TypeModule && result.Outcome == OutcomeCompleted {
+		if err := s.appendTaskAuditTx(
+			ctx,
+			tx,
+			audit.Actor{Kind: audit.ActorAgent, ID: agentID},
+			"module_task.evidence_accepted",
+			taskAgentAuditRoute("task.result_received", false),
+			record,
 		); err != nil {
 			return Task{}, CompletionInfo{}, err
 		}

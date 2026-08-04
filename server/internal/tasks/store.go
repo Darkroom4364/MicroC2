@@ -28,6 +28,7 @@ type Store struct {
 	lastDispatch     map[string]time.Time
 	runningUpdates   map[string]StatusUpdate
 	legacyOrigin     map[string]bool
+	modulePolicies   map[string]moduleTaskPolicy
 	now              func() time.Time
 	dispatchLease    time.Duration
 	maxTasksPerAgent int
@@ -61,6 +62,7 @@ func newStoreWithOptions(
 		lastDispatch:     make(map[string]time.Time),
 		runningUpdates:   make(map[string]StatusUpdate),
 		legacyOrigin:     make(map[string]bool),
+		modulePolicies:   make(map[string]moduleTaskPolicy),
 		now:              now,
 		dispatchLease:    dispatchLease,
 		maxTasksPerAgent: maxTasksPerAgent,
@@ -68,14 +70,35 @@ func newStoreWithOptions(
 }
 
 func (s *Store) Create(agentID string, request CreateRequest) (Task, error) {
-	return s.create(agentID, request, false)
+	return s.create(agentID, request, false, nil)
 }
 
-func (s *Store) create(agentID string, request CreateRequest, legacyOrigin bool) (Task, error) {
+func (s *Store) CreateModule(agentID string, request ModuleCreateRequest) (Task, error) {
+	shellRequest, policy, err := deriveModuleTaskPolicy(request)
+	if err != nil {
+		return Task{}, err
+	}
+	return s.create(agentID, shellRequest, false, &policy)
+}
+
+func (s *Store) create(
+	agentID string,
+	request CreateRequest,
+	legacyOrigin bool,
+	policy *moduleTaskPolicy,
+) (Task, error) {
 	if err := ValidateIdentifier("agent_id", agentID); err != nil {
 		return Task{}, err
 	}
-	if err := request.validate(); err != nil {
+	if policy == nil {
+		if err := request.validate(); err != nil {
+			return Task{}, err
+		}
+	} else if err := policy.validateTask(&Task{
+		Type:           request.Type,
+		Arguments:      request.Arguments,
+		TimeoutSeconds: request.TimeoutSeconds,
+	}); err != nil {
 		return Task{}, err
 	}
 
@@ -108,6 +131,9 @@ func (s *Store) create(agentID string, request CreateRequest, legacyOrigin bool)
 	s.byID[task.ID] = task
 	s.byAgent[agentID] = append(s.byAgent[agentID], task.ID)
 	s.legacyOrigin[task.ID] = legacyOrigin
+	if policy != nil {
+		s.modulePolicies[task.ID] = *policy
+	}
 	return cloneTask(task), nil
 }
 
@@ -119,7 +145,7 @@ func (s *Store) CreateLegacyShell(agentID, command string) (Task, error) {
 		Arguments:        ShellArguments{Command: command},
 		TimeoutSeconds:   DefaultTimeoutSeconds,
 		ExpiresInSeconds: &expiresIn,
-	}, true)
+	}, true, nil)
 }
 
 func (s *Store) List(agentID string) ([]Task, error) {
@@ -156,17 +182,31 @@ func (s *Store) Get(agentID, taskID string) (Task, error) {
 }
 
 func (s *Store) DispatchNext(agentID string) (Task, bool, error) {
-	return s.dispatchNext(agentID, false)
+	return s.dispatchNext(agentID, false, nil)
+}
+
+// DispatchNextEligible selects work using a manager-owned immutable module
+// eligibility snapshot. A missing or withdrawn module is cancelled and cannot
+// block later shell work.
+func (s *Store) DispatchNextEligible(
+	agentID string,
+	eligible map[string]struct{},
+) (Task, bool, error) {
+	return s.dispatchNext(agentID, false, eligible)
 }
 
 // DispatchNextLegacy returns only tasks created through a deprecated raw
 // command adapter. A legacy poll must never consume a typed-origin task because
 // it cannot preserve that task's ID or structured result contract.
 func (s *Store) DispatchNextLegacy(agentID string) (Task, bool, error) {
-	return s.dispatchNext(agentID, true)
+	return s.dispatchNext(agentID, true, nil)
 }
 
-func (s *Store) dispatchNext(agentID string, legacyOnly bool) (Task, bool, error) {
+func (s *Store) dispatchNext(
+	agentID string,
+	legacyOnly bool,
+	eligible map[string]struct{},
+) (Task, bool, error) {
 	if err := ValidateIdentifier("agent_id", agentID); err != nil {
 		return Task{}, false, err
 	}
@@ -188,6 +228,10 @@ func (s *Store) dispatchNext(agentID string, legacyOnly bool) (Task, bool, error
 		if lastDelivery != nil && now.Before(lastDelivery.Add(s.dispatchLease)) {
 			continue
 		}
+		if !s.moduleDispatchAllowedLocked(task, eligible) {
+			s.cancelModuleTaskLocked(task, now)
+			continue
+		}
 		s.lastDispatch[id] = now
 		return cloneTask(task), true, nil
 	}
@@ -195,6 +239,10 @@ func (s *Store) dispatchNext(agentID string, legacyOnly bool) (Task, bool, error
 	for _, id := range s.byAgent[agentID] {
 		task := s.byID[id]
 		if task == nil || task.Status != StatusQueued || !s.matchesOriginLocked(id, legacyOnly) {
+			continue
+		}
+		if !s.moduleDispatchAllowedLocked(task, eligible) {
+			s.cancelModuleTaskLocked(task, now)
 			continue
 		}
 		if err := transition(task, StatusDispatched); err != nil {
@@ -205,6 +253,29 @@ func (s *Store) dispatchNext(agentID string, legacyOnly bool) (Task, bool, error
 		return cloneTask(task), true, nil
 	}
 	return Task{}, false, nil
+}
+
+func (s *Store) moduleDispatchAllowedLocked(
+	task *Task,
+	eligible map[string]struct{},
+) bool {
+	if task.Type != TypeModule {
+		return true
+	}
+	policy, ok := s.modulePolicies[task.ID]
+	if !ok || policy.validateTask(task) != nil {
+		return false
+	}
+	_, ok = eligible[policy.moduleID]
+	return ok
+}
+
+func (s *Store) cancelModuleTaskLocked(task *Task, now time.Time) {
+	if task.Type != TypeModule || transition(task, StatusCancelled) != nil {
+		return
+	}
+	task.CompletedAt = timePointer(now)
+	delete(s.lastDispatch, task.ID)
 }
 
 func (s *Store) MarkRunning(agentID, taskID string, update StatusUpdate) (Task, error) {
@@ -260,6 +331,13 @@ func (s *Store) CompleteWithInfo(agentID string, result Result) (Task, Completio
 		return Task{}, CompletionInfo{}, err
 	}
 	info := CompletionInfo{LegacyOrigin: s.legacyOrigin[task.ID]}
+	var policy *moduleTaskPolicy
+	if task.Type == TypeModule {
+		value, ok := s.modulePolicies[task.ID]
+		if ok {
+			policy = &value
+		}
+	}
 	targetStatus := StatusCompleted
 	if result.Outcome == OutcomeFailed {
 		targetStatus = StatusFailed
@@ -273,7 +351,7 @@ func (s *Store) CompleteWithInfo(agentID string, result Result) (Task, Completio
 			ErrInvalidTransition,
 		)
 	}
-	if err := validateResultForTask(task, result); err != nil {
+	if err := validateResultForTask(task, result, policy); err != nil {
 		return Task{}, CompletionInfo{}, err
 	}
 	runningUpdate, ok := s.runningUpdates[task.ID]
@@ -495,6 +573,7 @@ func (s *Store) deleteTaskLocked(taskID string) {
 	delete(s.lastDispatch, taskID)
 	delete(s.runningUpdates, taskID)
 	delete(s.legacyOrigin, taskID)
+	delete(s.modulePolicies, taskID)
 }
 
 func isTerminal(status Status) bool {

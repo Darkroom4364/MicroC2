@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://microc2.local/schemas/module-task-create-request-v1.schema.json",
+  "title": "MicroC2 Governed Module Task Create Request v1",
+  "description": "Closed operator request accepted only by POST /api/agents/{id}/module-tasks. The server derives and persists policy; no policy, acknowledgement, command, or arbitrary metadata is accepted.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "module_id",
+    "input",
+    "timeout_seconds",
+    "expires_in_seconds"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "module_id": {"const": "agent.capability_inventory.v1"},
+    "input": {
+      "type": "object",
+      "maxProperties": 0,
+      "additionalProperties": false
+    },
+    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 5},
+    "expires_in_seconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 604800,
+      "description": "Seconds from server acceptance until the latest authorized start time."
+    }
+  }
+}

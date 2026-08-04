@@ -36,7 +36,7 @@ const exampleSchemas = new Map([
     ['task-dispatched-v1.json', 'task-v1.schema.json'],
     ['task-page-v1.json', 'task-page-v1.schema.json'],
     ['task-result-failed-v1.json', 'task-result-v1.schema.json'],
-    ['task-module-create-request-v1.json', 'task-create-request-v1.schema.json'],
+    ['task-module-create-request-v1.json', 'module-task-create-request-v1.schema.json'],
     ['task-module-dispatched-v1.json', 'task-v1.schema.json'],
     ['task-module-result-v1.json', 'task-result-v1.schema.json'],
     ['task-result-v1.json', 'task-result-v1.schema.json'],
@@ -388,14 +388,18 @@ const negativeCases = [
     },
     {
         name: 'module task rejects shell command arguments',
-        schema: 'task-create-request-v1.schema.json',
+        schema: 'module-task-create-request-v1.schema.json',
         value: {
             ...readJSON(path.join(exampleDirectory, 'task-module-create-request-v1.json')),
-            arguments: {
-                module_id: 'agent.capability_inventory.v1',
-                input: {},
-                command: 'whoami'
-            }
+            command: 'whoami'
+        }
+    },
+    {
+        name: 'module task rejects a timeout over five seconds',
+        schema: 'module-task-create-request-v1.schema.json',
+        value: {
+            ...readJSON(path.join(exampleDirectory, 'task-module-create-request-v1.json')),
+            timeout_seconds: 6
         }
     },
     ...forbiddenStateCases(

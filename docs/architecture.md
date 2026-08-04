@@ -118,7 +118,8 @@ are visible during development.
 | `/api/listeners/{id}/agents/{agent_id}/session/re-enroll` | `internal/handlers/api` | Explicitly authorize the next valid bootstrap to replace the session. |
 | `/api/agents/list` | `internal/handlers/api` | Aggregate agents across listeners. |
 | `/api/modules` | `internal/handlers/api` | Retrieve the bounded catalog of compile-time registered agent modules and their safety metadata. |
-| `/api/agents/{id}/tasks` | `internal/handlers/api` | `POST` a typed task or `GET` a bounded, paginated page of newest-first task summaries. |
+| `/api/agents/{id}/tasks` | `internal/handlers/api` | `POST` a closed shell Task v1 request or `GET` a bounded, paginated page of newest-first task summaries. |
+| `/api/agents/{id}/module-tasks` | `internal/handlers/api` | `POST` the closed governed capability-inventory request; the server derives and durably stores policy before queueing. |
 | `/api/agents/{id}/tasks/{task_id}` | `internal/handlers/api` | Get one full Task v1 resource, including terminal stdout/stderr and module evidence when present. |
 | `/api/agents/{id}/tasks/{task_id}/cancel` | `internal/handlers/api` | Cancel a queued task before it is dispatched. |
 | `/api/agents/command` | `internal/handlers/api` | Deprecated adapter from an `agent_id` plus raw command to a v1 shell task. |
@@ -168,6 +169,7 @@ and redaction semantics.
 The v1 wire formats are defined by:
 
 - [Create Task Request v1](schemas/task-create-request-v1.schema.json)
+- [Module Task Create Request v1](schemas/module-task-create-request-v1.schema.json)
 - [Task v1](schemas/task-v1.schema.json)
 - [Task summary v1](schemas/task-summary-v1.schema.json)
 - [Task page v1](schemas/task-page-v1.schema.json)
@@ -178,17 +180,21 @@ The v1 wire formats are defined by:
 - [Capability inventory input v1](schemas/module-capability-inventory-input-v1.schema.json)
 - [Capability inventory output v1](schemas/module-capability-inventory-output-v1.schema.json)
 
-The operator creation body contains `schema_version`, `type`, typed
-`arguments`, `timeout_seconds`, and `expires_in_seconds`. `type: "shell"` has
-one bounded `command`; `type: "module"` has a registered `module_id` and a
-closed JSON input. The server accepts a module task only when the selected
-agent's authenticated heartbeat advertises that module ID. A successful
-`POST /api/agents/{agent_id}/tasks` returns `202 Accepted` with the complete
-Task v1 resource. The server owns task IDs, agent correlation, lifecycle
-status, queue timestamps, registry validation, and any required safety
-acknowledgement. The agent owns the correlated terminal Task Result v1,
-including outcome, execution timestamps, exit code, separate stdout/stderr, and
-validated module `output.data` evidence.
+`POST /api/agents/{agent_id}/tasks` accepts only the shell Create Task Request
+v1: `schema_version`, `type: "shell"`, one bounded `arguments.command`,
+`timeout_seconds`, and `expires_in_seconds`. Governed work is created only at
+`POST /api/agents/{agent_id}/module-tasks` with the closed Module Task Create
+Request v1: `module_id: "agent.capability_inventory.v1"`, exact empty `input`,
+a 1–5 second timeout, and a bounded expiry. It rejects shell fields,
+acknowledgements, policy, and arbitrary metadata.
+
+The server derives the module's read-only/self, evidence-required,
+no-approval policy from its compiled registry and persists it outside Task v1
+and the agent wire. Module eligibility requires a current authenticated
+heartbeat advertisement, including after restart. Successful module evidence
+must be closed `output.data` no larger than 1024 bytes; failed results carry no
+accepted evidence. A successful creation returns `202 Accepted` with the
+unchanged Task v1 resource.
 
 `GET /api/agents/{agent_id}/tasks` returns Task Page v1 with explicit `limit`,
 `offset`, `total`, and `next_offset` fields. Pages contain at most 100
@@ -211,8 +217,9 @@ terminal results are idempotent. The agent retains unacknowledged work and
 completed results in a bounded in-memory outbox so transport retries do not
 repeat shell side effects.
 
-Legacy operator `/command` routes are deprecated compatibility adapters; new
-callers must use the typed `/tasks` resource.
+Legacy operator `/command` routes are deprecated arbitrary-shell compatibility
+adapters. New shell callers use `/tasks`; governed inventory callers use
+`/module-tasks`.
 
 ### Agent Listener Routes
 

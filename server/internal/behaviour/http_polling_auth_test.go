@@ -551,15 +551,35 @@ func TestAuthenticatedPollingRequiresFreshHeartbeatAfterRestart(t *testing.T) {
 	)
 	assertAgentStatus(t, response, http.StatusUnauthorized)
 
-	response = serveHeartbeat(
-		t,
+	response = serveAgentRequest(
 		restarted.GetHTTPHandler(),
-		"listener-one",
-		"payload-one",
-		"agent-one",
+		http.MethodPost,
+		"/api/agent/agent-one/heartbeat",
 		session,
+		marshalAgentJSON(t, Agent{
+			ID:         "agent-one",
+			ListenerID: "listener-one",
+			PayloadID:  "payload-one",
+			OS:         "linux",
+			Hostname:   "test-host",
+			IP:         "127.0.0.1",
+			IPList:     []string{"127.0.0.1"},
+			Commands:   []string{},
+			ModuleIDs:  []string{"agent.capability_inventory.v1"},
+		}),
 	)
 	assertAgentStatus(t, response, http.StatusOK)
+	expiresIn := 120
+	queued, err := restarted.CreateModuleTask("agent-one", tasks.ModuleCreateRequest{
+		SchemaVersion:    tasks.SchemaVersion,
+		ModuleID:         "agent.capability_inventory.v1",
+		Input:            json.RawMessage(`{}`),
+		TimeoutSeconds:   5,
+		ExpiresInSeconds: &expiresIn,
+	})
+	if err != nil {
+		t.Fatalf("create module task after fresh authenticated heartbeat: %v", err)
+	}
 	response = serveAgentRequest(
 		restarted.GetHTTPHandler(),
 		http.MethodGet,
@@ -567,7 +587,12 @@ func TestAuthenticatedPollingRequiresFreshHeartbeatAfterRestart(t *testing.T) {
 		session,
 		nil,
 	)
-	assertAgentStatus(t, response, http.StatusNoContent)
+	assertAgentStatus(t, response, http.StatusOK)
+	var dispatched tasks.Task
+	if err := json.Unmarshal(response.Body.Bytes(), &dispatched); err != nil ||
+		dispatched.ID != queued.ID || dispatched.Type != tasks.TypeModule {
+		t.Fatalf("fresh heartbeat did not restore module lease: task=%#v err=%v", dispatched, err)
+	}
 }
 
 func fillRuntimeAgentCache(
