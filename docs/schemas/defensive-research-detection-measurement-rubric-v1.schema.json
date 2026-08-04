@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://microc2.local/schemas/defensive-research-detection-measurement-rubric-v1.schema.json",
+  "title": "MicroC2 Defensive Research Detection-Measurement Rubric v1",
+  "description": "Versioned, evidence-only rubric for interpreting saved or synthetic defensive observations across five immutable dimensions: provenance, collection-coverage, validity, uncertainty, and missing-unknown-data. Each dimension pins a category reference to the microc2-defensive-research-categories registry. The rubric defines admissible evidence classes, invalid/unknown handling semantics, uncertainty disclosure requirements, reporting requirements, and comparability limits. This rubric does not prescribe products, executors, payloads, agents, tasking, telemetry capture, or run instructions. It forbids evasion guidance and single-verdict claims.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "rubric_id",
+    "rubric_version",
+    "schema_version",
+    "dimensions"
+  ],
+  "properties": {
+    "rubric_id": {
+      "const": "microc2-defensive-research-detection-measurement-rubric"
+    },
+    "rubric_version": {
+      "const": "1.0.0"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "dimensions": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/dimension"
+      }
+    }
+  },
+  "$defs": {
+    "dimension": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "definition",
+        "category_reference",
+        "admissible_evidence_classes",
+        "invalid_handling",
+        "unknown_handling",
+        "uncertainty_disclosure",
+        "reporting_requirement",
+        "comparability_limit"
+      ],
+      "properties": {
+        "id": {
+          "enum": [
+            "provenance",
+            "collection-coverage",
+            "validity",
+            "uncertainty",
+            "missing-unknown-data"
+          ],
+          "description": "Immutable dimension identifier from the closed five-dimension set."
+        },
+        "definition": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "Dimension definition describing what this dimension measures and how it should be interpreted in the context of defensive research."
+        },
+        "category_reference": {
+          "$ref": "defensive-research-category-reference-v1.schema.json",
+          "description": "Pinned reference to a category in the microc2-defensive-research-categories registry that governs admissible evidence classes for this dimension."
+        },
+        "admissible_evidence_classes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "integrity-metadata",
+              "redacted-observation-summary",
+              "aggregate-measurement-summary",
+              "synthetic-control-summary"
+            ]
+          },
+          "description": "Non-empty, unique subset of the pinned registry's four closed evidence-class values. Must be a subset of the referenced category's allowed_evidence_classes."
+        },
+        "invalid_handling": {
+          "enum": [
+            "reject-assessment",
+            "downgrade-to-unknown"
+          ],
+          "description": "How knowingly invalid or corrupted evidence is handled for this dimension. reject-assessment: the observation must not contribute to the dimension assessment. downgrade-to-unknown: the observation is reclassified as unknown and processed accordingly."
+        },
+        "unknown_handling": {
+          "enum": [
+            "report-as-unknown",
+            "exclude-from-comparison"
+          ],
+          "description": "How missing or absent evidence is handled for this dimension. report-as-unknown: the absence is recorded as an explicit unknown observation. exclude-from-comparison: the dimension is omitted from comparative analysis when evidence is absent."
+        },
+        "uncertainty_disclosure": {
+          "enum": [
+            "level",
+            "level-with-rationale"
+          ],
+          "description": "Required uncertainty reporting for this dimension. level: a discrete uncertainty level must be assigned. level-with-rationale: both a level and a written rationale are required."
+        },
+        "reporting_requirement": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "What must be reported for this dimension: the required content, format constraints, and any per-dimension specificity."
+        },
+        "comparability_limit": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "Explicit constraint on what comparisons are valid across measurement runs for this dimension, including any necessary precondition, normalisation, or scope boundary."
+        }
+      }
+    }
+  }
+}

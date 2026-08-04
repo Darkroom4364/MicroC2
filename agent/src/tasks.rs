@@ -764,4 +764,83 @@ mod tests {
         task.arguments.command = "é".repeat(MAX_SHELL_COMMAND_CHARS + 1);
         assert!(task.validate_for_agent("agent-one").is_err());
     }
+
+    #[test]
+    fn v1_contract_conformance_vectors() {
+        const CORPUS: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../docs/schemas/contract-vectors-v1.json"
+        ));
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct VectorEntry {
+            id: String,
+            schema_target: String,
+            expected: String,
+            value: serde_json::Value,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Corpus {
+            schema_version: u32,
+            vectors: Vec<VectorEntry>,
+        }
+
+        let corpus: Corpus =
+            serde_json::from_str(CORPUS).expect("deserialize contract vectors corpus");
+
+        assert_eq!(corpus.schema_version, 1, "corpus schema_version must be 1");
+        assert!(
+            !corpus.vectors.is_empty(),
+            "corpus vectors must be nonempty"
+        );
+
+        let mut seen = std::collections::HashSet::new();
+        for v in &corpus.vectors {
+            assert!(!v.id.is_empty(), "vector id must be nonempty");
+            assert!(seen.insert(&v.id), "duplicate vector id {:?}", v.id);
+
+            assert!(
+                v.schema_target == "task-result-v1.schema.json"
+                    || v.schema_target == "task-status-update-v1.schema.json",
+                "unknown schema_target {:?} in vector {:?}",
+                v.schema_target,
+                v.id
+            );
+
+            assert!(
+                v.expected == "accept" || v.expected == "reject",
+                "invalid expected value {:?} in vector {:?}",
+                v.expected,
+                v.id
+            );
+        }
+
+        for v in &corpus.vectors {
+            let accepted = match v.schema_target.as_str() {
+                "task-result-v1.schema.json" => {
+                    match serde_json::from_value::<TaskResult>(v.value.clone()) {
+                        Ok(result) => result.validate().is_ok(),
+                        Err(_) => false,
+                    }
+                }
+                "task-status-update-v1.schema.json" => {
+                    match serde_json::from_value::<TaskStatusUpdate>(v.value.clone()) {
+                        Ok(update) => update.validate().is_ok(),
+                        Err(_) => false,
+                    }
+                }
+                _ => unreachable!("schema_target already validated"),
+            };
+
+            let want_accept = v.expected == "accept";
+            assert_eq!(
+                accepted, want_accept,
+                "vector {:?} target {}: expected accepted={}, got accepted={}",
+                v.id, v.schema_target, want_accept, accepted
+            );
+        }
+    }
 }

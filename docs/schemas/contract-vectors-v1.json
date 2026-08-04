@@ -1,0 +1,151 @@
+{
+  "schema_version": 1,
+  "vectors": [
+    {
+      "id": "cv-result-completed-accept",
+      "schema_target": "task-result-v1.schema.json",
+      "expected": "accept",
+      "value": {
+        "schema_version": 1,
+        "task_id": "cv-task-01",
+        "agent_id": "cv-agent-01",
+        "outcome": "completed",
+        "started_at": "2026-07-28T10:00:00Z",
+        "completed_at": "2026-07-28T10:00:01Z",
+        "exit_code": 0,
+        "output": {"stdout": "fixture", "stderr": ""}
+      }
+    },
+    {
+      "id": "cv-result-failed-accept",
+      "schema_target": "task-result-v1.schema.json",
+      "expected": "accept",
+      "value": {
+        "schema_version": 1,
+        "task_id": "cv-task-02",
+        "agent_id": "cv-agent-01",
+        "outcome": "failed",
+        "started_at": "2026-07-28T10:00:00Z",
+        "completed_at": "2026-07-28T10:00:03Z",
+        "exit_code": 1,
+        "output": {"stdout": "", "stderr": "fixture error output"},
+        "error": "command not found"
+      }
+    },
+    {
+      "id": "cv-status-running-accept",
+      "schema_target": "task-status-update-v1.schema.json",
+      "expected": "accept",
+      "value": {
+        "schema_version": 1,
+        "task_id": "cv-task-01",
+        "agent_id": "cv-agent-01",
+        "status": "running",
+        "timestamp": "2026-07-28T10:00:00Z"
+      }
+    },
+    {
+      "id": "cv-result-missing-output-reject",
+      "schema_target": "task-result-v1.schema.json",
+      "expected": "reject",
+      "value": {
+        "schema_version": 1,
+        "task_id": "cv-task-01",
+        "agent_id": "cv-agent-01",
+        "outcome": "completed",
+        "started_at": "2026-07-28T10:00:00Z",
+        "completed_at": "2026-07-28T10:00:01Z",
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "cv-result-unknown-field-reject",
+      "schema_target": "task-result-v1.schema.json",
+      "expected": "reject",
+      "value": {
+        "schema_version": 1,
+        "task_id": "cv-task-01",
+        "agent_id": "cv-agent-01",
+        "outcome": "completed",
+        "started_at": "2026-07-28T10:00:00Z",
+        "completed_at": "2026-07-28T10:00:01Z",
+        "exit_code": 0,
+        "output": {"stdout": "", "stderr": ""},
+        "future_field": true
+      }
+    },
+    {
+      "id": "cv-result-unsupported-version-reject",
+      "schema_target": "task-result-v1.schema.json",
+      "expected": "reject",
+      "value": {
+        "schema_version": 2,
+        "task_id": "cv-task-01",
+        "agent_id": "cv-agent-01",
+        "outcome": "completed",
+        "started_at": "2026-07-28T10:00:00Z",
+        "completed_at": "2026-07-28T10:00:01Z",
+        "exit_code": 0,
+        "output": {"stdout": "", "stderr": ""}
+      }
+    },
+    {
+      "id": "cv-result-invalid-identifier-reject",
+      "schema_target": "task-result-v1.schema.json",
+      "expected": "reject",
+      "value": {
+        "schema_version": 1,
+        "task_id": "cv-task-01",
+        "agent_id": "cv/agent",
+        "outcome": "completed",
+        "started_at": "2026-07-28T10:00:00Z",
+        "completed_at": "2026-07-28T10:00:01Z",
+        "exit_code": 0,
+        "output": {"stdout": "", "stderr": ""}
+      }
+    },
+    {
+      "id": "cv-result-invalid-timestamp-reject",
+      "schema_target": "task-result-v1.schema.json",
+      "expected": "reject",
+      "value": {
+        "schema_version": 1,
+        "task_id": "cv-task-01",
+        "agent_id": "cv-agent-01",
+        "outcome": "completed",
+        "started_at": "not-a-timestamp",
+        "completed_at": "2026-07-28T10:00:01Z",
+        "exit_code": 0,
+        "output": {"stdout": "", "stderr": ""}
+      }
+    },
+    {
+      "id": "cv-result-empty-error-completed-reject",
+      "schema_target": "task-result-v1.schema.json",
+      "expected": "reject",
+      "value": {
+        "schema_version": 1,
+        "task_id": "cv-task-01",
+        "agent_id": "cv-agent-01",
+        "outcome": "completed",
+        "started_at": "2026-07-28T10:00:00Z",
+        "completed_at": "2026-07-28T10:00:01Z",
+        "exit_code": 0,
+        "output": {"stdout": "", "stderr": ""},
+        "error": ""
+      }
+    },
+    {
+      "id": "cv-status-non-running-reject",
+      "schema_target": "task-status-update-v1.schema.json",
+      "expected": "reject",
+      "value": {
+        "schema_version": 1,
+        "task_id": "cv-task-01",
+        "agent_id": "cv-agent-01",
+        "status": "completed",
+        "timestamp": "2026-07-28T10:00:00Z"
+      }
+    }
+  ]
+}

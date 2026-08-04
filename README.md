@@ -85,6 +85,7 @@ This framework can be used to:
 - [Durable storage, recovery, and backup](docs/storage.md)
 - [Roadmap](docs/roadmap.md)
 - [Development workflow and CI](docs/development-workflow.md)
+- [Health, readiness, and runtime telemetry](docs/health-telemetry.md)
 
 ---
 
