@@ -228,9 +228,12 @@ Goal: let MicroC2 grow without turning the core into a pile of special cases.
 
 Focus areas:
 
-- Define a plugin/module boundary for server-side tools and agent-side tasks.
-- Add stable schemas for module inputs, outputs, permissions, and evidence.
-- Build a small module SDK or examples before adding many modules.
+- The initial compile-time agent module boundary now has a server catalog, typed
+  module task envelope, safety metadata, and bounded structured evidence.
+- Add stable schemas for each module's inputs and outputs; registry validation,
+  rather than operator-provided code, remains the extension mechanism.
+- Keep future module registration explicit on both the server and the payload,
+  then require the agent to advertise support before it can receive tasking.
 - Consider read-only integrations with sibling research tools, such as BACillus,
   through structured evidence rather than repo mergers.
 - Add ATT&CK mapping and tags at the task/module level for reporting and
@@ -347,7 +350,9 @@ Research tracks:
   embeds a fresh, deliberately unrecorded enrollment bootstrap; recreating an
   exact credential-bearing artifact from source and seed alone is intentionally
   out of scope.
-- **R2: LLMjacking emulation module** (Phase 4 module SDK). No academic
+- **R2: LLMjacking emulation module** (Phase 4 module SDK). The typed SDK
+  prerequisite now exists as a compile-time registry and the read-only
+  capability-inventory example; R2 itself remains unimplemented. No academic
   baseline exists for AI-compute monetization ("LLMjacking"; industry-only
   reporting from Sysdig, Microsoft, Permiso). Build a module that emulates the
   kill chain endpoint-side in the lab: planted honeytoken LLM API keys, model
@@ -368,7 +373,8 @@ Research tracks:
 Track dependencies:
 
 - R1 needs Phase 3 build provenance and Phase 5 reporting/telemetry views.
-- R2 needs the Phase 4 module SDK and its safety metadata.
+- R2 now has the Phase 4 module SDK and safety metadata; it still needs its
+  isolated lab fixtures, local-model path, and measurement protocol.
 - R3 needs Phase 2 transport profiles as validated config.
 - R4 needs Phase 0 CI plus R1's frozen build artifacts.
 

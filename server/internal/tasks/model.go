@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"microc2/server/internal/modules"
 )
 
 const (
@@ -45,7 +47,8 @@ const (
 type Type string
 
 const (
-	TypeShell Type = "shell"
+	TypeShell  Type = "shell"
+	TypeModule Type = "module"
 )
 
 type Status string
@@ -86,13 +89,22 @@ func (e *ValidationError) Error() string {
 	return fmt.Sprintf("%s: %s", e.Field, e.Message)
 }
 
-type ShellArguments struct {
-	Command string `json:"command"`
+// TaskArguments is a closed tagged union. The enclosing task type determines
+// which fields are valid.
+type TaskArguments struct {
+	Command  string          `json:"command,omitempty"`
+	ModuleID string          `json:"module_id,omitempty"`
+	Input    json.RawMessage `json:"input,omitempty"`
 }
 
+// ShellArguments retains the source-level convenience name for existing shell
+// callers while sharing the canonical task argument representation.
+type ShellArguments = TaskArguments
+
 type Output struct {
-	Stdout string `json:"stdout"`
-	Stderr string `json:"stderr"`
+	Stdout string          `json:"stdout"`
+	Stderr string          `json:"stderr"`
+	Data   json.RawMessage `json:"data,omitempty"`
 }
 
 type Result struct {
@@ -153,16 +165,21 @@ func (r *Result) UnmarshalJSON(data []byte) error {
 		Output: Output{
 			Stdout: *wire.Output.Stdout,
 			Stderr: *wire.Output.Stderr,
+			Data:   cloneRawMessage(wire.Output.Data),
 		},
 		Error:        resultError,
 		errorPresent: errorPresent,
+	}
+	if len(r.Output.Data) > 0 && string(r.Output.Data) == "null" {
+		return &ValidationError{Field: "output.data", Message: "must be an object"}
 	}
 	return nil
 }
 
 type rawOutput struct {
-	Stdout *string `json:"stdout"`
-	Stderr *string `json:"stderr"`
+	Stdout *string         `json:"stdout"`
+	Stderr *string         `json:"stderr"`
+	Data   json.RawMessage `json:"data"`
 }
 
 type Task struct {
@@ -250,11 +267,12 @@ func Summarize(task Task) TaskSummary {
 // CreateRequest is the operator-facing subset of Task. Identity, state, and
 // timestamps are assigned by the server.
 type CreateRequest struct {
-	SchemaVersion    int            `json:"schema_version,omitempty"`
-	Type             Type           `json:"type"`
-	Arguments        ShellArguments `json:"arguments"`
-	TimeoutSeconds   int            `json:"timeout_seconds"`
-	ExpiresInSeconds *int           `json:"expires_in_seconds,omitempty"`
+	SchemaVersion      int           `json:"schema_version,omitempty"`
+	Type               Type          `json:"type"`
+	Arguments          TaskArguments `json:"arguments"`
+	TimeoutSeconds     int           `json:"timeout_seconds"`
+	ExpiresInSeconds   *int          `json:"expires_in_seconds,omitempty"`
+	SafetyAcknowledged bool          `json:"safety_acknowledged,omitempty"`
 }
 
 type StatusUpdate struct {
@@ -287,21 +305,52 @@ func ValidateIdentifier(field, value string) error {
 	return nil
 }
 
+// ValidateCreateRequest validates an operator request before it reaches a
+// store. Stores call it again so direct users cannot bypass module policy.
+func ValidateCreateRequest(r CreateRequest) error {
+	return r.validate()
+}
+
 func (r CreateRequest) validate() error {
 	if r.SchemaVersion != SchemaVersion {
 		return &ValidationError{Field: "schema_version", Message: "must be 1"}
 	}
-	if r.Type != TypeShell {
-		return &ValidationError{Field: "type", Message: `must be "shell"`}
-	}
-	if strings.TrimSpace(r.Arguments.Command) == "" {
-		return &ValidationError{Field: "arguments.command", Message: "is required"}
-	}
-	if utf8.RuneCountInString(r.Arguments.Command) > MaxCommandCharacters {
-		return &ValidationError{
-			Field:   "arguments.command",
-			Message: fmt.Sprintf("must be at most %d characters", MaxCommandCharacters),
+	switch r.Type {
+	case TypeShell:
+		if r.Arguments.ModuleID != "" || len(r.Arguments.Input) != 0 {
+			return &ValidationError{Field: "arguments", Message: "must contain only command for shell tasks"}
 		}
+		if r.SafetyAcknowledged {
+			return &ValidationError{Field: "safety_acknowledged", Message: "is only valid for module tasks"}
+		}
+		if strings.TrimSpace(r.Arguments.Command) == "" {
+			return &ValidationError{Field: "arguments.command", Message: "is required"}
+		}
+		if utf8.RuneCountInString(r.Arguments.Command) > MaxCommandCharacters {
+			return &ValidationError{
+				Field:   "arguments.command",
+				Message: fmt.Sprintf("must be at most %d characters", MaxCommandCharacters),
+			}
+		}
+	case TypeModule:
+		if r.Arguments.Command != "" {
+			return &ValidationError{Field: "arguments.command", Message: "is not valid for module tasks"}
+		}
+		if err := ValidateIdentifier("arguments.module_id", r.Arguments.ModuleID); err != nil {
+			return err
+		}
+		if err := modules.DefaultRegistry().ValidateInput(r.Arguments.ModuleID, r.Arguments.Input); err != nil {
+			return &ValidationError{Field: "arguments.input", Message: err.Error()}
+		}
+		requiresAcknowledgement, err := modules.DefaultRegistry().RequiresAcknowledgement(r.Arguments.ModuleID)
+		if err != nil {
+			return &ValidationError{Field: "arguments.module_id", Message: err.Error()}
+		}
+		if requiresAcknowledgement && !r.SafetyAcknowledged {
+			return &ValidationError{Field: "safety_acknowledged", Message: "must be true for this module"}
+		}
+	default:
+		return &ValidationError{Field: "type", Message: `must be "shell" or "module"`}
 	}
 	if r.TimeoutSeconds < 1 || r.TimeoutSeconds > MaxTimeoutSeconds {
 		return &ValidationError{Field: "timeout_seconds", Message: "must be between 1 and 3600"}
@@ -377,6 +426,18 @@ func (r Result) validate(agentID string) error {
 			Message: fmt.Sprintf("must be at most %d characters", MaxResultStreamCharacters),
 		}
 	}
+	if len(r.Output.Data) > 0 {
+		if len(r.Output.Data) > modules.MaxOutputBytes {
+			return &ValidationError{
+				Field:   "output.data",
+				Message: fmt.Sprintf("must be at most %d bytes", modules.MaxOutputBytes),
+			}
+		}
+		var data map[string]json.RawMessage
+		if !json.Valid(r.Output.Data) || json.Unmarshal(r.Output.Data, &data) != nil || data == nil {
+			return &ValidationError{Field: "output.data", Message: "must be a JSON object"}
+		}
+	}
 	if utf8.RuneCountInString(r.Error) > MaxResultErrorCharacters {
 		return &ValidationError{
 			Field:   "error",
@@ -393,17 +454,56 @@ func (r Result) validate(agentID string) error {
 	switch r.Outcome {
 	case OutcomeCompleted:
 		if r.ExitCode == nil || *r.ExitCode != 0 {
-			return &ValidationError{Field: "exit_code", Message: "must be 0 for a completed shell task"}
+			return &ValidationError{Field: "exit_code", Message: "must be 0 for a completed task"}
 		}
 		if r.errorPresent || r.Error != "" {
-			return &ValidationError{Field: "error", Message: "must be omitted for a completed shell task"}
+			return &ValidationError{Field: "error", Message: "must be omitted for a completed task"}
 		}
 	case OutcomeFailed:
 		if strings.TrimSpace(r.Error) == "" {
-			return &ValidationError{Field: "error", Message: "is required for a failed shell task"}
+			return &ValidationError{Field: "error", Message: "is required for a failed task"}
 		}
 	}
 	return nil
+}
+
+func validateResultForTask(task *Task, result Result) error {
+	switch task.Type {
+	case TypeShell:
+		if len(result.Output.Data) != 0 {
+			return &ValidationError{Field: "output.data", Message: "is not valid for shell tasks"}
+		}
+	case TypeModule:
+		if result.Outcome == OutcomeFailed {
+			if len(result.Output.Data) != 0 {
+				return &ValidationError{Field: "output.data", Message: "must be omitted for failed module tasks"}
+			}
+			return nil
+		}
+		if len(result.Output.Data) == 0 {
+			return &ValidationError{Field: "output.data", Message: "is required for completed module tasks"}
+		}
+		if err := modules.DefaultRegistry().ValidateOutput(task.Arguments.ModuleID, result.Output.Data); err != nil {
+			return &ValidationError{Field: "output.data", Message: err.Error()}
+		}
+	default:
+		return &ValidationError{Field: "type", Message: "is unsupported"}
+	}
+	return nil
+}
+
+func cloneRawMessage(value json.RawMessage) json.RawMessage {
+	if value == nil {
+		return nil
+	}
+	clone := make(json.RawMessage, len(value))
+	copy(clone, value)
+	return clone
+}
+
+func cloneTaskArguments(arguments TaskArguments) TaskArguments {
+	arguments.Input = cloneRawMessage(arguments.Input)
+	return arguments
 }
 
 func canTransition(from, to Status) bool {

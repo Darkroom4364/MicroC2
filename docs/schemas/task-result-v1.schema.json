@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://microc2.local/schemas/task-result-v1.schema.json",
   "title": "MicroC2 Task Result v1",
-  "description": "Terminal result submitted by an agent for a correlated task.",
+  "description": "Terminal result submitted by an agent for a correlated task. Module-specific output.data contracts are selected from the module catalog by the server.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -71,6 +71,11 @@
         "stderr": {
           "type": "string",
           "maxLength": 1048576
+        },
+        "data": {
+          "type": "object",
+          "maxProperties": 64,
+          "description": "Structured module evidence. The enclosing module contract defines its exact fields."
         }
       }
     },

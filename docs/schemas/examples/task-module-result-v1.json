@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "task_id": "task-module-01",
+  "agent_id": "agent-01",
+  "outcome": "completed",
+  "started_at": "2026-07-26T12:00:01Z",
+  "completed_at": "2026-07-26T12:00:02Z",
+  "exit_code": 0,
+  "output": {
+    "stdout": "",
+    "stderr": "",
+    "data": {
+      "operating_system": "linux",
+      "architecture": "x86_64",
+      "logical_cpu_count": 8,
+      "total_memory_bytes": 17179869184
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "type": "module",
+  "arguments": {
+    "module_id": "agent.capability_inventory.v1",
+    "input": {}
+  },
+  "timeout_seconds": 30,
+  "expires_in_seconds": 300
+}

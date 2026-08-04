@@ -1,11 +1,14 @@
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::error::Error;
 use std::fmt;
 
 pub const TASK_SCHEMA_VERSION: u32 = 1;
 pub const MAX_TASK_TIMEOUT_SECONDS: u64 = 3_600;
 pub const MAX_SHELL_COMMAND_CHARS: usize = 8_192;
+pub const MAX_MODULE_INPUT_BYTES: usize = 64 << 10;
+pub const MAX_MODULE_OUTPUT_BYTES: usize = 64 << 10;
 pub const MAX_TASK_OUTPUT_CHARS: usize = 1_048_576;
 pub const MAX_TASK_ERROR_CHARS: usize = 8_192;
 
@@ -13,6 +16,7 @@ pub const MAX_TASK_ERROR_CHARS: usize = 8_192;
 #[serde(rename_all = "lowercase")]
 pub enum TaskType {
     Shell,
+    Module,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -27,10 +31,15 @@ pub enum TaskStatus {
     Expired,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskArguments {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -106,16 +115,53 @@ impl Task {
                 "dispatched task must include expires_at",
             ));
         }
-        if self.arguments.command.trim().is_empty() {
-            return Err(TaskValidationError::new(
-                "shell task arguments.command is required",
-            ));
-        }
-        if self.arguments.command.chars().count() > MAX_SHELL_COMMAND_CHARS {
-            return Err(TaskValidationError::new(format!(
-                "shell task arguments.command must be at most {} characters",
-                MAX_SHELL_COMMAND_CHARS
-            )));
+        match self.task_type {
+            TaskType::Shell => {
+                if self.arguments.module_id.is_some() || self.arguments.input.is_some() {
+                    return Err(TaskValidationError::new(
+                        "shell task arguments must contain only command",
+                    ));
+                }
+                if self.arguments.command.trim().is_empty() {
+                    return Err(TaskValidationError::new(
+                        "shell task arguments.command is required",
+                    ));
+                }
+                if self.arguments.command.chars().count() > MAX_SHELL_COMMAND_CHARS {
+                    return Err(TaskValidationError::new(format!(
+                        "shell task arguments.command must be at most {} characters",
+                        MAX_SHELL_COMMAND_CHARS
+                    )));
+                }
+            }
+            TaskType::Module => {
+                if !self.arguments.command.is_empty() {
+                    return Err(TaskValidationError::new(
+                        "module task arguments.command is not valid",
+                    ));
+                }
+                let module_id = self.arguments.module_id.as_deref().ok_or_else(|| {
+                    TaskValidationError::new("module task arguments.module_id is required")
+                })?;
+                validate_identifier("module task arguments.module_id", module_id)?;
+                let input = self.arguments.input.as_ref().ok_or_else(|| {
+                    TaskValidationError::new("module task arguments.input is required")
+                })?;
+                if !input.is_object() {
+                    return Err(TaskValidationError::new(
+                        "module task arguments.input must be an object",
+                    ));
+                }
+                let input_bytes = serde_json::to_vec(input).map_err(|_| {
+                    TaskValidationError::new("module task arguments.input must be JSON")
+                })?;
+                if input_bytes.len() > MAX_MODULE_INPUT_BYTES {
+                    return Err(TaskValidationError::new(format!(
+                        "module task arguments.input must be at most {} bytes",
+                        MAX_MODULE_INPUT_BYTES
+                    )));
+                }
+            }
         }
         if !(1..=MAX_TASK_TIMEOUT_SECONDS).contains(&self.timeout_seconds) {
             return Err(TaskValidationError::new(format!(
@@ -147,6 +193,8 @@ pub enum TaskOutcome {
 pub struct TaskOutput {
     pub stdout: String,
     pub stderr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -197,6 +245,21 @@ impl TaskResult {
                 "output.stderr must be at most {} characters",
                 MAX_TASK_OUTPUT_CHARS
             )));
+        }
+        if let Some(data) = &self.output.data {
+            if !data.is_object() {
+                return Err(TaskValidationError::new(
+                    "output.data must be a JSON object",
+                ));
+            }
+            let data_bytes = serde_json::to_vec(data)
+                .map_err(|_| TaskValidationError::new("output.data must be JSON"))?;
+            if data_bytes.len() > MAX_MODULE_OUTPUT_BYTES {
+                return Err(TaskValidationError::new(format!(
+                    "output.data must be at most {} bytes",
+                    MAX_MODULE_OUTPUT_BYTES
+                )));
+            }
         }
         if self
             .error
@@ -365,6 +428,14 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/../docs/schemas/examples/task-status-update-v1.json"
     ));
+    const GOLDEN_MODULE_DISPATCHED_TASK: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../docs/schemas/examples/task-module-dispatched-v1.json"
+    ));
+    const GOLDEN_MODULE_RESULT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../docs/schemas/examples/task-module-result-v1.json"
+    ));
 
     fn sample_task() -> Task {
         Task {
@@ -374,6 +445,7 @@ mod tests {
             task_type: TaskType::Shell,
             arguments: TaskArguments {
                 command: "echo hello".to_string(),
+                ..TaskArguments::default()
             },
             timeout_seconds: 30,
             status: TaskStatus::Dispatched,
@@ -437,6 +509,28 @@ mod tests {
         let failed: TaskResult =
             serde_json::from_str(GOLDEN_FAILED_RESULT).expect("deserialize failed result");
         failed.validate().expect("validate failed result");
+
+        let module_task: Task =
+            serde_json::from_str(GOLDEN_MODULE_DISPATCHED_TASK).expect("deserialize module task");
+        module_task
+            .validate_for_agent("agent-01")
+            .expect("validate dispatched module task");
+        assert_eq!(
+            serde_json::to_value(&module_task).expect("serialize module task"),
+            serde_json::from_str::<serde_json::Value>(GOLDEN_MODULE_DISPATCHED_TASK)
+                .expect("parse module task JSON")
+        );
+
+        let module_result: TaskResult =
+            serde_json::from_str(GOLDEN_MODULE_RESULT).expect("deserialize module result");
+        module_result
+            .validate()
+            .expect("validate module result envelope");
+        assert_eq!(
+            serde_json::to_value(&module_result).expect("serialize module result"),
+            serde_json::from_str::<serde_json::Value>(GOLDEN_MODULE_RESULT)
+                .expect("parse module result JSON")
+        );
     }
 
     #[test]
@@ -446,6 +540,26 @@ mod tests {
 
         let err = serde_json::from_value::<Task>(encoded).expect_err("unsupported task type");
         assert!(err.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn module_task_requires_closed_arguments_and_bounds_input() {
+        let mut task = sample_task();
+        task.task_type = TaskType::Module;
+        task.arguments = TaskArguments {
+            command: String::new(),
+            module_id: Some("agent.capability_inventory.v1".to_string()),
+            input: Some(json!({})),
+        };
+        task.validate_for_agent("agent-one")
+            .expect("valid module task envelope");
+
+        task.arguments.command = "whoami".to_string();
+        assert!(task.validate_for_agent("agent-one").is_err());
+
+        task.arguments.command.clear();
+        task.arguments.input = Some(json!("not an object"));
+        assert!(task.validate_for_agent("agent-one").is_err());
     }
 
     #[test]
@@ -513,6 +627,7 @@ mod tests {
             output: TaskOutput {
                 stdout: "hello\n".to_string(),
                 stderr: String::new(),
+                data: None,
             },
             error: None,
         };
@@ -549,6 +664,7 @@ mod tests {
             output: TaskOutput {
                 stdout: String::new(),
                 stderr: String::new(),
+                data: None,
             },
             error: None,
         };
@@ -568,6 +684,7 @@ mod tests {
             output: TaskOutput {
                 stdout: String::new(),
                 stderr: String::new(),
+                data: None,
             },
             error: None,
         };

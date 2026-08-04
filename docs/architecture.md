@@ -97,7 +97,7 @@ are visible during development.
 | Surface | Served by | Route families |
 | --- | --- | --- |
 | Operator UI | operator web/API port | `/`, `/home/`, `/static/` |
-| Operator API | operator web/API port | `/api/agents/*`, `/api/listeners/*`, `/api/payload/*`, `/api/file_drop/*` |
+| Operator API | operator web/API port | `/api/modules`, `/api/agents/*`, `/api/listeners/*`, `/api/payload/*`, `/api/file_drop/*` |
 | Operator WebSockets | operator web/API port | `/ws/logs`, `/ws/terminal` |
 | Agent listener API | listener ports | `/api/agent/{agent_id}/heartbeat`, `/tasks`, `/tasks/{task_id}/status`, `/results`, plus deprecated `/command` and `/result` adapters |
 
@@ -117,8 +117,9 @@ are visible during development.
 | `/api/listeners/{id}/agents/{agent_id}/session/revoke` | `internal/handlers/api` | Immediately revoke an agent session. |
 | `/api/listeners/{id}/agents/{agent_id}/session/re-enroll` | `internal/handlers/api` | Explicitly authorize the next valid bootstrap to replace the session. |
 | `/api/agents/list` | `internal/handlers/api` | Aggregate agents across listeners. |
+| `/api/modules` | `internal/handlers/api` | Retrieve the bounded catalog of compile-time registered agent modules and their safety metadata. |
 | `/api/agents/{id}/tasks` | `internal/handlers/api` | `POST` a typed task or `GET` a bounded, paginated page of newest-first task summaries. |
-| `/api/agents/{id}/tasks/{task_id}` | `internal/handlers/api` | Get one full Task v1 resource, including terminal stdout/stderr. |
+| `/api/agents/{id}/tasks/{task_id}` | `internal/handlers/api` | Get one full Task v1 resource, including terminal stdout/stderr and module evidence when present. |
 | `/api/agents/{id}/tasks/{task_id}/cancel` | `internal/handlers/api` | Cancel a queued task before it is dispatched. |
 | `/api/agents/command` | `internal/handlers/api` | Deprecated adapter from an `agent_id` plus raw command to a v1 shell task. |
 | `/api/agents/{id}/command` | `internal/handlers/api` | Deprecated adapter from a raw command to a v1 shell task. |
@@ -173,13 +174,21 @@ The v1 wire formats are defined by:
 - [Task status update v1](schemas/task-status-update-v1.schema.json)
 - [Task result v1](schemas/task-result-v1.schema.json)
 - [Task result summary v1](schemas/task-result-summary-v1.schema.json)
+- [Module catalog v1](schemas/module-catalog-v1.schema.json)
+- [Capability inventory input v1](schemas/module-capability-inventory-input-v1.schema.json)
+- [Capability inventory output v1](schemas/module-capability-inventory-output-v1.schema.json)
 
 The operator creation body contains `schema_version`, `type`, typed
-`arguments`, `timeout_seconds`, and `expires_in_seconds`. A successful
+`arguments`, `timeout_seconds`, and `expires_in_seconds`. `type: "shell"` has
+one bounded `command`; `type: "module"` has a registered `module_id` and a
+closed JSON input. The server accepts a module task only when the selected
+agent's authenticated heartbeat advertises that module ID. A successful
 `POST /api/agents/{agent_id}/tasks` returns `202 Accepted` with the complete
-Task v1 resource. The server owns task IDs, agent correlation, lifecycle status,
-and queue timestamps. The agent owns the correlated terminal Task Result v1,
-including outcome, execution timestamps, exit code, and separate stdout/stderr.
+Task v1 resource. The server owns task IDs, agent correlation, lifecycle
+status, queue timestamps, registry validation, and any required safety
+acknowledgement. The agent owns the correlated terminal Task Result v1,
+including outcome, execution timestamps, exit code, separate stdout/stderr, and
+validated module `output.data` evidence.
 
 `GET /api/agents/{agent_id}/tasks` returns Task Page v1 with explicit `limit`,
 `offset`, `total`, and `next_offset` fields. Pages contain at most 100
@@ -345,10 +354,11 @@ At runtime the agent:
    lifecycle requests.
 7. Polls for one typed task at a time.
 8. Retains the task until an exact running acknowledgement is accepted.
-9. Dispatches by task type and executes shell tasks with their configured
-   process-group/job-object timeout and bounded output capture.
+9. Dispatches by task type: shell work uses its configured process-group/job-object
+   timeout and bounded output capture; a module can execute only if it was
+   compiled into the payload's registry.
 10. Retains and retries the exact correlated result until the listener accepts
-   it, without executing the task again.
+    it, without executing the task again.
 
 Agent state is rooted at `$XDG_STATE_HOME/microc2/agent` on Linux (falling back
 to `$HOME/.local/state/microc2/agent`), at
@@ -358,9 +368,13 @@ encoded as separate unpadded-base64url path components. Windows protects the
 session bearer with current-user DPAPI; Unix state directories and files use
 `0700` and `0600` permissions.
 
-Shell Task v1 is the active end-to-end format. File transfer, pivot control, and
-future modules must add explicit task types and schemas rather than parse
-operator-provided raw command strings.
+Shell Task v1 remains the active general-purpose format. Module Task v1 now
+adds a compile-time registry boundary: the server catalog validates closed
+input/output schemas, and the agent advertises only payload-compiled module IDs
+in its heartbeat. The shipped `agent.capability_inventory.v1` module is
+read-only, self-scoped, and returns bounded OS/architecture/CPU/memory evidence.
+File transfer and pivot control must use the same typed-task route instead of
+parsing operator-provided raw command strings.
 
 ### OPSEC Engine
 

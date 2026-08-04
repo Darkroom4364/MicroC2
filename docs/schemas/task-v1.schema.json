@@ -34,22 +34,13 @@
       "pattern": "^[A-Za-z0-9_.:-]+$"
     },
     "type": {
-      "const": "shell"
+      "enum": [
+        "shell",
+        "module"
+      ]
     },
     "arguments": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "command"
-      ],
-      "properties": {
-        "command": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 8192,
-          "pattern": "\\S"
-        }
-      }
+      "type": "object"
     },
     "timeout_seconds": {
       "type": "integer",
@@ -102,137 +93,155 @@
       "$ref": "task-result-v1.schema.json"
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "shell"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "arguments": {
+            "$ref": "#/$defs/shell_arguments"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "module"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "arguments": {
+            "$ref": "#/$defs/module_arguments"
+          }
+        }
+      }
+    }
+  ],
   "oneOf": [
     {
       "properties": {
-        "status": {
-          "const": "queued"
-        },
+        "status": {"const": "queued"},
         "dispatched_at": false,
         "started_at": false,
         "completed_at": false,
         "result": false
       },
-      "required": [
-        "status"
-      ]
+      "required": ["status"]
     },
     {
       "properties": {
-        "status": {
-          "const": "dispatched"
-        },
+        "status": {"const": "dispatched"},
         "dispatched_at": true,
         "started_at": false,
         "completed_at": false,
         "result": false
       },
-      "required": [
-        "status",
-        "dispatched_at"
-      ]
+      "required": ["status", "dispatched_at"]
     },
     {
       "properties": {
-        "status": {
-          "const": "running"
-        },
+        "status": {"const": "running"},
         "dispatched_at": true,
         "started_at": true,
         "completed_at": false,
         "result": false
       },
-      "required": [
-        "status",
-        "dispatched_at",
-        "started_at"
-      ]
+      "required": ["status", "dispatched_at", "started_at"]
     },
     {
       "properties": {
-        "status": {
-          "const": "completed"
-        },
+        "status": {"const": "completed"},
         "dispatched_at": true,
         "started_at": true,
         "completed_at": true,
         "result": {
           "type": "object",
-          "properties": {
-            "outcome": {
-              "const": "completed"
-            }
-          },
-          "required": [
-            "outcome"
-          ]
+          "properties": {"outcome": {"const": "completed"}},
+          "required": ["outcome"]
         }
       },
-      "required": [
-        "status",
-        "dispatched_at",
-        "started_at",
-        "completed_at",
-        "result"
-      ]
+      "required": ["status", "dispatched_at", "started_at", "completed_at", "result"]
     },
     {
       "properties": {
-        "status": {
-          "const": "failed"
-        },
+        "status": {"const": "failed"},
         "dispatched_at": true,
         "started_at": true,
         "completed_at": true,
         "result": {
           "type": "object",
-          "properties": {
-            "outcome": {
-              "const": "failed"
-            }
-          },
-          "required": [
-            "outcome"
-          ]
+          "properties": {"outcome": {"const": "failed"}},
+          "required": ["outcome"]
         }
       },
-      "required": [
-        "status",
-        "dispatched_at",
-        "started_at",
-        "completed_at",
-        "result"
-      ]
+      "required": ["status", "dispatched_at", "started_at", "completed_at", "result"]
     },
     {
       "properties": {
-        "status": {
-          "const": "cancelled"
-        },
+        "status": {"const": "cancelled"},
         "dispatched_at": false,
         "started_at": false,
         "completed_at": true,
         "result": false
       },
-      "required": [
-        "status",
-        "completed_at"
-      ]
+      "required": ["status", "completed_at"]
     },
     {
       "properties": {
-        "status": {
-          "const": "expired"
-        },
+        "status": {"const": "expired"},
         "dispatched_at": true,
         "started_at": false,
         "completed_at": true,
         "result": false
       },
-      "required": [
-        "status",
-        "completed_at"
-      ]
+      "required": ["status", "completed_at"]
     }
-  ]
+  ],
+  "$defs": {
+    "shell_arguments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command"],
+      "properties": {
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192,
+          "pattern": "\\S"
+        }
+      }
+    },
+    "module_arguments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["module_id", "input"],
+      "properties": {
+        "module_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_.:-]+$"
+        },
+        "input": {
+          "type": "object"
+        }
+      }
+    }
+  }
 }

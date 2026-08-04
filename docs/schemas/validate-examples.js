@@ -25,6 +25,9 @@ for (const file of schemaFiles) {
 }
 
 const exampleSchemas = new Map([
+    ['module-capability-inventory-input-v1.json', 'module-capability-inventory-input-v1.schema.json'],
+    ['module-capability-inventory-output-v1.json', 'module-capability-inventory-output-v1.schema.json'],
+    ['module-catalog-v1.json', 'module-catalog-v1.schema.json'],
     ['audit-page-v1.json', 'audit-page-v1.schema.json'],
     ['defensive-research-categories-v1.json', 'defensive-research-categories-v1.schema.json'],
     ['defensive-research-category-reference-v1.json', 'defensive-research-category-reference-v1.schema.json'],
@@ -33,6 +36,9 @@ const exampleSchemas = new Map([
     ['task-dispatched-v1.json', 'task-v1.schema.json'],
     ['task-page-v1.json', 'task-page-v1.schema.json'],
     ['task-result-failed-v1.json', 'task-result-v1.schema.json'],
+    ['task-module-create-request-v1.json', 'task-create-request-v1.schema.json'],
+    ['task-module-dispatched-v1.json', 'task-v1.schema.json'],
+    ['task-module-result-v1.json', 'task-result-v1.schema.json'],
     ['task-result-v1.json', 'task-result-v1.schema.json'],
     ['task-status-update-v1.json', 'task-status-update-v1.schema.json'],
     ['task-v1.json', 'task-v1.schema.json'],
@@ -365,6 +371,31 @@ const negativeCases = [
         value: {
             ...readJSON(path.join(exampleDirectory, 'task-page-v1.json')),
             offset: -1
+        }
+    },
+    {
+        name: 'module input rejects undeclared properties',
+        schema: 'module-capability-inventory-input-v1.schema.json',
+        value: {target: 'another host'}
+    },
+    {
+        name: 'module output rejects undeclared sensitive metadata',
+        schema: 'module-capability-inventory-output-v1.schema.json',
+        value: {
+            ...readJSON(path.join(exampleDirectory, 'module-capability-inventory-output-v1.json')),
+            hostname: 'must-not-leak'
+        }
+    },
+    {
+        name: 'module task rejects shell command arguments',
+        schema: 'task-create-request-v1.schema.json',
+        value: {
+            ...readJSON(path.join(exampleDirectory, 'task-module-create-request-v1.json')),
+            arguments: {
+                module_id: 'agent.capability_inventory.v1',
+                input: {},
+                command: 'whoami'
+            }
         }
     },
     ...forbiddenStateCases(

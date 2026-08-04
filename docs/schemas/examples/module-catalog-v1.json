@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "modules": [
+    {
+      "id": "agent.capability_inventory.v1",
+      "name": "Agent capability inventory",
+      "version": 1,
+      "description": "Collects bounded local hardware and operating-system capabilities without network or process actions.",
+      "input_schema": "module-capability-inventory-input-v1.schema.json",
+      "output_schema": "module-capability-inventory-output-v1.schema.json",
+      "safety": {
+        "risk_level": "read_only",
+        "target_scope": "self",
+        "requires_operator_acknowledgement": false,
+        "evidence_required": true
+      }
+    }
+  ]
+}
